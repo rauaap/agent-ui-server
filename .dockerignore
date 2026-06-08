@@ -1,0 +1,12 @@
+.git
+.venv
+.uv-cache
+.pytest_cache
+.ruff_cache
+__pycache__
+tests/__pycache__
+*.pyc
+.env
+sessions.db
+sessions.db-shm
+sessions.db-wal

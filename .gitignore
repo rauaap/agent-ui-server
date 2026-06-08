@@ -1,0 +1,9 @@
+sessions.db
+sessions.db-shm
+sessions.db-wal
+__pycache__/
+.pytest_cache/
+.env
+.venv/
+.uv-cache/
+.ruff_cache/

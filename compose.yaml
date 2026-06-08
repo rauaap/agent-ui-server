@@ -1,0 +1,18 @@
+services:
+  agent-ui:
+    build: .
+    network_mode: host
+    privileged: true          # required for nested podman (containers inside the container)
+    devices:
+      - /dev/fuse             # fuse-overlayfs storage for podman
+    volumes:
+      - ./sessions.db:/app/sessions.db
+      - /home/wawa/projects:/projects
+      - claude-auth:/home/agent
+    environment:
+      - WIREGUARD_IP=${WIREGUARD_IP:-10.0.0.1}
+      - PORT=${PORT:-8000}
+    restart: unless-stopped
+
+volumes:
+  claude-auth:
