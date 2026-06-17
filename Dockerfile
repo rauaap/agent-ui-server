@@ -7,7 +7,7 @@ COPY --from=uv /uv /uvx /usr/local/bin/
 RUN dnf install -y --setopt=install_weak_deps=False \
         nodejs npm python3 git bash ca-certificates make podman fuse-overlayfs \
     && dnf clean all \
-    && npm install -g @anthropic-ai/claude-code
+    && npm install -g @anthropic-ai/claude-code opencode-ai
 
 ENV SHELL=/bin/bash \
     HOME=/home/agent

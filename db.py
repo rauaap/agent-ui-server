@@ -37,13 +37,24 @@ class Database:
                     name TEXT NOT NULL,
                     working_dir TEXT NOT NULL,
                     agent TEXT NOT NULL,
-                    claude_session_id TEXT,
+                    agent_session_id TEXT,
                     status TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     last_active_at TEXT NOT NULL
                 )
                 """
             )
+            # Migrate databases created before the column was generalised from
+            # Claude Code's session id to any agent's resume id.
+            columns = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(sessions)")
+            }
+            if "claude_session_id" in columns and "agent_session_id" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE sessions "
+                    "RENAME COLUMN claude_session_id TO agent_session_id"
+                )
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS scrollback (
@@ -75,7 +86,7 @@ class Database:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT id, name, working_dir, agent, claude_session_id, status,
+                SELECT id, name, working_dir, agent, agent_session_id, status,
                        created_at, last_active_at
                 FROM sessions
                 ORDER BY last_active_at DESC, created_at DESC
@@ -90,7 +101,7 @@ class Database:
             self._conn.execute(
                 """
                 INSERT INTO sessions (
-                    id, name, working_dir, agent, claude_session_id, status,
+                    id, name, working_dir, agent, agent_session_id, status,
                     created_at, last_active_at
                 )
                 VALUES (?, ?, ?, ?, NULL, 'idle', ?, ?)
@@ -111,7 +122,7 @@ class Database:
         with self._lock:
             row = self._conn.execute(
                 """
-                SELECT id, name, working_dir, agent, claude_session_id, status,
+                SELECT id, name, working_dir, agent, agent_session_id, status,
                        created_at, last_active_at
                 FROM sessions
                 WHERE id = ?
@@ -146,15 +157,15 @@ class Database:
         if cursor.rowcount == 0:
             raise KeyError(f"Unknown session: {session_id}")
 
-    def set_claude_session_id(self, session_id: str, claude_session_id: str) -> None:
+    def set_agent_session_id(self, session_id: str, agent_session_id: str) -> None:
         with self._lock, self._conn:
             cursor = self._conn.execute(
                 """
                 UPDATE sessions
-                SET claude_session_id = ?, last_active_at = ?
+                SET agent_session_id = ?, last_active_at = ?
                 WHERE id = ?
                 """,
-                (claude_session_id, utc_now(), session_id),
+                (agent_session_id, utc_now(), session_id),
             )
         if cursor.rowcount == 0:
             raise KeyError(f"Unknown session: {session_id}")

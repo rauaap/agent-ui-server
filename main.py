@@ -9,7 +9,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
-from agent import AgentAdapter, ClaudeCodeAdapter
+from agent import AgentAdapter, ClaudeCodeAdapter, OpenCodeAdapter
 from db import Database
 
 
@@ -17,7 +17,10 @@ SCROLLBACK_REPLAY_LIMIT = 200
 
 app = FastAPI(title="agent-ui")
 db = Database(os.environ.get("SESSION_DB", "sessions.db"))
-adapters: dict[str, AgentAdapter] = {"claude-code": ClaudeCodeAdapter()}
+adapters: dict[str, AgentAdapter] = {
+    "claude-code": ClaudeCodeAdapter(),
+    "opencode": OpenCodeAdapter(),
+}
 subscribers: dict[str, set[WebSocket]] = defaultdict(set)
 running_tasks: dict[str, asyncio.Task[None]] = {}
 turn_lock = asyncio.Lock()
@@ -209,7 +212,7 @@ async def run_turn(session_id: str, prompt: str) -> None:
                 )
 
             if event_type == "done" and event.get("session_id"):
-                db.set_claude_session_id(session_id, event["session_id"])
+                db.set_agent_session_id(session_id, event["session_id"])
 
             await broadcast(session_id, event)
     except Exception as exc:

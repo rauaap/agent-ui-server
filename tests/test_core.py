@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agent import ClaudeCodeAdapter
+from agent import ClaudeCodeAdapter, OpenCodeAdapter
 from db import Database
 
 
@@ -117,6 +117,67 @@ class ClaudeCodeAdapterParsingTests(unittest.TestCase):
         )
 
         self.assertEqual(session_id, "abc123")
+
+
+class OpenCodeAdapterParsingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.adapter = OpenCodeAdapter(executable="opencode")
+
+    def test_message_chunk_classified_as_text(self) -> None:
+        self.assertEqual(
+            self.adapter._classify_update(
+                {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "hi"},
+                }
+            ),
+            ("text", None, "hi"),
+        )
+
+    def test_tool_call_update_with_input_becomes_tool_use(self) -> None:
+        kind, key, payload = self.adapter._classify_update(
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_1",
+                "title": "bash",
+                "rawInput": {"command": "echo hi"},
+            }
+        )
+        self.assertEqual(kind, "tool")
+        self.assertEqual(key, "call_1")
+        self.assertEqual(
+            payload,
+            {"type": "tool_use", "tool": "bash", "input": {"command": "echo hi"}},
+        )
+
+    def test_tool_call_without_input_is_skipped(self) -> None:
+        self.assertIsNone(
+            self.adapter._classify_update(
+                {"sessionUpdate": "tool_call", "toolCallId": "call_1", "rawInput": {}}
+            )
+        )
+
+    def test_thought_and_usage_updates_are_ignored(self) -> None:
+        self.assertIsNone(
+            self.adapter._classify_update(
+                {
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": {"type": "text", "text": "thinking"},
+                }
+            )
+        )
+        self.assertIsNone(
+            self.adapter._classify_update({"sessionUpdate": "usage_update", "used": 5})
+        )
+
+    def test_select_option_prefers_allow_once_and_reject_once(self) -> None:
+        options = [
+            {"optionId": "once", "kind": "allow_once"},
+            {"optionId": "always", "kind": "allow_always"},
+            {"optionId": "reject", "kind": "reject_once"},
+        ]
+        self.assertEqual(self.adapter._select_option(options, "allow"), "once")
+        self.assertEqual(self.adapter._select_option(options, "deny"), "reject")
 
 
 if __name__ == "__main__":

@@ -61,7 +61,8 @@ with the `session_id` captured from the previous turn's `result` event.
 ```
 agent-ui/
 ├── main.py          # FastAPI app — REST routes, WebSocket endpoint, turn orchestration
-├── agent.py         # AgentAdapter base class + ClaudeCodeAdapter (subprocess + stream-json)
+├── agent.py         # AgentAdapter base + ClaudeCodeAdapter (stream-json) + OpenCodeAdapter (ACP)
+├── opencode_permissions.json  # Default OpenCode permission config (gates tools to "ask")
 ├── db.py            # SQLite — session metadata + append-only scrollback
 ├── pyproject.toml   # Dependencies (managed with uv)
 ├── Dockerfile       # Fedora + uv + Claude Code CLI + nested Podman
@@ -110,22 +111,24 @@ WIREGUARD_IP=10.0.0.1 PORT=8000 uv run main.py
 docker compose up -d
 ```
 
-After the **first** deploy, log in once inside the container:
+After the **first** deploy, log in once inside the container — each agent you
+intend to use needs its own login:
 
 ```sh
-docker compose exec agent-ui claude login
+docker compose exec agent-ui claude login          # Claude Code
+docker compose exec agent-ui opencode auth login   # OpenCode
 ```
 
-Claude Code credentials are persisted on the `claude-auth` named volume (mounted
-at `HOME=/home/agent`), so later rebuilds (`docker compose up -d --build`) stay
+Credentials are persisted on the `claude-auth` named volume (mounted at
+`HOME=/home/agent`), so later rebuilds (`docker compose up -d --build`) stay
 logged in. To force a fresh login, remove the volume:
 
 ```sh
 docker volume rm <project>_claude-auth
 ```
 
-The container image is Fedora-based and ships `uv`, the Claude Code CLI, `git`,
-and a nested **Podman** stack (`privileged: true` + `/dev/fuse` +
+The container image is Fedora-based and ships `uv`, the Claude Code CLI, the
+OpenCode CLI, `git`, and a nested **Podman** stack (`privileged: true` + `/dev/fuse` +
 `fuse-overlayfs`) so agents can run containers inside their working directory.
 Host networking is used so the container sees the WireGuard interface directly.
 Project directories are bind-mounted at `/projects`; create sessions with
@@ -142,6 +145,8 @@ identical whether you use uv or Compose.
 | `PORT`         | `8000`        | Listen port                                      |
 | `SESSION_DB`   | `sessions.db` | SQLite database path                             |
 | `CLAUDE_BIN`   | `claude`      | Path/name of the Claude Code executable          |
+| `OPENCODE_BIN` | `opencode`    | Path/name of the OpenCode executable             |
+| `OPENCODE_CONFIG` | bundled `opencode_permissions.json` | OpenCode config passed to the agent; sets which tools require approval |
 
 ## API
 
@@ -156,9 +161,9 @@ identical whether you use uv or Compose.
 | `DELETE` | `/sessions/{id}`        | Stop the process and delete the session and its scrollback       |
 
 `POST /sessions` requires an absolute `working_dir`; the directory is created
-(`mkdir -p`) if missing. `agent` defaults to `"claude-code"`, the only adapter
-currently registered. Starting a turn on a session that is not `idle` returns
-`409`.
+(`mkdir -p`) if missing. `agent` is one of the registered adapters —
+`"claude-code"` (the default) or `"opencode"`. Starting a turn on a session that
+is not `idle` returns `409`.
 
 ### WebSocket
 
@@ -215,8 +220,8 @@ Future is failed and the prompt is cleared.
 | `id`                | TEXT PK | Internal UUID                                               |
 | `name`              | TEXT    | Human-readable label                                        |
 | `working_dir`       | TEXT    | Absolute path inside the container, e.g. `/projects/foo`    |
-| `agent`             | TEXT    | Which adapter to use, e.g. `claude-code`                    |
-| `claude_session_id` | TEXT    | Passed to `--resume`; `NULL` until the first turn completes |
+| `agent`             | TEXT    | Which adapter to use, e.g. `claude-code` or `opencode`      |
+| `agent_session_id`  | TEXT    | The agent's own resume id; `NULL` until the first turn completes |
 | `status`            | TEXT    | `idle` \| `running` \| `awaiting_approval`                  |
 | `created_at`        | TEXT    | ISO 8601 (UTC, `Z`)                                         |
 | `last_active_at`    | TEXT    | ISO 8601, bumped on each turn                               |
@@ -254,18 +259,40 @@ class AgentAdapter:
 
 `AgentEvent` is a tagged union (`output`, `tool_use`, `approval_request`,
 `done`, `error`). The WebSocket layer and the Android app only ever speak
-`AgentEvent` — they never touch adapter internals. v1 ships `ClaudeCodeAdapter`
-only.
+`AgentEvent` — they never touch adapter internals. Two adapters ship today:
 
-Other CLIs follow the same one-shot-per-turn shape and are expected to share a
-future `OneShotAdapter` base class:
+| Agent           | Per-turn process                          | Resume                  | Tool approval                                  |
+|-----------------|-------------------------------------------|-------------------------|------------------------------------------------|
+| **Claude Code** | `claude -p --output-format stream-json`   | `--resume <id>`         | `--permission-prompt-tool stdio` via stdin     |
+| **OpenCode**    | `opencode acp` (JSON-RPC over stdio)      | `session/load <id>`     | `session/request_permission` callback over stdio |
+| **Codex**       | `codex exec --json`                       | `codex exec resume`     | not in `exec` — needs persistent `app-server`  |
 
-| Agent           | One-shot CLI                              | Resume               | Interactive approval                        |
-|-----------------|-------------------------------------------|----------------------|---------------------------------------------|
-| **Claude Code** | `claude -p --output-format stream-json`   | `--resume <id>`      | `--permission-prompt-tool stdio` via stdin  |
-| **OpenCode**    | `opencode run --format json`              | `--session <id>`     | unknown                                     |
-| **Forge**       | `forge <agent> <prompt> --print`          | `--session <id>`     | unknown                                     |
-| **Codex**       | `codex exec --json`                       | `codex exec resume`  | not in `exec` — needs persistent `app-server` |
+Both shipping adapters are **one short-lived subprocess per turn** and surface
+real allow/deny approvals; they only differ in wire protocol.
+
+**Claude Code** speaks Anthropic's `stream-json` over stdio: we write the user
+message to stdin, stream JSON events from stdout, and answer
+`control_request`/`sdk_control_request` permission prompts by writing a
+`control_response` back to stdin.
+
+**OpenCode** speaks **ACP** (Agent Client Protocol) — JSON-RPC 2.0 over stdio,
+and bidirectional. Each turn the adapter spawns `opencode acp`, calls
+`initialize` → `session/new` (first turn) or `session/load <id>` (resume) →
+`session/prompt`, maps the streamed `session/update` notifications
+(`agent_message_chunk` → `output`, `tool_call`/`tool_call_update` → `tool_use`)
+to `AgentEvent`s, and answers the agent's `session/request_permission` callbacks
+as `approval_request` → `allow`/`deny`. The session id returned by
+`session/new` is stored as `agent_session_id` and replayed via `session/load`.
+
+OpenCode only emits `session/request_permission` for tools configured to `"ask"`
+— out of the box most tools default to `"allow"` and would run without
+prompting. The adapter therefore points the child at a permission config via the
+`OPENCODE_CONFIG` env var; a bundled default (`opencode_permissions.json`) gates
+`bash`, `edit`, `write`, and `webfetch`. Set `OPENCODE_CONFIG` yourself to
+override which tools prompt.
+
+Codex remains future work — its approval handling needs a persistent
+`app-server` speaking JSON-RPC, so it does not fit the one-shot shape.
 
 ## Development
 
@@ -286,7 +313,6 @@ from the standard library. No ORM, no task queue, no message broker.
 
 ## Roadmap
 
-- `OneShotAdapter` base class shared by OpenCode and Forge
 - `AppServerAdapter` for Codex (persistent `app-server` over JSON-RPC 2.0)
 - Voice input: Android app audio → backend → local `faster-whisper` (`tiny`
   model, no GPU) → transcription used as a prompt
