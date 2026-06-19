@@ -37,6 +37,25 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(database.require_session(session["id"])["status"], "idle")
             database.close()
 
+    def test_rename_session_updates_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Database(Path(tmpdir) / "sessions.db")
+            session = database.create_session(
+                name="demo",
+                working_dir="/projects/demo",
+                agent="claude-code",
+            )
+
+            renamed = database.rename_session(session["id"], "renamed")
+            self.assertEqual(renamed["name"], "renamed")
+            self.assertEqual(
+                database.require_session(session["id"])["name"], "renamed"
+            )
+
+            with self.assertRaises(KeyError):
+                database.rename_session("missing", "nope")
+            database.close()
+
 
 class ClaudeCodeAdapterParsingTests(unittest.TestCase):
     def setUp(self) -> None:

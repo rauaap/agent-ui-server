@@ -148,6 +148,16 @@ class Database:
         if cursor.rowcount == 0:
             raise KeyError(f"Unknown session: {session_id}")
 
+    def rename_session(self, session_id: str, name: str) -> dict[str, Any]:
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                "UPDATE sessions SET name = ? WHERE id = ?",
+                (name, session_id),
+            )
+        if cursor.rowcount == 0:
+            raise KeyError(f"Unknown session: {session_id}")
+        return self.require_session(session_id)
+
     def touch_session(self, session_id: str) -> None:
         with self._lock, self._conn:
             cursor = self._conn.execute(

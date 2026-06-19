@@ -156,6 +156,7 @@ identical whether you use uv or Compose.
 |----------|-------------------------|------------------------------------------------------------------|
 | `GET`    | `/sessions`             | List all sessions with metadata                                  |
 | `POST`   | `/sessions`             | Create a session (`name`, `working_dir`, `agent`) → `201`        |
+| `PATCH`  | `/sessions/{id}`        | Rename a session (`name`) and return the updated session         |
 | `POST`   | `/sessions/{id}/turn`   | Send a prompt and spawn a turn → `202`                           |
 | `POST`   | `/sessions/{id}/stop`   | Stop the running process, set status → `idle`, keep the session  |
 | `DELETE` | `/sessions/{id}`        | Stop the process and delete the session and its scrollback       |
@@ -164,6 +165,10 @@ identical whether you use uv or Compose.
 (`mkdir -p`) if missing. `agent` is one of the registered adapters —
 `"claude-code"` (the default) or `"opencode"`. Starting a turn on a session that
 is not `idle` returns `409`.
+
+`PATCH /sessions/{id}` takes a non-empty `name` (1–120 chars, trimmed), updates
+the session's label, and broadcasts a `renamed` event to all WebSocket
+subscribers so connected clients update live.
 
 ### WebSocket
 
@@ -187,6 +192,7 @@ either way.)
   "tool": "Bash", "input": { "command": "rm -rf /tmp/test" } }
 { "type": "input", "text": "..." }                                    // echo of a submitted prompt
 { "type": "status", "status": "running" | "idle" | "awaiting_approval" }
+{ "type": "renamed", "name": "..." }                                  // session label changed
 { "type": "done" }                                                    // turn complete
 { "type": "error", "message": "..." }
 

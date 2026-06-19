@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from agent import AgentAdapter, ClaudeCodeAdapter, OpenCodeAdapter
 from db import Database
@@ -30,6 +30,18 @@ class CreateSessionRequest(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     working_dir: str = Field(min_length=1)
     agent: str = "claude-code"
+
+
+class RenameSessionRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+
+    @field_validator("name")
+    @classmethod
+    def strip_name(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("name cannot be empty")
+        return stripped
 
 
 class TurnRequest(BaseModel):
@@ -79,6 +91,17 @@ async def create_session(payload: CreateSessionRequest) -> dict[str, Any]:
         working_dir=working_dir,
         agent=payload.agent,
     )
+
+
+@app.patch("/sessions/{session_id}")
+async def rename_session(
+    session_id: str, payload: RenameSessionRequest
+) -> dict[str, Any]:
+    require_session_or_404(session_id)
+    name = payload.name
+    session = db.rename_session(session_id, name)
+    await broadcast(session_id, {"type": "renamed", "name": name})
+    return session
 
 
 @app.post("/sessions/{session_id}/stop")
