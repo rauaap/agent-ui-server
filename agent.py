@@ -6,12 +6,75 @@ import json
 import os
 import uuid
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 
 AgentEvent = dict[str, Any]
 
+
+@dataclass
+class ApprovalDecision:
+    """A resolved answer to an approval_request.
+
+    `behavior` is always the canonical "allow"/"deny" derived from whichever of
+    `option_id` / `behavior` the client supplied. `option_id` names a specific
+    choice from the request's `options` list (multiple choice); `message` is an
+    optional free-form denial reason.
+    """
+
+    behavior: str
+    option_id: str | None = None
+    message: str | None = None
+
+
+def _option_behavior(options: list[dict[str, Any]], option_id: str) -> str | None:
+    """Map an option id to "allow"/"deny" via its kind, or None if not found.
+
+    Options are stored internally in ACP shape (`optionId`, `name`, `kind`)
+    regardless of agent, so `kind` is one of allow_once/allow_always/
+    reject_once/reject_always.
+    """
+    for option in options:
+        if option.get("optionId") == option_id:
+            kind = (option.get("kind") or "").lower()
+            return "allow" if kind.startswith("allow") else "deny"
+    return None
+
+
+def _event_options(options: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Project internal options into the wire shape sent to clients."""
+    projected: list[dict[str, Any]] = []
+    for option in options:
+        option_id = option.get("optionId")
+        if not option_id:
+            continue
+        projected.append(
+            {
+                "id": option_id,
+                "name": option.get("name") or option_id,
+                "kind": option.get("kind"),
+            }
+        )
+    return projected
+
+
+def _resolve_decision(
+    options: list[dict[str, Any]],
+    behavior: str,
+    option_id: str | None,
+    message: str | None,
+) -> ApprovalDecision:
+    """Validate a client response and normalize it to an ApprovalDecision."""
+    if option_id:
+        derived = _option_behavior(options, option_id)
+        if derived is None:
+            raise KeyError(f"Unknown approval option: {option_id}")
+        behavior = derived
+    if behavior not in {"allow", "deny"}:
+        raise ValueError("Approval behavior must be 'allow' or 'deny'")
+    return ApprovalDecision(behavior=behavior, option_id=option_id, message=message)
 
 # asyncio's StreamReader defaults to a 64 KiB line buffer. Agent stdout is
 # newline-delimited JSON whose single lines (large tool results, file reads,
@@ -35,8 +98,26 @@ class AgentAdapter(abc.ABC):
         session: dict[str, Any],
         request_id: str,
         behavior: str,
-    ) -> None:
+        *,
+        option_id: str | None = None,
+        message: str | None = None,
+    ) -> str:
+        """Answer a pending approval; returns the effective "allow"/"deny"."""
         raise NotImplementedError
+
+    async def send_answer(
+        self,
+        session: dict[str, Any],
+        request_id: str,
+        answers: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Answer a pending AskUserQuestion; returns the validated answers.
+
+        Concrete (not abstract): adapters without an equivalent tool — OpenCode
+        has none — inherit this clean failure, which the server surfaces as an
+        `error` event.
+        """
+        raise NotImplementedError("This agent does not support interactive questions")
 
     @abc.abstractmethod
     async def stop(self, session: dict[str, Any]) -> None:
@@ -44,11 +125,44 @@ class AgentAdapter(abc.ABC):
 
 
 class ClaudeCodeAdapter(AgentAdapter):
+    # Claude Code's stdio permission protocol does not advertise a list of
+    # choices: its decision is allow (with updatedInput) or deny (with a
+    # message). We surface the two it supports as multiple-choice options so the
+    # wire contract matches OpenCode's; "allow always" is intentionally omitted
+    # since we do not persist permission rules.
+    OPTIONS = [
+        {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+        {"optionId": "deny", "name": "Deny", "kind": "reject_once"},
+    ]
+
+    # The built-in tool that asks the *user* a multiple-choice question. It
+    # arrives as a can_use_tool control_request like any other tool, but is
+    # surfaced as a `question` event (not an approval) and answered by merging
+    # the user's pick into updatedInput.answers.
+    QUESTION_TOOL = "AskUserQuestion"
+
+    # Maps a Claude Code tool name to an auto-approve category. Read-only tools
+    # are auto-allowed by `--permission-mode default` and never reach this gate,
+    # so only the mutating tools are listed; anything unmapped (e.g. WebFetch)
+    # always prompts.
+    TOOL_CATEGORIES = {
+        "Bash": "command",
+        "Write": "write",
+        "Edit": "write",
+        "MultiEdit": "write",
+        "NotebookEdit": "write",
+    }
+
     def __init__(self, executable: str | None = None) -> None:
         self.executable = executable or os.environ.get("CLAUDE_BIN", "claude")
         self.processes: dict[str, asyncio.subprocess.Process] = {}
-        self.pending_approvals: dict[str, asyncio.Future[str]] = {}
+        self.pending_approvals: dict[str, asyncio.Future[ApprovalDecision]] = {}
         self.pending_sessions: dict[str, str] = {}
+        self.pending_options: dict[str, list[dict[str, Any]]] = {}
+        # Pending AskUserQuestion calls: the future resolves to the validated
+        # answers, and the spec is kept alongside so send_answer can validate.
+        self.pending_questions: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self.pending_question_specs: dict[str, list[dict[str, Any]]] = {}
 
     async def start_turn(
         self,
@@ -146,16 +260,35 @@ class ClaudeCodeAdapter(AgentAdapter):
         session: dict[str, Any],
         request_id: str,
         behavior: str,
-    ) -> None:
-        if behavior not in {"allow", "deny"}:
-            raise ValueError("Approval behavior must be 'allow' or 'deny'")
-
+        *,
+        option_id: str | None = None,
+        message: str | None = None,
+    ) -> str:
         future = self.pending_approvals.get(request_id)
         if future is None or self.pending_sessions.get(request_id) != session["id"]:
             raise KeyError(f"Unknown approval request: {request_id}")
 
+        options = self.pending_options.get(request_id, self.OPTIONS)
+        decision = _resolve_decision(options, behavior, option_id, message)
         if not future.done():
-            future.set_result(behavior)
+            future.set_result(decision)
+        return decision.behavior
+
+    async def send_answer(
+        self,
+        session: dict[str, Any],
+        request_id: str,
+        answers: dict[str, Any],
+    ) -> dict[str, Any]:
+        future = self.pending_questions.get(request_id)
+        if future is None or self.pending_sessions.get(request_id) != session["id"]:
+            raise KeyError(f"Unknown question request: {request_id}")
+
+        questions = self.pending_question_specs.get(request_id, [])
+        validated = self._validate_answers(questions, answers)
+        if not future.done():
+            future.set_result(validated)
+        return validated
 
     async def stop(self, session: dict[str, Any]) -> None:
         session_id = session["id"]
@@ -199,23 +332,56 @@ class ClaudeCodeAdapter(AgentAdapter):
 
             request_id = request["request_id"]
             tool_input = request.get("input") or {}
+
+            # AskUserQuestion is a question for the user, not a run/deny gate:
+            # surface it as a `question` event and answer it by writing the
+            # user's pick into updatedInput.answers.
+            if request["tool"] == self.QUESTION_TOOL:
+                questions = self._normalize_questions(tool_input)
+                loop = asyncio.get_running_loop()
+                answer_future: asyncio.Future[dict[str, Any]] = loop.create_future()
+                self.pending_questions[request_id] = answer_future
+                self.pending_sessions[request_id] = session_id
+                self.pending_question_specs[request_id] = questions
+
+                yield {
+                    "type": "question",
+                    "request_id": request_id,
+                    "questions": questions,
+                }
+
+                try:
+                    answers = await answer_future
+                    await self._write_question_response(
+                        process, request_id, tool_input, answers
+                    )
+                except Exception as exc:
+                    yield {"type": "error", "message": str(exc)}
+                finally:
+                    self.pending_questions.pop(request_id, None)
+                    self.pending_sessions.pop(request_id, None)
+                    self.pending_question_specs.pop(request_id, None)
+                return
+
             loop = asyncio.get_running_loop()
-            future: asyncio.Future[str] = loop.create_future()
+            future: asyncio.Future[ApprovalDecision] = loop.create_future()
             self.pending_approvals[request_id] = future
             self.pending_sessions[request_id] = session_id
+            self.pending_options[request_id] = self.OPTIONS
 
             yield request
 
             try:
-                behavior = await future
+                decision = await future
                 await self._write_approval_response(
-                    process, request_id, behavior, tool_input
+                    process, request_id, decision, tool_input
                 )
             except Exception as exc:
                 yield {"type": "error", "message": str(exc)}
             finally:
                 self.pending_approvals.pop(request_id, None)
                 self.pending_sessions.pop(request_id, None)
+                self.pending_options.pop(request_id, None)
             return
 
         if event_type == "result":
@@ -247,6 +413,10 @@ class ClaudeCodeAdapter(AgentAdapter):
                 if block_type == "text" and block.get("text"):
                     events.append({"type": "output", "text": block["text"]})
                 elif block_type in {"tool_use", "server_tool_use"}:
+                    # AskUserQuestion is surfaced as a `question` event via its
+                    # control_request, so don't also emit a tool_use bubble.
+                    if block.get("name") == self.QUESTION_TOOL:
+                        continue
                     events.append(self._tool_use_event(block))
 
         if not events and event.get("text"):
@@ -306,6 +476,8 @@ class ClaudeCodeAdapter(AgentAdapter):
             "request_id": request_id,
             "tool": tool,
             "input": tool_input,
+            "options": _event_options(self.OPTIONS),
+            "category": self.TOOL_CATEGORIES.get(tool),
         }
 
     def _extract_session_id(self, event: dict[str, Any]) -> str | None:
@@ -355,26 +527,137 @@ class ClaudeCodeAdapter(AgentAdapter):
         self,
         process: asyncio.subprocess.Process,
         request_id: str,
-        behavior: str,
+        decision: ApprovalDecision,
         tool_input: dict[str, Any],
     ) -> None:
         if process.stdin is None:
             raise RuntimeError("Claude Code stdin is unavailable")
 
-        if behavior == "allow":
-            decision: dict[str, Any] = {
+        if decision.behavior == "allow":
+            response: dict[str, Any] = {
                 "behavior": "allow",
                 "updatedInput": tool_input or {},
             }
         else:
-            decision = {"behavior": "deny", "message": "Denied by user"}
+            response = {
+                "behavior": "deny",
+                "message": decision.message or "Denied by user",
+            }
 
         payload = {
             "type": "control_response",
             "response": {
                 "subtype": "success",
                 "request_id": request_id,
-                "response": decision,
+                "response": response,
+            },
+        }
+        process.stdin.write((json.dumps(payload) + "\n").encode("utf-8"))
+        await process.stdin.drain()
+
+    def _normalize_questions(self, tool_input: dict[str, Any]) -> list[dict[str, Any]]:
+        """Project AskUserQuestion's opaque input into the wire `questions` shape.
+
+        Every field is guarded with a default — the input is an untrusted
+        passthrough, same convention as `_tool_use_event`.
+        """
+        raw_questions = tool_input.get("questions")
+        if not isinstance(raw_questions, list):
+            return []
+
+        normalized: list[dict[str, Any]] = []
+        for raw in raw_questions:
+            if not isinstance(raw, dict):
+                continue
+            options: list[dict[str, Any]] = []
+            raw_options = raw.get("options")
+            if isinstance(raw_options, list):
+                for opt in raw_options:
+                    if not isinstance(opt, dict):
+                        continue
+                    options.append(
+                        {
+                            "label": str(opt.get("label", "")),
+                            "description": str(opt.get("description", "")),
+                        }
+                    )
+            normalized.append(
+                {
+                    "question": str(raw.get("question", "")),
+                    "header": str(raw.get("header", "")),
+                    "multiSelect": bool(raw.get("multiSelect", False)),
+                    "options": options,
+                }
+            )
+        return normalized
+
+    def _validate_answers(
+        self,
+        questions: list[dict[str, Any]],
+        answers: Any,
+    ) -> dict[str, Any]:
+        """Check answers against the stored spec, keyed by question text.
+
+        Each key must name a known question and each value a known option label
+        (a list of labels for multiSelect). Raises ValueError on any mismatch so
+        the request stays pending and the client can retry.
+        """
+        if not isinstance(answers, dict):
+            raise ValueError("answers must be an object keyed by question text")
+
+        by_text = {question["question"]: question for question in questions}
+        validated: dict[str, Any] = {}
+        for question_text, value in answers.items():
+            question = by_text.get(question_text)
+            if question is None:
+                raise ValueError(f"Unknown question: {question_text!r}")
+            labels = {opt["label"] for opt in question["options"]}
+            if question["multiSelect"]:
+                if not isinstance(value, list):
+                    raise ValueError(
+                        f"multiSelect question {question_text!r} expects a list of labels"
+                    )
+                for label in value:
+                    if label not in labels:
+                        raise ValueError(
+                            f"Unknown option {label!r} for question {question_text!r}"
+                        )
+                validated[question_text] = list(value)
+            else:
+                if not isinstance(value, str) or value not in labels:
+                    raise ValueError(
+                        f"Unknown option {value!r} for question {question_text!r}"
+                    )
+                validated[question_text] = value
+        return validated
+
+    async def _write_question_response(
+        self,
+        process: asyncio.subprocess.Process,
+        request_id: str,
+        tool_input: dict[str, Any],
+        answers: dict[str, Any],
+    ) -> None:
+        """Answer an AskUserQuestion control_request.
+
+        The tool reads the answer back out of its own input, so we allow the
+        call with the answers merged into updatedInput.answers (keyed by the
+        exact question text). Keying by header, or leaving updatedInput
+        unchanged, is recorded as "did not answer".
+        """
+        if process.stdin is None:
+            raise RuntimeError("Claude Code stdin is unavailable")
+
+        updated_input = {**(tool_input or {}), "answers": answers}
+        payload = {
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": request_id,
+                "response": {
+                    "behavior": "allow",
+                    "updatedInput": updated_input,
+                },
             },
         }
         process.stdin.write((json.dumps(payload) + "\n").encode("utf-8"))
@@ -390,8 +673,16 @@ class ClaudeCodeAdapter(AgentAdapter):
             future = self.pending_approvals.get(request_id)
             if future and not future.done():
                 future.set_exception(RuntimeError(reason))
+            # A pending question blocks the turn the same way an approval does;
+            # unblock it too so a stop / process exit doesn't hang.
+            answer_future = self.pending_questions.get(request_id)
+            if answer_future and not answer_future.done():
+                answer_future.set_exception(RuntimeError(reason))
             self.pending_approvals.pop(request_id, None)
+            self.pending_questions.pop(request_id, None)
+            self.pending_question_specs.pop(request_id, None)
             self.pending_sessions.pop(request_id, None)
+            self.pending_options.pop(request_id, None)
 
     async def _collect_stderr(
         self,
@@ -432,6 +723,17 @@ class OpenCodeAdapter(AgentAdapter):
     # Tools that should prompt for approval; everything else stays "allow".
     DEFAULT_CONFIG = str(Path(__file__).resolve().parent / "opencode_permissions.json")
 
+    # Maps ACP's toolCall.kind to an auto-approve category. ACP kinds are
+    # read/edit/delete/move/search/execute/fetch/think/other; only the mutating
+    # ones map to a switchable category, so reads/searches always prompt if
+    # they ever reach the gate.
+    KIND_CATEGORIES = {
+        "execute": "command",
+        "edit": "write",
+        "delete": "write",
+        "move": "write",
+    }
+
     def __init__(
         self,
         executable: str | None = None,
@@ -442,8 +744,9 @@ class OpenCodeAdapter(AgentAdapter):
             config_path or os.environ.get("OPENCODE_CONFIG") or self.DEFAULT_CONFIG
         )
         self.processes: dict[str, asyncio.subprocess.Process] = {}
-        self.pending_approvals: dict[str, asyncio.Future[str]] = {}
+        self.pending_approvals: dict[str, asyncio.Future[ApprovalDecision]] = {}
         self.pending_sessions: dict[str, str] = {}
+        self.pending_options: dict[str, list[dict[str, Any]]] = {}
 
     async def start_turn(
         self,
@@ -543,20 +846,46 @@ class OpenCodeAdapter(AgentAdapter):
                 tool_call = params.get("toolCall") or {}
                 options = params.get("options") or []
                 request_id = f"perm_{uuid.uuid4().hex}"
-                future: asyncio.Future[str] = loop.create_future()
+                future: asyncio.Future[ApprovalDecision] = loop.create_future()
                 self.pending_approvals[request_id] = future
                 self.pending_sessions[request_id] = session_id
+                self.pending_options[request_id] = options
                 await queue.put(
                     {
                         "type": "approval_request",
                         "request_id": request_id,
                         "tool": tool_call.get("title") or "tool",
                         "input": tool_call.get("rawInput") or {},
+                        "options": _event_options(options),
+                        "category": self.KIND_CATEGORIES.get(tool_call.get("kind")),
                     }
                 )
                 try:
-                    behavior = await future
-                    option_id = self._select_option(options, behavior)
+                    decision = await future
+                    if decision.behavior == "deny" and decision.message:
+                        # ACP can carry neither a free-form denial reason nor a
+                        # cancel, and if we answer "reject" the agent burns the
+                        # rest of the turn speculating about why. So we don't
+                        # answer at all: end the turn here (the process is torn
+                        # down before the agent resumes) and re-prompt with a
+                        # self-contained follow-up carrying the reason. session/
+                        # load on the next turn resumes the conversation.
+                        await queue.put(
+                            {
+                                "type": "followup",
+                                "prompt": self._denial_followup_prompt(
+                                    tool_call.get("title") or "tool",
+                                    tool_call.get("rawInput") or {},
+                                    decision.message,
+                                ),
+                            }
+                        )
+                        await queue.put({"type": "done", "session_id": current_sid})
+                        await queue.put(None)
+                        return
+                    option_id = decision.option_id
+                    if not option_id or _option_behavior(options, option_id) is None:
+                        option_id = self._select_option(options, decision.behavior)
                     await respond(
                         mid,
                         {"outcome": {"outcome": "selected", "optionId": option_id}},
@@ -566,6 +895,7 @@ class OpenCodeAdapter(AgentAdapter):
                 finally:
                     self.pending_approvals.pop(request_id, None)
                     self.pending_sessions.pop(request_id, None)
+                    self.pending_options.pop(request_id, None)
                 return
 
             if method == "fs/read_text_file":
@@ -762,16 +1092,19 @@ class OpenCodeAdapter(AgentAdapter):
         session: dict[str, Any],
         request_id: str,
         behavior: str,
-    ) -> None:
-        if behavior not in {"allow", "deny"}:
-            raise ValueError("Approval behavior must be 'allow' or 'deny'")
-
+        *,
+        option_id: str | None = None,
+        message: str | None = None,
+    ) -> str:
         future = self.pending_approvals.get(request_id)
         if future is None or self.pending_sessions.get(request_id) != session["id"]:
             raise KeyError(f"Unknown approval request: {request_id}")
 
+        options = self.pending_options.get(request_id, [])
+        decision = _resolve_decision(options, behavior, option_id, message)
         if not future.done():
-            future.set_result(behavior)
+            future.set_result(decision)
+        return decision.behavior
 
     async def stop(self, session: dict[str, Any]) -> None:
         session_id = session["id"]
@@ -825,6 +1158,23 @@ class OpenCodeAdapter(AgentAdapter):
 
         return options[0]["optionId"] if options else "reject"
 
+    @staticmethod
+    def _denial_followup_prompt(
+        tool: str,
+        raw_input: dict[str, Any],
+        message: str,
+    ) -> str:
+        """Compose a self-contained prompt for the follow-up turn after a deny.
+
+        It restates the rejected tool + input so the next turn does not depend on
+        OpenCode having persisted the interrupted call, and appends the user's
+        reason.
+        """
+        detail = f" with input {json.dumps(raw_input, ensure_ascii=False)}" if raw_input else ""
+        return (
+            f"I denied your request to run the {tool} tool{detail}. {message}".strip()
+        )
+
     async def _terminate(self, process: asyncio.subprocess.Process) -> int | None:
         if process.returncode is None:
             try:
@@ -850,6 +1200,7 @@ class OpenCodeAdapter(AgentAdapter):
                 future.set_exception(RuntimeError(reason))
             self.pending_approvals.pop(request_id, None)
             self.pending_sessions.pop(request_id, None)
+            self.pending_options.pop(request_id, None)
 
     def _build_env(self) -> dict[str, str]:
         env = dict(os.environ)

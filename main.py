@@ -32,12 +32,22 @@ class CreateSessionRequest(BaseModel):
     agent: str = "claude-code"
 
 
-class RenameSessionRequest(BaseModel):
-    name: str = Field(min_length=1, max_length=120)
+class UpdateSessionRequest(BaseModel):
+    """Partial update of a session: rename and/or flip auto-approve toggles.
+
+    Every field is optional; only the ones supplied are applied. `name` keeps
+    the old rename contract (non-empty, trimmed) when present.
+    """
+
+    name: str | None = Field(default=None, max_length=120)
+    auto_approve_write: bool | None = None
+    auto_approve_command: bool | None = None
 
     @field_validator("name")
     @classmethod
-    def strip_name(cls, value: str) -> str:
+    def strip_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         stripped = value.strip()
         if not stripped:
             raise ValueError("name cannot be empty")
@@ -94,14 +104,32 @@ async def create_session(payload: CreateSessionRequest) -> dict[str, Any]:
 
 
 @app.patch("/sessions/{session_id}")
-async def rename_session(
-    session_id: str, payload: RenameSessionRequest
+async def update_session(
+    session_id: str, payload: UpdateSessionRequest
 ) -> dict[str, Any]:
     require_session_or_404(session_id)
-    name = payload.name
-    session = db.rename_session(session_id, name)
-    await broadcast(session_id, {"type": "renamed", "name": name})
-    return session
+    session: dict[str, Any] | None = None
+
+    if payload.name is not None:
+        session = db.rename_session(session_id, payload.name)
+        await broadcast(session_id, {"type": "renamed", "name": payload.name})
+
+    if payload.auto_approve_write is not None or payload.auto_approve_command is not None:
+        session = db.set_auto_approve(
+            session_id,
+            write=payload.auto_approve_write,
+            command=payload.auto_approve_command,
+        )
+        await broadcast(
+            session_id,
+            {
+                "type": "settings",
+                "auto_approve_write": session["auto_approve_write"],
+                "auto_approve_command": session["auto_approve_command"],
+            },
+        )
+
+    return session if session is not None else require_session_or_404(session_id)
 
 
 @app.post("/sessions/{session_id}/stop")
@@ -177,9 +205,27 @@ async def session_websocket(websocket: WebSocket, session_id: str) -> None:
             elif message_type == "approval_response":
                 request_id = str(message.get("request_id", ""))
                 behavior = str(message.get("behavior", ""))
+                raw_option_id = message.get("option_id")
+                option_id = str(raw_option_id) if raw_option_id else None
+                raw_message = message.get("message")
+                deny_message = str(raw_message) if raw_message else None
                 try:
-                    await handle_approval(session_id, request_id, behavior)
+                    await handle_approval(
+                        session_id,
+                        request_id,
+                        behavior,
+                        option_id=option_id,
+                        message=deny_message,
+                    )
                 except (KeyError, ValueError) as exc:
+                    await websocket.send_json({"type": "error", "message": str(exc)})
+
+            elif message_type == "question_response":
+                request_id = str(message.get("request_id", ""))
+                answers = message.get("answers")
+                try:
+                    await handle_question_answer(session_id, request_id, answers)
+                except (KeyError, ValueError, NotImplementedError) as exc:
                     await websocket.send_json({"type": "error", "message": str(exc)})
             else:
                 await websocket.send_json(
@@ -215,19 +261,52 @@ async def begin_turn(session_id: str, prompt: str) -> None:
 async def run_turn(session_id: str, prompt: str) -> None:
     session = db.require_session(session_id)
     adapter = adapters[session["agent"]]
+    followup_prompt: str | None = None
 
     try:
         async for event in adapter.start_turn(session, prompt):
             event_type = event.get("type")
 
-            if event_type in {"output", "tool_use", "approval_request", "error"}:
+            # Internal orchestration event: the adapter ended the turn and wants
+            # a new one started (OpenCode's deny-with-reason). Not persisted or
+            # broadcast on its own — it surfaces as the next turn's input.
+            if event_type == "followup":
+                followup_prompt = event.get("prompt")
+                continue
+
+            # Decide auto-approval before persisting/broadcasting so the event
+            # carries the marker and we can skip the awaiting_approval status.
+            # Re-read the session so a toggle flipped mid-turn applies on the
+            # next approval, not only on the next turn.
+            auto_category: str | None = None
+            if event_type == "approval_request":
+                category = event.get("category")
+                current = db.get_session(session_id) or session
+                if category in {"write", "command"} and current.get(
+                    f"auto_approve_{category}"
+                ):
+                    auto_category = category
+                    event = {**event, "auto_approved": True}
+
+            if event_type in {
+                "output",
+                "tool_use",
+                "approval_request",
+                "question",
+                "error",
+            }:
                 db.append_scrollback(
                     session_id,
                     event_type,
                     {key: value for key, value in event.items() if key != "type"},
                 )
 
-            if event_type == "approval_request":
+            # A pending question blocks on the user just like an approval; reuse
+            # the awaiting_approval status (the client tells them apart by
+            # event). An auto-approved request never blocks, so it stays running.
+            if event_type == "question" or (
+                event_type == "approval_request" and auto_category is None
+            ):
                 db.update_status(session_id, "awaiting_approval")
                 await broadcast(
                     session_id,
@@ -238,6 +317,13 @@ async def run_turn(session_id: str, prompt: str) -> None:
                 db.set_agent_session_id(session_id, event["session_id"])
 
             await broadcast(session_id, event)
+
+            # Answer on the user's behalf right after the request is on the wire,
+            # so the transcript shows the request followed by the auto-approval.
+            if auto_category is not None:
+                await handle_approval(
+                    session_id, event["request_id"], "allow", auto=True
+                )
     except Exception as exc:
         message = f"Agent turn failed: {exc}"
         db.append_scrollback(session_id, "error", {"message": message})
@@ -247,16 +333,56 @@ async def run_turn(session_id: str, prompt: str) -> None:
         await broadcast(session_id, {"type": "status", "status": "idle"})
         running_tasks.pop(session_id, None)
 
+    if followup_prompt:
+        # Chain the denial follow-up as a fresh turn now that this one is idle.
+        # A new turn only auto-chains again if the user denies again, so this
+        # can't spin on its own.
+        try:
+            await begin_turn(session_id, followup_prompt)
+        except HTTPException:
+            pass
 
-async def handle_approval(session_id: str, request_id: str, behavior: str) -> None:
+
+async def handle_approval(
+    session_id: str,
+    request_id: str,
+    behavior: str,
+    option_id: str | None = None,
+    message: str | None = None,
+    auto: bool = False,
+) -> None:
     session = db.require_session(session_id)
     adapter = adapters[session["agent"]]
-    await adapter.send_approval(session, request_id, behavior)
+    effective = await adapter.send_approval(
+        session, request_id, behavior, option_id=option_id, message=message
+    )
 
-    payload = {"request_id": request_id, "behavior": behavior}
+    payload: dict[str, Any] = {"request_id": request_id, "behavior": effective}
+    if option_id:
+        payload["option_id"] = option_id
+    if message:
+        payload["message"] = message
+    if auto:
+        payload["auto"] = True
     db.append_scrollback(session_id, "approval_response", payload)
     db.update_status(session_id, "running")
     await broadcast(session_id, {"type": "approval_response", **payload})
+    await broadcast(session_id, {"type": "status", "status": "running"})
+
+
+async def handle_question_answer(
+    session_id: str,
+    request_id: str,
+    answers: Any,
+) -> None:
+    session = db.require_session(session_id)
+    adapter = adapters[session["agent"]]
+    validated = await adapter.send_answer(session, request_id, answers)
+
+    payload = {"request_id": request_id, "answers": validated}
+    db.append_scrollback(session_id, "question_response", payload)
+    db.update_status(session_id, "running")
+    await broadcast(session_id, {"type": "question_response", **payload})
     await broadcast(session_id, {"type": "status", "status": "running"})
 
 

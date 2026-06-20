@@ -67,6 +67,7 @@ agent-ui/
 ├── pyproject.toml   # Dependencies (managed with uv)
 ├── Dockerfile       # Fedora + uv + Claude Code CLI + nested Podman
 ├── compose.yaml     # Host-network service, bind mounts, named auth volume
+├── docs/            # Design notes + the WebSocket event schema reference
 ├── tests/           # Unit tests (db lifecycle + adapter stream-json parsing)
 └── sessions.db      # SQLite file — gitignored, bind-mounted into the container
 ```
@@ -156,7 +157,7 @@ identical whether you use uv or Compose.
 |----------|-------------------------|------------------------------------------------------------------|
 | `GET`    | `/sessions`             | List all sessions with metadata                                  |
 | `POST`   | `/sessions`             | Create a session (`name`, `working_dir`, `agent`) → `201`        |
-| `PATCH`  | `/sessions/{id}`        | Rename a session (`name`) and return the updated session         |
+| `PATCH`  | `/sessions/{id}`        | Update a session: rename (`name`) and/or set auto-approve toggles |
 | `POST`   | `/sessions/{id}/turn`   | Send a prompt and spawn a turn → `202`                           |
 | `POST`   | `/sessions/{id}/stop`   | Stop the running process, set status → `idle`, keep the session  |
 | `DELETE` | `/sessions/{id}`        | Stop the process and delete the session and its scrollback       |
@@ -166,9 +167,12 @@ identical whether you use uv or Compose.
 `"claude-code"` (the default) or `"opencode"`. Starting a turn on a session that
 is not `idle` returns `409`.
 
-`PATCH /sessions/{id}` takes a non-empty `name` (1–120 chars, trimmed), updates
-the session's label, and broadcasts a `renamed` event to all WebSocket
-subscribers so connected clients update live.
+`PATCH /sessions/{id}` is a partial update; every field is optional and only the
+supplied ones are applied. `name` (a non-empty 1–120 char label, trimmed)
+renames the session and broadcasts a `renamed` event. `auto_approve_write` and
+`auto_approve_command` are booleans that flip the per-session auto-approval
+toggles (see [Auto-approval](#auto-approval)) and broadcast a `settings` event.
+Both broadcasts reach all WebSocket subscribers so connected clients update live.
 
 ### WebSocket
 
@@ -189,33 +193,90 @@ either way.)
 { "type": "output", "text": "..." }                                   // agent text
 { "type": "tool_use", "tool": "Bash", "input": { "command": "..." } } // tool notification
 { "type": "approval_request", "request_id": "perm_1",                 // process blocked on stdin
-  "tool": "Bash", "input": { "command": "rm -rf /tmp/test" } }
+  "tool": "Bash", "input": { "command": "rm -rf /tmp/test" },
+  "category": "command",                                              // write | command | null
+  "auto_approved": true,                                              // (optional) answered by a toggle
+  "options": [ { "id": "allow", "name": "Allow", "kind": "allow_once" },
+               { "id": "deny", "name": "Deny", "kind": "reject_once" } ] }
+{ "type": "approval_response", "request_id": "perm_1",                // broadcast when an approval resolves
+  "behavior": "allow" | "deny", "auto": true }                       // `auto` set on toggle auto-approvals
+{ "type": "question", "request_id": "perm_2",                         // AskUserQuestion (Claude only) — blocks
+  "questions": [ { "question": "...", "header": "...", "multiSelect": false,
+                   "options": [ { "label": "...", "description": "..." } ] } ] }
+{ "type": "question_response", "request_id": "perm_2",               // broadcast when a question is answered
+  "answers": { "<question text>": "<label>" } }
 { "type": "input", "text": "..." }                                    // echo of a submitted prompt
 { "type": "status", "status": "running" | "idle" | "awaiting_approval" }
 { "type": "renamed", "name": "..." }                                  // session label changed
+{ "type": "settings", "auto_approve_write": false,                    // auto-approve toggles changed
+  "auto_approve_command": true }
 { "type": "done" }                                                    // turn complete
 { "type": "error", "message": "..." }
 
 // Client -> Server
 { "type": "input", "text": "..." }                                    // start a new turn
 { "type": "approval_response", "request_id": "perm_1",                // answer an approval
-  "behavior": "allow" | "deny" }
+  "behavior": "allow" | "deny",                                       // or pick a specific option:
+  "option_id": "deny",                                                // (optional) one of options[].id
+  "message": "..." }                                                  // (optional) denial reason
+{ "type": "question_response", "request_id": "perm_2",               // answer an AskUserQuestion
+  "answers": { "<question text>": "<label>" } }                       // label, or [labels] for multiSelect
 ```
+
+`question` / `question_response` cover Claude Code's built-in **AskUserQuestion**
+tool — the agent asking the user to *pick content*, distinct from a tool
+allow/deny. A pending question reuses the `awaiting_approval` status; the client
+tells them apart by event type. OpenCode has no equivalent.
 
 ### Approval flow
 
 1. The `claude` subprocess emits a `control_request` / `sdk_control_request`
    (subtype `permission` or `can_use_tool`) and blocks on stdin.
 2. The backend sets status → `awaiting_approval`, persists the request to
-   scrollback, and broadcasts an `approval_request` to all subscribers. The
-   approval is held in an in-memory `asyncio.Future` keyed by `request_id`.
-3. A client answers with `approval_response` (`allow` or `deny`).
+   scrollback, and broadcasts an `approval_request` (with the available
+   `options`) to all subscribers. The approval is held in an in-memory
+   `asyncio.Future` keyed by `request_id`.
+3. A client answers with `approval_response`, supplying either a `behavior`
+   (`allow`/`deny`) or a specific `option_id`, plus an optional denial `message`.
 4. The backend resolves the Future and writes a `control_response` to the
-   subprocess stdin — `allow` echoes `updatedInput`, `deny` sends a denial
-   message — then flips status back to `running` and the process continues.
+   subprocess stdin — `allow` echoes `updatedInput`, `deny` sends the client's
+   `message` (falling back to a default) — then flips status back to `running`
+   and the process continues.
+
+A `deny` with a `message` is agent-specific. **Claude Code** delivers the reason
+inline in the denial, so the agent reacts to it in the same turn. **OpenCode**'s
+ACP cannot relay a reason (and 1.17.3 has no `session/cancel`), so a plain
+"reject" would leave the agent speculating for the rest of the turn. Instead the
+OpenCode adapter ends the turn at the denial and emits an internal `followup`
+event; `run_turn` then auto-starts a new turn whose prompt restates the denied
+tool + input + reason. `session/load` resumes the conversation, and because the
+follow-up prompt is self-contained it does not depend on OpenCode having
+persisted the interrupted call.
 
 If the session is stopped or the process exits while an approval is pending, the
 Future is failed and the prompt is cleared.
+
+### Auto-approval
+
+Each session carries two toggles — `auto_approve_write` and
+`auto_approve_command` — set via `PATCH /sessions/{id}`. Nothing changes on the
+agent side: both adapters still run in "ask every time" mode and still emit an
+`approval_request`. The toggles only change whether the *backend* waits for a
+human or answers `allow` itself.
+
+Every `approval_request` carries a `category` the adapter derives from the tool —
+Claude Code by tool name (`Bash` → `command`; `Write`/`Edit`/`MultiEdit`/
+`NotebookEdit` → `write`), OpenCode from ACP's `toolCall.kind` (`execute` →
+`command`; `edit`/`delete`/`move` → `write`). When the matching session toggle is
+on, `run_turn` marks the request `auto_approved`, broadcasts it without entering
+`awaiting_approval`, and immediately answers `allow` on the user's behalf (the
+resulting `approval_response` carries `auto: true`). The toggle is re-read from
+the database on each approval, so flipping it mid-turn takes effect on the next
+tool call.
+
+There is no `read` toggle: read-only tools are auto-allowed by Claude Code's
+`--permission-mode default` and by OpenCode's permission config, so they never
+reach this gate. Tools with no category (e.g. `WebFetch`) always prompt.
 
 ## Data model
 
@@ -231,6 +292,8 @@ Future is failed and the prompt is cleared.
 | `status`            | TEXT    | `idle` \| `running` \| `awaiting_approval`                  |
 | `created_at`        | TEXT    | ISO 8601 (UTC, `Z`)                                         |
 | `last_active_at`    | TEXT    | ISO 8601, bumped on each turn                               |
+| `auto_approve_write`   | INTEGER | `0`/`1` — auto-approve write/edit tools (default `0`)    |
+| `auto_approve_command` | INTEGER | `0`/`1` — auto-approve shell commands (default `0`)      |
 
 ### `scrollback` (append-only)
 
@@ -239,7 +302,7 @@ Future is failed and the prompt is cleared.
 | `id`         | INTEGER | Autoincrement PK                                                               |
 | `session_id` | TEXT FK | References `sessions.id` (`ON DELETE CASCADE`)                                 |
 | `ts`         | TEXT    | ISO 8601                                                                       |
-| `type`       | TEXT    | `input` \| `output` \| `tool_use` \| `approval_request` \| `approval_response` \| `error` |
+| `type`       | TEXT    | `input` \| `output` \| `tool_use` \| `approval_request` \| `approval_response` \| `question` \| `question_response` \| `error` |
 | `payload`    | TEXT    | JSON blob                                                                      |
 
 SQLite runs in WAL mode with foreign keys on. On startup, any session left in a
@@ -259,7 +322,8 @@ Adapters implement a small interface so other CLIs can be added later:
 ```python
 class AgentAdapter:
     async def start_turn(session, prompt) -> AsyncIterator[AgentEvent]
-    async def send_approval(session, request_id, behavior) -> None
+    async def send_approval(session, request_id, behavior,
+                            *, option_id=None, message=None) -> str  # effective allow/deny
     async def stop(session) -> None
 ```
 
@@ -274,7 +338,7 @@ class AgentAdapter:
 | **Codex**       | `codex exec --json`                       | `codex exec resume`     | not in `exec` — needs persistent `app-server`  |
 
 Both shipping adapters are **one short-lived subprocess per turn** and surface
-real allow/deny approvals; they only differ in wire protocol.
+real multiple-choice approvals; they only differ in wire protocol.
 
 **Claude Code** speaks Anthropic's `stream-json` over stdio: we write the user
 message to stdin, stream JSON events from stdout, and answer
@@ -287,8 +351,12 @@ and bidirectional. Each turn the adapter spawns `opencode acp`, calls
 `session/prompt`, maps the streamed `session/update` notifications
 (`agent_message_chunk` → `output`, `tool_call`/`tool_call_update` → `tool_use`)
 to `AgentEvent`s, and answers the agent's `session/request_permission` callbacks
-as `approval_request` → `allow`/`deny`. The session id returned by
-`session/new` is stored as `agent_session_id` and replayed via `session/load`.
+by forwarding the chosen `optionId`. The request's `options` are passed through
+to the client so it can offer the agent's actual choices (e.g. allow always).
+ACP has no field for a free-form denial reason, so a `deny` with a `message` is
+handled by interrupting the turn and re-prompting with the reason (see the
+approval flow above). The session id returned by `session/new` is stored as
+`agent_session_id` and replayed via `session/load`.
 
 OpenCode only emits `session/request_permission` for tools configured to `"ask"`
 — out of the box most tools default to `"allow"` and would run without

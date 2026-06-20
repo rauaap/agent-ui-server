@@ -11,9 +11,24 @@ from typing import Any
 
 VALID_STATUSES = {"idle", "running", "awaiting_approval"}
 
+# Per-session auto-approve toggles, stored as 0/1 INTEGER columns. Read-only
+# tools never reach the permission gate on either agent, so only the mutating
+# categories are switchable; the keys here are the column suffixes.
+AUTO_APPROVE_CATEGORIES = ("write", "command")
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _row_to_session(row: sqlite3.Row) -> dict[str, Any]:
+    """Decode a sessions row, coercing the auto-approve flags to bool."""
+    session = dict(row)
+    for category in AUTO_APPROVE_CATEGORIES:
+        column = f"auto_approve_{category}"
+        if column in session:
+            session[column] = bool(session[column])
+    return session
 
 
 class Database:
@@ -40,7 +55,9 @@ class Database:
                     agent_session_id TEXT,
                     status TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    last_active_at TEXT NOT NULL
+                    last_active_at TEXT NOT NULL,
+                    auto_approve_write INTEGER NOT NULL DEFAULT 0,
+                    auto_approve_command INTEGER NOT NULL DEFAULT 0
                 )
                 """
             )
@@ -55,6 +72,15 @@ class Database:
                     "ALTER TABLE sessions "
                     "RENAME COLUMN claude_session_id TO agent_session_id"
                 )
+            # Add the per-session auto-approve toggles to databases created
+            # before the feature existed.
+            for category in AUTO_APPROVE_CATEGORIES:
+                column = f"auto_approve_{category}"
+                if column not in columns:
+                    self._conn.execute(
+                        f"ALTER TABLE sessions "
+                        f"ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
+                    )
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS scrollback (
@@ -87,12 +113,13 @@ class Database:
             rows = self._conn.execute(
                 """
                 SELECT id, name, working_dir, agent, agent_session_id, status,
-                       created_at, last_active_at
+                       created_at, last_active_at,
+                       auto_approve_write, auto_approve_command
                 FROM sessions
                 ORDER BY last_active_at DESC, created_at DESC
                 """
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [_row_to_session(row) for row in rows]
 
     def create_session(self, name: str, working_dir: str, agent: str) -> dict[str, Any]:
         session_id = str(uuid.uuid4())
@@ -123,13 +150,14 @@ class Database:
             row = self._conn.execute(
                 """
                 SELECT id, name, working_dir, agent, agent_session_id, status,
-                       created_at, last_active_at
+                       created_at, last_active_at,
+                       auto_approve_write, auto_approve_command
                 FROM sessions
                 WHERE id = ?
                 """,
                 (session_id,),
             ).fetchone()
-        return dict(row) if row else None
+        return _row_to_session(row) if row else None
 
     def require_session(self, session_id: str) -> dict[str, Any]:
         session = self.get_session(session_id)
@@ -153,6 +181,40 @@ class Database:
             cursor = self._conn.execute(
                 "UPDATE sessions SET name = ? WHERE id = ?",
                 (name, session_id),
+            )
+        if cursor.rowcount == 0:
+            raise KeyError(f"Unknown session: {session_id}")
+        return self.require_session(session_id)
+
+    def set_auto_approve(
+        self,
+        session_id: str,
+        *,
+        write: bool | None = None,
+        command: bool | None = None,
+    ) -> dict[str, Any]:
+        """Update whichever auto-approve toggles are provided; leave the rest.
+
+        Returns the refreshed session. A call with nothing to update is a no-op
+        that still returns the current row.
+        """
+        updates = {"write": write, "command": command}
+        assignments: list[str] = []
+        params: list[Any] = []
+        for category, value in updates.items():
+            if value is None:
+                continue
+            assignments.append(f"auto_approve_{category} = ?")
+            params.append(1 if value else 0)
+
+        if not assignments:
+            return self.require_session(session_id)
+
+        params.append(session_id)
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                f"UPDATE sessions SET {', '.join(assignments)} WHERE id = ?",
+                params,
             )
         if cursor.rowcount == 0:
             raise KeyError(f"Unknown session: {session_id}")
