@@ -13,6 +13,13 @@ from typing import Any
 AgentEvent = dict[str, Any]
 
 
+# asyncio's StreamReader defaults to a 64 KiB line buffer. Agent stdout is
+# newline-delimited JSON whose single lines (large tool results, file reads,
+# long assistant messages) routinely exceed that, which makes readline() raise
+# "Separator is found, but chunk is longer than limit". Give it ample room.
+STREAM_LIMIT = 64 * 1024 * 1024  # 64 MiB
+
+
 class AgentAdapter(abc.ABC):
     @abc.abstractmethod
     async def start_turn(
@@ -77,6 +84,7 @@ class ClaudeCodeAdapter(AgentAdapter):
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                limit=STREAM_LIMIT,
             )
         except FileNotFoundError as exc:
             yield {"type": "error", "message": f"Unable to start Claude Code: {exc}"}
@@ -456,6 +464,7 @@ class OpenCodeAdapter(AgentAdapter):
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                limit=STREAM_LIMIT,
             )
         except FileNotFoundError as exc:
             yield {"type": "error", "message": f"Unable to start OpenCode: {exc}"}
