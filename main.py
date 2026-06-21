@@ -15,7 +15,7 @@ from db import Database
 
 SCROLLBACK_REPLAY_LIMIT = 200
 
-app = FastAPI(title="agent-ui")
+app = FastAPI(title="agent-ui-server")
 db = Database(os.environ.get("SESSION_DB", "sessions.db"))
 adapters: dict[str, AgentAdapter] = {
     "claude-code": ClaudeCodeAdapter(),

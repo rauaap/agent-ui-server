@@ -1,5 +1,5 @@
 [project]
-name = "agent-ui"
+name = "agent-ui-server"
 version = "0.1.0"
 description = "Mobile-first web UI for controlling Claude Code agent sessions."
 requires-python = ">=3.11"

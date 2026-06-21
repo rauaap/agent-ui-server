@@ -1064,7 +1064,7 @@ class OpenCodeAdapter(AgentAdapter):
                 if event_type == "done" and not produced:
                     yield {
                         "type": "output",
-                        "text": "[agent-ui] OpenCode produced no output. This "
+                        "text": "[agent-ui-server] OpenCode produced no output. This "
                         "usually means the model call failed silently — run "
                         "`opencode run \"hi\"` to see the real error (often an "
                         "expired auth token; fix with `opencode auth login`).",

@@ -1,4 +1,4 @@
-# agent-ui
+# agent-ui-server
 
 A lightweight, self-hosted backend for driving [Claude Code](https://github.com/anthropics/claude-code)
 agent sessions on a VPS from your phone. It replaces the Termux + tmux workflow:
@@ -8,14 +8,14 @@ native **Android app** over WireGuard.
 > **Scope.** This repo is the backend / control plane: a FastAPI app, a Claude
 > Code adapter, and a SQLite store. It is implemented and tested. The client is
 > a separate Android app —
-> [rauaap/agent-ui-android](https://github.com/rauaap/agent-ui-android) — that
+> [rauaap/agent-ui-server-android](https://github.com/rauaap/agent-ui-server-android) — that
 > talks to it over the REST + WebSocket API documented below; that API is also
 > reachable from any WebSocket client (`curl`, `websocat`, etc.) for testing.
 
 ## Why
 
 Controlling a coding agent from a phone usually means SSH'ing into a box and
-fighting a terminal multiplexer through a touchscreen keyboard. agent-ui gives
+fighting a terminal multiplexer through a touchscreen keyboard. agent-ui-server gives
 each session stable metadata, streams output as plain JSON events, and surfaces
 tool-approval requests as simple allow/deny messages the Android app renders as
 buttons — no PTY, no terminal emulator, no copy-paste gymnastics.
@@ -59,7 +59,7 @@ with the `session_id` captured from the previous turn's `result` event.
 ### Source layout
 
 ```
-agent-ui/
+agent-ui-server/
 ├── main.py          # FastAPI app — REST routes, WebSocket endpoint, turn orchestration
 ├── agent.py         # AgentAdapter base + ClaudeCodeAdapter (stream-json) + OpenCodeAdapter (ACP)
 ├── opencode_permissions.json  # Default OpenCode permission config (gates tools to "ask")
@@ -116,8 +116,8 @@ After the **first** deploy, log in once inside the container — each agent you
 intend to use needs its own login:
 
 ```sh
-docker compose exec agent-ui claude login          # Claude Code
-docker compose exec agent-ui opencode auth login   # OpenCode
+docker compose exec agent-ui-server claude login          # Claude Code
+docker compose exec agent-ui-server opencode auth login   # OpenCode
 ```
 
 Credentials are persisted on the `claude-auth` named volume (mounted at

@@ -1,5 +1,5 @@
 services:
-  agent-ui:
+  agent-ui-server:
     build: .
     network_mode: host
     privileged: true          # required for nested podman (containers inside the container)

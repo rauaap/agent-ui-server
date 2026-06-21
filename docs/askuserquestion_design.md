@@ -12,7 +12,7 @@ the *user* a multiple-choice question (e.g. "Which emoji? Cat / Rocket / Taco")
 and waits for the user's selection. The selection is the tool's **answer**, not a
 permission allow/deny.
 
-Today the agent-ui backend gates every tool through the permission path. So an
+Today the agent-ui-server backend gates every tool through the permission path. So an
 `AskUserQuestion` call arrives as a normal `approval_request` whose synthesized
 `options` are just Allow / Deny. The front-end renders deny/accept; the real
 choices (Cat/Rocket/Taco) are buried, unrendered, in `input.questions[].options`,

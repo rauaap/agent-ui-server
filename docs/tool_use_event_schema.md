@@ -69,7 +69,7 @@ optional), `timeout` (number, ms, optional). Only `command` is reliably present.
   "type": "tool_use",
   "tool": "Edit",
   "input": {
-    "file_path": "/home/mapadmin/agent-ui/main.py",
+    "file_path": "/home/mapadmin/agent-ui-server/main.py",
     "old_string": "host=\"127.0.0.1\"",
     "new_string": "host=os.environ[\"WIREGUARD_IP\"]",
     "replace_all": false
