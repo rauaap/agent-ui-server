@@ -3,10 +3,14 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from typing import Any
 
 import asyncio
 
+from fastapi import HTTPException
+
+import db as db_module
 from agent import (
     ApprovalDecision,
     ClaudeCodeAdapter,
@@ -97,6 +101,327 @@ class DatabaseTests(unittest.TestCase):
             )
             with self.assertRaises(KeyError):
                 database.set_auto_approve("missing", write=True)
+            database.close()
+
+
+class ProjectTableTests(unittest.TestCase):
+    def test_create_project_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Database(Path(tmpdir) / "sessions.db")
+
+            created = database.create_project("/projects/demo", "demo")
+            self.assertEqual(created["path"], "/projects/demo")
+            self.assertEqual(created["name"], "demo")
+            self.assertEqual(created["session_count"], 0)
+            self.assertIsNone(created["last_active_at"])
+
+            # Creating it again neither duplicates nor errors.
+            again = database.create_project("/projects/demo", "renamed")
+            self.assertEqual(again["name"], "demo")
+            self.assertEqual(len(database.list_projects()), 1)
+
+            database.close()
+
+    def test_projects_carry_session_aggregates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Database(Path(tmpdir) / "sessions.db")
+            database.create_project("/projects/shared", "shared")
+            database.create_project("/projects/empty", "empty")
+            for name in ("one", "two"):
+                database.create_session(
+                    name=name, working_dir="/projects/shared", agent="claude-code"
+                )
+
+            projects = {p["path"]: p for p in database.list_projects()}
+            self.assertEqual(projects["/projects/shared"]["session_count"], 2)
+            self.assertEqual(projects["/projects/empty"]["session_count"], 0)
+            self.assertIsNone(projects["/projects/empty"]["last_active_at"])
+
+            newest = max(
+                session["last_active_at"]
+                for session in database.list_sessions()
+                if session["working_dir"] == "/projects/shared"
+            )
+            self.assertEqual(projects["/projects/shared"]["last_active_at"], newest)
+
+            database.close()
+
+    def test_sessions_elsewhere_do_not_leak_into_a_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Database(Path(tmpdir) / "sessions.db")
+            database.create_project("/projects/demo", "demo")
+            database.create_session(
+                name="other", working_dir="/projects/demo-2", agent="claude-code"
+            )
+
+            self.assertEqual(
+                database.get_project("/projects/demo")["session_count"], 0
+            )
+            self.assertIsNone(database.get_project("/projects/missing"))
+            database.close()
+
+    def test_projects_sorted_by_recency_with_never_used_last(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Database(Path(tmpdir) / "sessions.db")
+            for path in ("/p/older", "/p/newer", "/p/b-idle", "/p/a-idle"):
+                database.create_project(path, PurePosixPath(path).name)
+
+            # Pin the clock so the two active projects differ by more than the
+            # one-second resolution of the stored timestamps.
+            stamps = iter(["2026-07-27T10:00:00Z", "2026-07-28T10:00:00Z"])
+            original = db_module.utc_now
+            db_module.utc_now = lambda: next(stamps)
+            try:
+                database.create_session(
+                    name="a", working_dir="/p/older", agent="claude-code"
+                )
+                database.create_session(
+                    name="b", working_dir="/p/newer", agent="claude-code"
+                )
+            finally:
+                db_module.utc_now = original
+
+            self.assertEqual(
+                [p["path"] for p in database.list_projects()],
+                ["/p/newer", "/p/older", "/p/a-idle", "/p/b-idle"],
+            )
+            database.close()
+
+    def test_projects_survive_reopening_the_database(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sessions.db"
+            database = Database(path)
+            database.create_project("/projects/demo", "demo")
+            database.close()
+
+            database = Database(path)
+            projects = database.list_projects()
+            self.assertEqual([p["path"] for p in projects], ["/projects/demo"])
+            self.assertEqual(projects[0]["name"], "demo")
+            database.close()
+
+
+class CreateProjectTests(unittest.IsolatedAsyncioTestCase):
+    async def _create(self, database: Database, path: str) -> dict[str, Any]:
+        import main
+
+        original = main.db
+        main.db = database
+        try:
+            return await main.create_project(main.CreateProjectRequest(path=path))
+        finally:
+            main.db = original
+
+    async def test_creates_directory_and_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Database(Path(tmpdir) / "sessions.db")
+            target = Path(tmpdir) / "group" / "fresh"
+
+            project = await self._create(database, str(target))
+
+            self.assertTrue(target.is_dir())
+            self.assertEqual(project["path"], str(target))
+            self.assertEqual(project["name"], "fresh")
+            self.assertEqual(project["session_count"], 0)
+            self.assertIsNone(project["last_active_at"])
+            self.assertEqual([p["path"] for p in database.list_projects()],
+                             [str(target)])
+            database.close()
+
+    async def test_recreating_reports_real_aggregates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Database(Path(tmpdir) / "sessions.db")
+            target = str(Path(tmpdir) / "used")
+            await self._create(database, target)
+            database.create_session(
+                name="one", working_dir=target, agent="claude-code"
+            )
+
+            again = await self._create(database, target)
+            self.assertEqual(again["session_count"], 1)
+            self.assertEqual(len(database.list_projects()), 1)
+            database.close()
+
+    async def test_trailing_slash_and_traversal_are_normalised(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Database(Path(tmpdir) / "sessions.db")
+            messy = str(Path(tmpdir)) + "/one/../two//three/"
+
+            project = await self._create(database, messy)
+
+            # Same directory must not be able to enter the table twice under
+            # two spellings.
+            self.assertEqual(project["path"], str(Path(tmpdir) / "two" / "three"))
+            self.assertEqual(project["name"], "three")
+            database.close()
+
+    async def test_relative_path_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Database(Path(tmpdir) / "sessions.db")
+            with self.assertRaises(HTTPException) as caught:
+                await self._create(database, "relative/dir")
+            self.assertEqual(caught.exception.status_code, 400)
+            self.assertEqual(database.list_projects(), [])
+            database.close()
+
+    async def test_filesystem_root_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Database(Path(tmpdir) / "sessions.db")
+            with self.assertRaises(HTTPException) as caught:
+                await self._create(database, "/")
+            self.assertEqual(caught.exception.status_code, 400)
+            database.close()
+
+    async def test_explicit_name_is_kept_and_may_differ_from_the_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Database(Path(tmpdir) / "sessions.db")
+            target = str(Path(tmpdir) / "some-dir")
+
+            import main
+
+            original = main.db
+            main.db = database
+            try:
+                project = await main.create_project(
+                    main.CreateProjectRequest(path=target, name="My Project")
+                )
+            finally:
+                main.db = original
+
+            # The user broke the name/path link in the dialog, so the label
+            # must not be re-derived from the directory.
+            self.assertEqual(project["name"], "My Project")
+            self.assertEqual(project["path"], target)
+            database.close()
+
+    async def test_adopting_an_existing_directory_is_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Database(Path(tmpdir) / "sessions.db")
+            target = Path(tmpdir) / "already-here"
+            target.mkdir()
+            (target / "code.py").write_text("x")
+
+            project = await self._create(database, str(target))
+
+            self.assertEqual(project["path"], str(target))
+            self.assertTrue(project["exists"])
+            # Adopting must not disturb what is already in the directory.
+            self.assertEqual((target / "code.py").read_text(), "x")
+            database.close()
+
+    async def test_exists_flag_tracks_the_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Database(Path(tmpdir) / "sessions.db")
+            target = Path(tmpdir) / "vanishing"
+            await self._create(database, str(target))
+
+            import main
+
+            original = main.db
+            main.db = database
+            try:
+                self.assertTrue((await main.list_projects())[0]["exists"])
+                target.rmdir()
+                # The row survives; only the flag changes.
+                listed = await main.list_projects()
+                self.assertEqual(len(listed), 1)
+                self.assertFalse(listed[0]["exists"])
+            finally:
+                main.db = original
+            database.close()
+
+    async def test_undeletable_path_is_a_400_not_a_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Database(Path(tmpdir) / "sessions.db")
+            # A file where the directory should go: mkdir fails, and the row
+            # must not be written either.
+            blocker = Path(tmpdir) / "blocker"
+            blocker.write_text("x")
+
+            with self.assertRaises(HTTPException) as caught:
+                await self._create(database, str(blocker))
+            self.assertEqual(caught.exception.status_code, 400)
+            self.assertEqual(database.list_projects(), [])
+            database.close()
+
+
+class DeleteProjectTests(unittest.IsolatedAsyncioTestCase):
+    async def _delete(self, database: Database, path: str) -> dict[str, Any]:
+        import main
+
+        original = main.db
+        main.db = database
+        try:
+            return await main.delete_project(main.DeleteProjectRequest(path=path))
+        finally:
+            main.db = original
+
+    async def test_deletes_row_and_sessions_but_never_the_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Database(Path(tmpdir) / "sessions.db")
+            target = Path(tmpdir) / "doomed"
+            target.mkdir()
+            (target / "work.txt").write_text("the agent's output")
+            database.create_project(str(target), "doomed")
+
+            for name in ("one", "two"):
+                database.create_session(
+                    name=name, working_dir=str(target), agent="claude-code"
+                )
+            keeper = database.create_session(
+                name="elsewhere",
+                working_dir=str(Path(tmpdir) / "other"),
+                agent="claude-code",
+            )
+
+            result = await self._delete(database, str(target))
+
+            self.assertEqual(result["sessions_deleted"], 2)
+            self.assertEqual(database.list_projects(), [])
+            # Sessions in other directories are untouched.
+            self.assertEqual(
+                [s["id"] for s in database.list_sessions()], [keeper["id"]]
+            )
+            # The whole point: files on disk survive.
+            self.assertTrue(target.is_dir())
+            self.assertEqual((target / "work.txt").read_text(), "the agent's output")
+            database.close()
+
+    async def test_deleting_scrollback_goes_with_the_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Database(Path(tmpdir) / "sessions.db")
+            target = str(Path(tmpdir) / "doomed")
+            database.create_project(target, "doomed")
+            session = database.create_session(
+                name="one", working_dir=target, agent="claude-code"
+            )
+            database.append_scrollback(session["id"], "input", {"text": "hello"})
+
+            await self._delete(database, target)
+
+            self.assertEqual(database.recent_scrollback(session["id"]), [])
+            database.close()
+
+    async def test_missing_directory_can_still_be_deleted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Database(Path(tmpdir) / "sessions.db")
+            # The case the client's pop-up exists for: directory removed
+            # outside the app, project row left behind.
+            gone = str(Path(tmpdir) / "gone")
+            database.create_project(gone, "gone")
+
+            result = await self._delete(database, gone)
+
+            self.assertEqual(result["sessions_deleted"], 0)
+            self.assertEqual(database.list_projects(), [])
+            database.close()
+
+    async def test_unknown_project_is_404(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Database(Path(tmpdir) / "sessions.db")
+            with self.assertRaises(HTTPException) as caught:
+                await self._delete(database, "/projects/never-existed")
+            self.assertEqual(caught.exception.status_code, 404)
             database.close()
 
 

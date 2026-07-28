@@ -155,6 +155,9 @@ identical whether you use uv or Compose.
 
 | Method   | Path                    | Description                                                       |
 |----------|-------------------------|------------------------------------------------------------------|
+| `GET`    | `/projects`             | List projects (working directories) with session aggregates      |
+| `POST`   | `/projects`             | Create a project: `mkdir -p` + row (`path`, `name`) → `201`      |
+| `DELETE` | `/projects`             | Forget a project and its sessions (`path`); disk untouched       |
 | `GET`    | `/sessions`             | List all sessions with metadata                                  |
 | `POST`   | `/sessions`             | Create a session (`name`, `working_dir`, `agent`) → `201`        |
 | `PATCH`  | `/sessions/{id}`        | Update a session: rename (`name`) and/or set auto-approve toggles |
@@ -173,6 +176,70 @@ renames the session and broadcasts a `renamed` event. `auto_approve_write` and
 `auto_approve_command` are booleans that flip the per-session auto-approval
 toggles (see [Auto-approval](#auto-approval)) and broadcast a `settings` event.
 Both broadcasts reach all WebSocket subscribers so connected clients update live.
+
+#### Projects
+
+A **project** is a working directory, stored as a row in `projects` and keyed by
+its path. The server never scans the filesystem to discover projects and has no
+configured projects root: a project exists because it was created through
+`POST /projects`, and nowhere else.
+
+```jsonc
+[
+  { "path": "/projects/agent-ui", "name": "agent-ui", "exists": true,
+    "session_count": 3, "last_active_at": "2026-07-28T09:14:02Z" },
+  { "path": "/projects/scratch",  "name": "scratch",  "exists": false,
+    "session_count": 0, "last_active_at": null }
+]
+```
+
+`session_count` and `last_active_at` are a `LEFT JOIN` onto `sessions` matched on
+`working_dir`, so a project with no sessions yet reports `0` / `null`. Results
+are sorted by `last_active_at` descending — SQLite sorts `NULL` below everything,
+so never-used projects land last — then by `path` ascending.
+
+`exists` is a `stat` of the stored path at request time, not a discovery scan.
+Because the row is the record, a directory removed outside the app leaves the
+project in place; the flag is how a client can say so and offer to forget it.
+
+#### `POST /projects`
+
+Takes `{ "path": "/projects/foo", "name": "foo" }`, creates the directory
+(`mkdir -p`), inserts the row, and returns the same shape as a list entry.
+
+- `path` must be absolute, and is normalised lexically (`..` and duplicate
+  slashes collapsed, trailing slash dropped) so one directory cannot enter the
+  table twice under two spellings. `/` itself is a `400`.
+- `name` is optional and defaults to the path's last segment. It is stored
+  separately because the client lets you break the link between the two — a
+  project may be called `api` while living in `/projects/backend-rewrite`.
+- An **existing** directory is adopted as-is, but it has to be usable: a path
+  that exists and is not a directory, or a directory the server cannot write to,
+  is a `400` rather than a project that fails on its first turn.
+- Creating a project that already exists is a no-op returning its real
+  aggregates, not an error.
+
+#### `DELETE /projects`
+
+Takes `{ "path": "/projects/foo" }` and **never touches the filesystem** — the
+directory and everything the agent wrote in it stay exactly where they are.
+
+What it does remove is the row *and every session whose `working_dir` matches*,
+along with their scrollback: sessions are reachable only through their project,
+so leaving them would strand history with no way to open or delete it. The
+response reports the count (`{"status": "deleted", "sessions_deleted": 2}`) so a
+client can say up front what will be lost. Running sessions are stopped first,
+exactly as `DELETE /sessions/{id}` does. Unknown path → `404`.
+
+The path travels in the body rather than the URL for the same reason there are
+no nested `/projects/{path}/sessions` routes: a filesystem path does not belong
+in a URL segment. `GET /sessions` already carries `working_dir` on every row, so
+clients group locally.
+
+Sessions are **not** restricted to projects: `POST /sessions` still takes any
+absolute `working_dir` and does its own `mkdir -p`. Nothing reconciles the two
+afterwards, so a session whose `working_dir` has no project row simply does not
+appear in a client that browses by project. Create the project first.
 
 ### WebSocket
 
@@ -279,6 +346,18 @@ There is no `read` toggle: read-only tools are auto-allowed by Claude Code's
 reach this gate. Tools with no category (e.g. `WebFetch`) always prompt.
 
 ## Data model
+
+### `projects`
+
+| Column       | Type    | Notes                                                        |
+|--------------|---------|--------------------------------------------------------------|
+| `path`       | TEXT PK | Absolute working directory, normalised — the project's identity |
+| `name`       | TEXT    | Display label; defaults to the path's last segment but may differ |
+| `created_at` | TEXT    | ISO 8601 (UTC, `Z`)                                          |
+
+Sessions join to a project on `sessions.working_dir = projects.path`. There is
+deliberately **no foreign key**: `POST /sessions` accepts any absolute directory,
+and a session must never be blocked because its directory has no project row.
 
 ### `sessions`
 

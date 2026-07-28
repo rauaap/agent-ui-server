@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 from collections import defaultdict
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -24,6 +24,29 @@ adapters: dict[str, AgentAdapter] = {
 subscribers: dict[str, set[WebSocket]] = defaultdict(set)
 running_tasks: dict[str, asyncio.Task[None]] = {}
 turn_lock = asyncio.Lock()
+
+
+class CreateProjectRequest(BaseModel):
+    """A project's directory, and optionally a label that differs from it.
+
+    The client seeds the path from the name, but lets the user break that link
+    and point the project somewhere else — so the two are stored separately.
+    """
+
+    path: str = Field(min_length=1)
+    name: str | None = Field(default=None, max_length=120)
+
+    @field_validator("name")
+    @classmethod
+    def strip_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
+
+
+class DeleteProjectRequest(BaseModel):
+    path: str = Field(min_length=1)
 
 
 class CreateSessionRequest(BaseModel):
@@ -70,6 +93,68 @@ async def shutdown() -> None:
     if running_tasks:
         await asyncio.gather(*running_tasks.values(), return_exceptions=True)
     db.close()
+
+
+@app.get("/projects")
+async def list_projects() -> list[dict[str, Any]]:
+    return [with_existence(project) for project in db.list_projects()]
+
+
+@app.post("/projects", status_code=201)
+async def create_project(payload: CreateProjectRequest) -> dict[str, Any]:
+    """Register a project and create its directory.
+
+    The row is the record — nothing is inferred from the filesystem — so a
+    project lists from the moment it is created rather than only once its first
+    session exists. Creating one that already exists is a no-op.
+    """
+    path = normalize_project_path(payload.path)
+    target = Path(path)
+
+    # Adopting a directory that already exists is normal; adopting something
+    # that is not a usable directory is not, and failing here beats failing on
+    # the first turn the agent tries to run.
+    if target.exists() and not target.is_dir():
+        raise HTTPException(
+            status_code=400, detail="path exists but is not a directory"
+        )
+    if target.is_dir() and not os.access(target, os.W_OK | os.X_OK):
+        raise HTTPException(
+            status_code=400, detail="directory exists but is not writable"
+        )
+
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not create project directory: {exc}",
+        )
+
+    name = payload.name or PurePosixPath(path).name
+    return with_existence(db.create_project(path=path, name=name))
+
+
+@app.delete("/projects")
+async def delete_project(payload: DeleteProjectRequest) -> dict[str, Any]:
+    """Forget a project and its sessions. Never touches the directory on disk.
+
+    The sessions go with it: they are reachable only through their project, so
+    leaving them behind would strand their scrollback with no way to open or
+    delete it. The files the agent produced are left exactly where they are.
+
+    Takes the path in the body rather than the URL — a filesystem path does not
+    belong in a path segment, and the same reasoning kept `/sessions` flat.
+    """
+    path = normalize_project_path(payload.path)
+    if db.get_project(path) is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    doomed = [s for s in db.list_sessions() if s["working_dir"] == path]
+    for session in doomed:
+        await teardown_session(session)
+    db.delete_project(path)
+    return {"status": "deleted", "sessions_deleted": len(doomed)}
 
 
 @app.get("/sessions")
@@ -144,23 +229,7 @@ async def stop_session(session_id: str) -> dict[str, str]:
 
 @app.delete("/sessions/{session_id}")
 async def delete_session(session_id: str) -> dict[str, str]:
-    session = require_session_or_404(session_id)
-    adapter = adapters[session["agent"]]
-
-    await adapter.stop(session)
-    task = running_tasks.pop(session_id, None)
-    if task:
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-
-    for websocket in list(subscribers.get(session_id, set())):
-        try:
-            await websocket.close(code=1000)
-        except Exception:
-            pass
-    subscribers.pop(session_id, None)
-
-    db.delete_session(session_id)
+    await teardown_session(require_session_or_404(session_id))
     return {"status": "deleted"}
 
 
@@ -404,6 +473,57 @@ async def broadcast(session_id: str, message: dict[str, Any]) -> None:
         subscribers[session_id].discard(websocket)
     if session_id in subscribers and not subscribers[session_id]:
         subscribers.pop(session_id, None)
+
+
+async def teardown_session(session: dict[str, Any]) -> None:
+    """Stop a session's process, drop its subscribers, and delete its row.
+
+    Shared by deleting one session and deleting a whole project's worth.
+    """
+    session_id = session["id"]
+    adapter = adapters[session["agent"]]
+
+    await adapter.stop(session)
+    task = running_tasks.pop(session_id, None)
+    if task:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    for websocket in list(subscribers.get(session_id, set())):
+        try:
+            await websocket.close(code=1000)
+        except Exception:
+            pass
+    subscribers.pop(session_id, None)
+
+    db.delete_session(session_id)
+
+
+def with_existence(project: dict[str, Any]) -> dict[str, Any]:
+    """Annotate a project with whether its directory is still there.
+
+    One stat per project, not a scan: the client needs it to explain a project
+    whose directory was removed outside the app and offer to forget it.
+    """
+    return {**project, "exists": os.path.isdir(project["path"])}
+
+
+def normalize_project_path(raw: str) -> str:
+    """Absolute, lexically normalised project path.
+
+    Normalising is purely textual — no filesystem access — so it collapses
+    `..` and duplicate slashes without resolving symlinks or requiring the
+    directory to exist yet.
+    """
+    path = raw.strip()
+    if not path.startswith("/"):
+        raise HTTPException(status_code=400, detail="path must be absolute")
+    path = os.path.normpath(path)
+    if path == "/":
+        raise HTTPException(
+            status_code=400, detail="path must name a directory, not /"
+        )
+    return path
 
 
 def require_session_or_404(session_id: str) -> dict[str, Any]:

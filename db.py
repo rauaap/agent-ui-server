@@ -97,6 +97,18 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_scrollback_session_id_id "
                 "ON scrollback(session_id, id)"
             )
+            # Projects are explicit rows, keyed by their working directory —
+            # sessions reference that path rather than an id, so there is no
+            # foreign key and a session can still be created anywhere.
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS projects (
+                    path TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
 
     def close(self) -> None:
         with self._lock:
@@ -120,6 +132,61 @@ class Database:
                 """
             ).fetchall()
         return [_row_to_session(row) for row in rows]
+
+    # A project row plus the aggregates its card shows. The LEFT JOIN keeps
+    # projects with no sessions, which report 0 / NULL. SQLite sorts NULL below
+    # everything, so DESC already puts never-used projects last.
+    _PROJECT_QUERY = """
+        SELECT p.path, p.name,
+               COUNT(s.id) AS session_count,
+               MAX(s.last_active_at) AS last_active_at
+        FROM projects p
+        LEFT JOIN sessions s ON s.working_dir = p.path
+        {where}
+        GROUP BY p.path, p.name
+        ORDER BY last_active_at DESC, p.path ASC
+    """
+
+    def list_projects(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                self._PROJECT_QUERY.format(where="")
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_project(self, path: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                self._PROJECT_QUERY.format(where="WHERE p.path = ?"),
+                (path,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def delete_project(self, path: str) -> bool:
+        """Forget a project. Its sessions are removed by the caller first."""
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                "DELETE FROM projects WHERE path = ?",
+                (path,),
+            )
+        return cursor.rowcount > 0
+
+    def create_project(self, path: str, name: str) -> dict[str, Any]:
+        """Register a project. Creating one that exists is a no-op, not an error.
+
+        Returns the project either way, so a repeat create reports the real
+        session aggregates rather than claiming the project is empty.
+        """
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO projects (path, name, created_at) "
+                "VALUES (?, ?, ?)",
+                (path, name, utc_now()),
+            )
+        project = self.get_project(path)
+        if project is None:
+            raise KeyError(f"Unknown project: {path}")
+        return project
 
     def create_session(self, name: str, working_dir: str, agent: str) -> dict[str, Any]:
         session_id = str(uuid.uuid4())
