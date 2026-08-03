@@ -148,6 +148,24 @@ identical whether you use uv or Compose.
 | `CLAUDE_BIN`   | `claude`      | Path/name of the Claude Code executable          |
 | `OPENCODE_BIN` | `opencode`    | Path/name of the OpenCode executable             |
 | `OPENCODE_CONFIG` | bundled `opencode_permissions.json` | OpenCode config passed to the agent; sets which tools require approval |
+| `WEB_ROOT`     | unset         | Directory of static files to serve at `/`; unset serves no UI |
+
+### Serving a web client
+
+Setting `WEB_ROOT` mounts a directory of static files at `/`, so a browser
+client is served from the same origin as the API — no CORS, and nothing to
+configure client-side because the page infers the API from its own URL. The
+desktop client, [rauaap/agent-ui-desktop](https://github.com/rauaap/agent-ui-desktop),
+is a zero-build static app meant to be pointed at exactly this:
+
+```sh
+WEB_ROOT=../agent-ui-desktop uv run main.py
+```
+
+The mount is registered after every route, so `/projects`, `/sessions` and
+`/ws/sessions/{id}` still win over any file of the same name. Serving a UI does
+not change the security model — the API was already reachable at that address,
+and access is still "you are on the WireGuard network or you are not."
 
 ## API
 

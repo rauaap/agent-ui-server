@@ -9,9 +9,14 @@ services:
       - ./sessions.db:/app/sessions.db
       - /home/wawa/projects:/projects
       - claude-auth:/home/agent
+      # The desktop client, served at / from this same origin. Read-only: the
+      # server has no business writing to it. Drop this line and WEB_ROOT to
+      # run the API on its own.
+      - ../agent-ui-desktop:/web:ro
     environment:
       - WIREGUARD_IP=${WIREGUARD_IP:-10.0.0.1}
       - PORT=${PORT:-8000}
+      - WEB_ROOT=/web
     restart: unless-stopped
 
 volumes:

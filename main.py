@@ -7,6 +7,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
 from agent import AgentAdapter, ClaudeCodeAdapter, OpenCodeAdapter
@@ -531,6 +532,26 @@ def require_session_or_404(session_id: str) -> dict[str, Any]:
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
     return session
+
+
+# Serving the desktop client (agent-ui-desktop) from the API's own origin means
+# it needs no server address configured and no CORS. Mounting is opt-in via
+# WEB_ROOT so a server with no client checked out behaves exactly as before.
+#
+# This must stay at the bottom of the module: Starlette matches routes in
+# registration order, and a mount at "/" registered earlier would shadow
+# /projects, /sessions and the WebSocket endpoint.
+def mount_web_root(app: FastAPI) -> None:
+    web_root = os.environ.get("WEB_ROOT", "").strip()
+    if not web_root:
+        return
+    if not os.path.isdir(web_root):
+        # A typo here would otherwise surface as 404s on every page load.
+        raise RuntimeError(f"WEB_ROOT is not a directory: {web_root}")
+    app.mount("/", StaticFiles(directory=web_root, html=True), name="web")
+
+
+mount_web_root(app)
 
 
 def main() -> None:
