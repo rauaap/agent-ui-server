@@ -48,6 +48,7 @@ ClaudeCodeAdapter
     -> claude -p --output-format stream-json --input-format stream-json
               --permission-prompt-tool stdio --permission-mode default --verbose
               [--resume <claude_session_id>]   # omitted on the first turn
+    |  Bash mode (no agent) .... shell.py  ->  bash -lc '<command>'
 SQLite .......................... db.py  ->  sessions.db (metadata + scrollback)
 ```
 
@@ -63,6 +64,7 @@ agent-ui-server/
 ├── main.py          # FastAPI app — REST routes, WebSocket endpoint, turn orchestration
 ├── agent.py         # AgentAdapter base + ClaudeCodeAdapter (stream-json) + OpenCodeAdapter (ACP)
 ├── opencode_permissions.json  # Default OpenCode permission config (gates tools to "ask")
+├── shell.py         # Bash mode — one-shot `bash -lc`, timeout + output caps
 ├── db.py            # SQLite — session metadata + append-only scrollback
 ├── pyproject.toml   # Dependencies (managed with uv)
 ├── Dockerfile       # Fedora + uv + Claude Code CLI + nested Podman
@@ -85,6 +87,13 @@ uvicorn --host <wireguard-ip> --port 8000   # NOT exposed to the internet
 No reverse proxy, no TLS, no bearer tokens, no login form. The entire access
 model is "you are on the WireGuard network or you are not." Do not bind this to
 `0.0.0.0` or expose the port publicly.
+
+[Bash mode](#bash-mode) sharpens this considerably: `POST /sessions/{id}/bash`
+is unauthenticated arbitrary code execution as the server user, and unlike the
+agent's own `Bash` tool it has **no approval gate at all** — that is the point
+of the feature. Anyone who can reach the port has a shell. This is acceptable
+only because the port is reachable from the WireGuard network and nowhere else;
+if that ever stops being true, this endpoint is the first thing to remove.
 
 ## Running
 
@@ -149,6 +158,8 @@ identical whether you use uv or Compose.
 | `OPENCODE_BIN` | `opencode`    | Path/name of the OpenCode executable             |
 | `OPENCODE_CONFIG` | bundled `opencode_permissions.json` | OpenCode config passed to the agent; sets which tools require approval |
 | `WEB_ROOT`     | unset         | Directory of static files to serve at `/`; unset serves no UI |
+| `BASH_TIMEOUT_SECONDS` | `120` | Bash mode: how long a command may run before it is killed |
+| `BASH_OUTPUT_LIMIT`    | `102400` | Bash mode: bytes kept per stream before output is truncated |
 
 ### Serving a web client
 
@@ -180,7 +191,8 @@ and access is still "you are on the WireGuard network or you are not."
 | `POST`   | `/sessions`             | Create a session (`name`, `working_dir`, `agent`) → `201`        |
 | `PATCH`  | `/sessions/{id}`        | Update a session: rename (`name`) and/or set auto-approve toggles |
 | `POST`   | `/sessions/{id}/turn`   | Send a prompt and spawn a turn → `202`                           |
-| `POST`   | `/sessions/{id}/stop`   | Stop the running process, set status → `idle`, keep the session  |
+| `POST`   | `/sessions/{id}/bash`   | Run a shell command (`command`), bypassing the agent → `202`     |
+| `POST`   | `/sessions/{id}/stop`   | Stop the running process and any shell command, status → `idle`  |
 | `DELETE` | `/sessions/{id}`        | Stop the process and delete the session and its scrollback       |
 
 `POST /sessions` requires an absolute `working_dir`; the directory is created
@@ -291,6 +303,11 @@ either way.)
 { "type": "question_response", "request_id": "perm_2",               // broadcast when a question is answered
   "answers": { "<question text>": "<label>" } }
 { "type": "input", "text": "..." }                                    // echo of a submitted prompt
+{ "type": "bash_input", "command": "df -h" }                          // echo of a `!` command
+{ "type": "bash_output", "command": "df -h",                          // that command, once it exits
+  "stdout": "...", "stderr": "",
+  "exit_code": 0,                                                     // null if it never started
+  "duration_ms": 41, "timed_out": false, "truncated": false }
 { "type": "status", "status": "running" | "idle" | "awaiting_approval" }
 { "type": "renamed", "name": "..." }                                  // session label changed
 { "type": "settings", "auto_approve_write": false,                    // auto-approve toggles changed
@@ -300,6 +317,7 @@ either way.)
 
 // Client -> Server
 { "type": "input", "text": "..." }                                    // start a new turn
+{ "type": "bash", "command": "df -h" }                                // run a shell command
 { "type": "approval_response", "request_id": "perm_1",                // answer an approval
   "behavior": "allow" | "deny",                                       // or pick a specific option:
   "option_id": "deny",                                                // (optional) one of options[].id
@@ -312,6 +330,44 @@ either way.)
 tool — the agent asking the user to *pick content*, distinct from a tool
 allow/deny. A pending question reuses the `awaiting_approval` status; the client
 tells them apart by event type. OpenCode has no equivalent.
+
+### Bash mode
+
+A message the user prefixes with `!` is not a prompt. The **client** strips the
+`!` and sends `{"type": "bash", "command": "..."}` (or `POST
+/sessions/{id}/bash`); the server spawns `bash -lc '<command>'` in the session's
+`working_dir`, captures stdout and stderr, and writes the result to scrollback
+as a `bash_output` event. The agent is never involved — no tokens, no context,
+no approval prompt.
+
+The server never inspects prompt text for a leading `!`. Keeping the split on
+the client means a prompt that legitimately begins with `!` stays sendable, and
+the wire says what it means.
+
+- **Nothing persists between invocations.** Each command is a fresh shell:
+  `cd`, `export` and shell functions are gone by the next one. Every command
+  starts in the session's `working_dir`.
+- **Independent of the agent.** Bash never takes the turn lock and never
+  changes `status`, so a command can run while the session is `running` or
+  parked in `awaiting_approval`, and neither side notices the other. A client
+  should not gate the `!` path on session status.
+- **One at a time per session.** A second command while one is in flight is
+  rejected with `409` (REST) or an `error` event (WebSocket).
+- **Bounded.** A command is killed after `BASH_TIMEOUT_SECONDS` (SIGTERM to the
+  whole process group, SIGKILL 3s later, so backgrounded children die too) and
+  the result comes back with `timed_out: true` plus whatever it printed first.
+  Output past `BASH_OUTPUT_LIMIT` per stream is replaced mid-way by a
+  `… N bytes omitted …` marker keeping the head and the tail, with
+  `truncated: true`. The reader keeps draining past the cap, so a command like
+  `yes` cannot wedge on a full pipe.
+- **stdin is `/dev/null`,** so a command that decides to prompt gets EOF instead
+  of hanging until the timeout.
+- **Killable.** `POST /sessions/{id}/stop` kills an in-flight command as well as
+  the agent process; the transcript gets an `error` event saying it was stopped.
+
+`exit_code` is `null` when the command never started — most often a
+`working_dir` that was deleted after the session was created, which is reported
+in `stderr` rather than raised.
 
 ### Approval flow
 
@@ -399,7 +455,7 @@ and a session must never be blocked because its directory has no project row.
 | `id`         | INTEGER | Autoincrement PK                                                               |
 | `session_id` | TEXT FK | References `sessions.id` (`ON DELETE CASCADE`)                                 |
 | `ts`         | TEXT    | ISO 8601                                                                       |
-| `type`       | TEXT    | `input` \| `output` \| `tool_use` \| `approval_request` \| `approval_response` \| `question` \| `question_response` \| `error` |
+| `type`       | TEXT    | `input` \| `output` \| `tool_use` \| `approval_request` \| `approval_response` \| `question` \| `question_response` \| `bash_input` \| `bash_output` \| `error` |
 | `payload`    | TEXT    | JSON blob                                                                      |
 
 SQLite runs in WAL mode with foreign keys on. On startup, any session left in a
@@ -408,9 +464,11 @@ subprocess survives a backend restart.
 
 ### In-memory state
 
-Live process handles, WebSocket subscribers, the running-turn tasks, and pending
-approval Futures are held in memory and intentionally **not** persisted —
-they are all empty after a restart.
+Live process handles, WebSocket subscribers, the running-turn tasks, the
+in-flight bash-mode tasks, and pending approval Futures are held in memory and
+intentionally **not** persisted — they are all empty after a restart. Bash tasks
+are tracked in their own dict, separate from turns, precisely because the two
+are allowed to run at the same time.
 
 ## Agent interface
 
@@ -472,10 +530,12 @@ uv sync                                        # install dependencies
 uv run python -m unittest discover -s tests    # run the test suite
 ```
 
-The tests cover the SQLite session/scrollback lifecycle and the
-`ClaudeCodeAdapter` stream-json parsing (assistant text/tool blocks, permission
-and `can_use_tool` normalization, nested `session_id` extraction). No agent
-subprocess is spawned in tests.
+The tests cover the SQLite session/scrollback lifecycle, the `ClaudeCodeAdapter`
+stream-json parsing (assistant text/tool blocks, permission and `can_use_tool`
+normalization, nested `session_id` extraction), and bash mode end to end
+(timeout, process-group kill, output truncation, turn independence). No *agent*
+subprocess is spawned in tests; the bash-mode tests do spawn a real, short-lived
+`/bin/bash`.
 
 ## Dependencies
 

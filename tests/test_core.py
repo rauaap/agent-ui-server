@@ -11,6 +11,7 @@ import asyncio
 from fastapi import HTTPException
 
 import db as db_module
+import shell
 from agent import (
     ApprovalDecision,
     ClaudeCodeAdapter,
@@ -971,6 +972,243 @@ class SendAnswerTests(unittest.IsolatedAsyncioTestCase):
         adapter = ClaudeCodeAdapter(executable="claude")
         with self.assertRaises(KeyError):
             await adapter.send_approval({"id": "s1"}, "missing", "allow")
+
+
+class ShellCommandTests(unittest.IsolatedAsyncioTestCase):
+    """Bash mode's one-shot runner. These spawn a real `/bin/bash`."""
+
+    async def test_captures_stdout_and_exit_code(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = await shell.run_command("echo hello", cwd=tmpdir)
+
+        self.assertEqual(result["stdout"], "hello\n")
+        self.assertEqual(result["stderr"], "")
+        self.assertEqual(result["exit_code"], 0)
+        self.assertFalse(result["timed_out"])
+        self.assertFalse(result["truncated"])
+
+    async def test_captures_stderr_and_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = await shell.run_command("echo boom >&2; exit 3", cwd=tmpdir)
+
+        self.assertEqual(result["stderr"], "boom\n")
+        self.assertEqual(result["exit_code"], 3)
+
+    async def test_runs_in_the_given_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = await shell.run_command("pwd", cwd=tmpdir)
+
+        # macOS/temp paths can be symlinked, so compare resolved paths.
+        self.assertEqual(
+            Path(result["stdout"].strip()).resolve(), Path(tmpdir).resolve()
+        )
+
+    async def test_no_state_persists_between_invocations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            await shell.run_command("cd /tmp; export MARKER=set", cwd=tmpdir)
+            result = await shell.run_command("pwd; echo \"[${MARKER-}]\"", cwd=tmpdir)
+
+        self.assertIn("[]", result["stdout"])
+        self.assertEqual(
+            Path(result["stdout"].splitlines()[0]).resolve(), Path(tmpdir).resolve()
+        )
+
+    async def test_timeout_kills_and_keeps_partial_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = await shell.run_command(
+                "echo started; sleep 30", cwd=tmpdir, timeout=0.5
+            )
+
+        self.assertTrue(result["timed_out"])
+        self.assertEqual(result["stdout"], "started\n")
+        self.assertNotEqual(result["exit_code"], 0)
+        # Killed at the timeout, not after the full sleep.
+        self.assertLess(result["duration_ms"], 5000)
+
+    async def test_timeout_kills_backgrounded_children(self) -> None:
+        # `sleep 30 &` outlives the shell unless the whole process group is
+        # signalled — and it holds stdout open, so the drain would hang too.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = await shell.run_command(
+                "sleep 30 & echo spawned; wait", cwd=tmpdir, timeout=0.5
+            )
+
+        self.assertTrue(result["timed_out"])
+        self.assertLess(result["duration_ms"], 5000)
+
+    async def test_stdin_is_closed_rather_than_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = await shell.run_command("cat", cwd=tmpdir, timeout=5)
+
+        self.assertFalse(result["timed_out"])
+        self.assertEqual(result["exit_code"], 0)
+
+    async def test_output_over_the_limit_keeps_head_and_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = await shell.run_command(
+                "seq 1 20000", cwd=tmpdir, limit=200
+            )
+
+        self.assertTrue(result["truncated"])
+        self.assertLess(len(result["stdout"]), 1000)
+        self.assertTrue(result["stdout"].startswith("1\n2\n3\n"))
+        self.assertTrue(result["stdout"].endswith("20000\n"))
+        self.assertIn("bytes omitted", result["stdout"])
+        self.assertEqual(result["exit_code"], 0)
+
+    async def test_runaway_output_does_not_wedge_on_a_full_pipe(self) -> None:
+        # `yes` never stops on its own: the drain has to keep reading past the
+        # cap, and the timeout has to kill it.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = await shell.run_command("yes", cwd=tmpdir, timeout=0.5, limit=200)
+
+        self.assertTrue(result["timed_out"])
+        self.assertTrue(result["truncated"])
+        self.assertLess(result["duration_ms"], 5000)
+
+    async def test_missing_working_directory_is_reported_not_raised(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing = str(Path(tmpdir) / "gone")
+        result = await shell.run_command("echo hi", cwd=missing)
+
+        self.assertIsNone(result["exit_code"])
+        self.assertIn("Could not run the command", result["stderr"])
+        self.assertEqual(result["stdout"], "")
+
+    async def test_cancellation_kills_the_process_group(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            task = asyncio.create_task(
+                shell.run_command("sleep 30", cwd=tmpdir, timeout=30)
+            )
+            await asyncio.sleep(0.2)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+
+class BashModeTests(unittest.IsolatedAsyncioTestCase):
+    """main.begin_bash / run_bash: the parts that must not touch turn state."""
+
+    async def _session(self, tmpdir: str):
+        import main
+
+        main.db = Database(Path(tmpdir) / "sessions.db")
+        session = main.db.create_session(
+            name="demo", working_dir=tmpdir, agent="claude-code"
+        )
+        return main, session
+
+    async def _capture(self, main):
+        events: list[dict] = []
+
+        async def fake_broadcast(session_id, message):
+            events.append(message)
+
+        main.broadcast = fake_broadcast
+        return events
+
+    async def test_echo_then_output_without_status_changes(self) -> None:
+        import main
+
+        original = main.broadcast
+        with tempfile.TemporaryDirectory() as tmpdir:
+            main_mod, session = await self._session(tmpdir)
+            events = await self._capture(main_mod)
+            try:
+                await main_mod.begin_bash(session["id"], "echo hi")
+                await main_mod.bash_tasks[session["id"]]
+
+                self.assertEqual(
+                    [e["type"] for e in events], ["bash_input", "bash_output"]
+                )
+                self.assertEqual(events[1]["command"], "echo hi")
+                self.assertEqual(events[1]["stdout"], "hi\n")
+                self.assertEqual(events[1]["exit_code"], 0)
+
+                # The turn state machine is untouched: no status event, and the
+                # session is still idle with no turn recorded.
+                self.assertNotIn("status", [e["type"] for e in events])
+                refreshed = main_mod.db.require_session(session["id"])
+                self.assertEqual(refreshed["status"], "idle")
+
+                # Both events land in scrollback, so they replay on reconnect.
+                rows = main_mod.db.recent_scrollback(session["id"])
+                self.assertEqual(
+                    [row["type"] for row in rows], ["bash_input", "bash_output"]
+                )
+            finally:
+                main_mod.broadcast = original
+                main_mod.db.close()
+
+    async def test_runs_while_the_agent_turn_is_running(self) -> None:
+        import main
+
+        original = main.broadcast
+        with tempfile.TemporaryDirectory() as tmpdir:
+            main_mod, session = await self._session(tmpdir)
+            events = await self._capture(main_mod)
+            main_mod.db.update_status(session["id"], "running")
+            try:
+                await main_mod.begin_bash(session["id"], "echo hi")
+                await main_mod.bash_tasks[session["id"]]
+
+                self.assertEqual(events[-1]["type"], "bash_output")
+                # Still running: bash neither waited for the turn nor ended it.
+                self.assertEqual(
+                    main_mod.db.require_session(session["id"])["status"], "running"
+                )
+            finally:
+                main_mod.broadcast = original
+                main_mod.db.close()
+
+    async def test_second_command_while_one_is_in_flight_is_rejected(self) -> None:
+        import main
+
+        original = main.broadcast
+        with tempfile.TemporaryDirectory() as tmpdir:
+            main_mod, session = await self._session(tmpdir)
+            await self._capture(main_mod)
+            try:
+                await main_mod.begin_bash(session["id"], "sleep 5")
+                with self.assertRaises(HTTPException) as caught:
+                    await main_mod.begin_bash(session["id"], "echo hi")
+                self.assertEqual(caught.exception.status_code, 409)
+
+                await main_mod.cancel_bash(session["id"])
+            finally:
+                main_mod.broadcast = original
+                main_mod.db.close()
+
+    async def test_cancel_bash_reports_the_stop(self) -> None:
+        import main
+
+        original = main.broadcast
+        with tempfile.TemporaryDirectory() as tmpdir:
+            main_mod, session = await self._session(tmpdir)
+            events = await self._capture(main_mod)
+            try:
+                await main_mod.begin_bash(session["id"], "sleep 30")
+                await asyncio.sleep(0.1)
+                await main_mod.cancel_bash(session["id"])
+
+                self.assertEqual(events[-1]["type"], "error")
+                self.assertIn("Command stopped", events[-1]["message"])
+                self.assertNotIn(session["id"], main_mod.bash_tasks)
+            finally:
+                main_mod.broadcast = original
+                main_mod.db.close()
+
+    async def test_unknown_session_is_404(self) -> None:
+        import main
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            main_mod, _ = await self._session(tmpdir)
+            try:
+                with self.assertRaises(HTTPException) as caught:
+                    await main_mod.begin_bash("missing", "echo hi")
+                self.assertEqual(caught.exception.status_code, 404)
+            finally:
+                main_mod.db.close()
 
 
 if __name__ == "__main__":

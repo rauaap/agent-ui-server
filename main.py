@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
+import shell
 from agent import AgentAdapter, ClaudeCodeAdapter, OpenCodeAdapter
 from db import Database
 
@@ -24,6 +25,9 @@ adapters: dict[str, AgentAdapter] = {
 }
 subscribers: dict[str, set[WebSocket]] = defaultdict(set)
 running_tasks: dict[str, asyncio.Task[None]] = {}
+# Bash-mode commands are tracked separately from agent turns on purpose: they
+# are allowed to run alongside one, so they must not share the turn's slot.
+bash_tasks: dict[str, asyncio.Task[None]] = {}
 turn_lock = asyncio.Lock()
 
 
@@ -82,6 +86,10 @@ class TurnRequest(BaseModel):
     prompt: str = Field(min_length=1)
 
 
+class BashRequest(BaseModel):
+    command: str = Field(min_length=1)
+
+
 @app.on_event("startup")
 async def startup() -> None:
     db.reset_active_sessions()
@@ -89,10 +97,11 @@ async def startup() -> None:
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
-    for task in list(running_tasks.values()):
+    pending = list(running_tasks.values()) + list(bash_tasks.values())
+    for task in pending:
         task.cancel()
-    if running_tasks:
-        await asyncio.gather(*running_tasks.values(), return_exceptions=True)
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
     db.close()
 
 
@@ -223,6 +232,9 @@ async def stop_session(session_id: str) -> dict[str, str]:
     session = require_session_or_404(session_id)
     adapter = adapters[session["agent"]]
     await adapter.stop(session)
+    # Stop means everything this session is running, agent or not — otherwise a
+    # runaway `!` command would have no kill switch short of the timeout.
+    await cancel_bash(session_id)
     db.update_status(session_id, "idle")
     await broadcast(session_id, {"type": "status", "status": "idle"})
     return {"status": "idle"}
@@ -237,6 +249,12 @@ async def delete_session(session_id: str) -> dict[str, str]:
 @app.post("/sessions/{session_id}/turn", status_code=202)
 async def start_turn(session_id: str, payload: TurnRequest) -> dict[str, str]:
     await begin_turn(session_id, payload.prompt)
+    return {"status": "running"}
+
+
+@app.post("/sessions/{session_id}/bash", status_code=202)
+async def start_bash(session_id: str, payload: BashRequest) -> dict[str, str]:
+    await begin_bash(session_id, payload.command)
     return {"status": "running"}
 
 
@@ -267,6 +285,20 @@ async def session_websocket(websocket: WebSocket, session_id: str) -> None:
                     continue
                 try:
                     await begin_turn(session_id, prompt)
+                except HTTPException as exc:
+                    await websocket.send_json(
+                        {"type": "error", "message": str(exc.detail)}
+                    )
+
+            elif message_type == "bash":
+                command = str(message.get("command", "")).strip()
+                if not command:
+                    await websocket.send_json(
+                        {"type": "error", "message": "Command cannot be empty"}
+                    )
+                    continue
+                try:
+                    await begin_bash(session_id, command)
                 except HTTPException as exc:
                     await websocket.send_json(
                         {"type": "error", "message": str(exc.detail)}
@@ -413,6 +445,69 @@ async def run_turn(session_id: str, prompt: str) -> None:
             pass
 
 
+async def begin_bash(session_id: str, command: str) -> None:
+    """Start a one-shot shell command in the session's working directory.
+
+    Deliberately none of what `begin_turn` does: no turn lock, no status
+    change, no adapter. Bash mode bypasses the agent entirely, so it must also
+    bypass the turn state machine — a command can run while the agent is
+    mid-turn or blocked on an approval, and neither notices the other.
+    """
+    require_session_or_404(session_id)
+    existing = bash_tasks.get(session_id)
+    if existing and not existing.done():
+        raise HTTPException(
+            status_code=409, detail="A command is already running in this session"
+        )
+
+    db.append_scrollback(session_id, "bash_input", {"command": command})
+    db.touch_session(session_id)
+    await broadcast(session_id, {"type": "bash_input", "command": command})
+
+    bash_tasks[session_id] = asyncio.create_task(run_bash(session_id, command))
+
+
+async def run_bash(session_id: str, command: str) -> None:
+    try:
+        session = db.require_session(session_id)
+        result = await shell.run_command(command, cwd=session["working_dir"])
+        payload = {"command": command, **result}
+        db.append_scrollback(session_id, "bash_output", payload)
+        await broadcast(session_id, {"type": "bash_output", **payload})
+    except asyncio.CancelledError:
+        # Stopped by the user or shutting down; the process group is already
+        # dead. Say so in the transcript rather than leaving the command
+        # hanging with no result.
+        await report_bash_error(session_id, f"Command stopped: {command}")
+        raise
+    except Exception as exc:
+        await report_bash_error(session_id, f"Command failed: {exc}")
+    finally:
+        bash_tasks.pop(session_id, None)
+
+
+async def report_bash_error(session_id: str, message: str) -> None:
+    """Record a command failure, unless the session itself is already gone.
+
+    Deleting a session cancels its command, so the cancellation lands with the
+    row possibly on its way out; scrollback has a foreign key to it, and an
+    insert that loses that race must not surface as a crashed task.
+    """
+    if db.get_session(session_id) is None:
+        return
+    db.append_scrollback(session_id, "error", {"message": message})
+    await broadcast(session_id, {"type": "error", "message": message})
+
+
+async def cancel_bash(session_id: str) -> None:
+    """Kill this session's in-flight command, if any, and wait for it to end."""
+    task = bash_tasks.pop(session_id, None)
+    if task is None or task.done():
+        return
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
 async def handle_approval(
     session_id: str,
     request_id: str,
@@ -489,6 +584,9 @@ async def teardown_session(session: dict[str, Any]) -> None:
     if task:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+    # Before the row goes: the command's own error path writes scrollback.
+    await cancel_bash(session_id)
 
     for websocket in list(subscribers.get(session_id, set())):
         try:
