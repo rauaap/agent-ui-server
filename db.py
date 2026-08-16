@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 
@@ -16,16 +17,28 @@ VALID_STATUSES = {"idle", "running", "awaiting_approval"}
 # categories are switchable; the keys here are the column suffixes.
 AUTO_APPROVE_CATEGORIES = ("write", "command")
 
+# Every sessions column stored as 0/1 that the API exposes as a bool. Kept
+# apart from AUTO_APPROVE_CATEGORIES, which also drives `set_auto_approve` and
+# so must stay a list of *toggles*.
+BOOL_COLUMNS = tuple(
+    f"auto_approve_{category}" for category in AUTO_APPROVE_CATEGORIES
+) + ("owns_worktree",)
+
+_SESSION_COLUMNS = """
+    id, name, project_id, working_dir, owns_worktree, agent, agent_session_id,
+    status, created_at, last_active_at,
+    auto_approve_write, auto_approve_command
+"""
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def _row_to_session(row: sqlite3.Row) -> dict[str, Any]:
-    """Decode a sessions row, coercing the auto-approve flags to bool."""
+    """Decode a sessions row, coercing the 0/1 columns to bool."""
     session = dict(row)
-    for category in AUTO_APPROVE_CATEGORIES:
-        column = f"auto_approve_{category}"
+    for column in BOOL_COLUMNS:
         if column in session:
             session[column] = bool(session[column])
     return session
@@ -45,12 +58,28 @@ class Database:
 
     def init(self) -> None:
         with self._lock, self._conn:
+            # Projects have their own uuid identity: `path` is still how the
+            # HTTP API addresses one and is still unique, but sessions link to
+            # the id, so a project's path can change without taking its
+            # sessions with it.
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS projects (
+                    id TEXT PRIMARY KEY,
+                    path TEXT NOT NULL UNIQUE,
+                    name TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS sessions (
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
+                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
                     working_dir TEXT NOT NULL,
+                    owns_worktree INTEGER NOT NULL DEFAULT 0,
                     agent TEXT NOT NULL,
                     agent_session_id TEXT,
                     status TEXT NOT NULL,
@@ -97,18 +126,184 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_scrollback_session_id_id "
                 "ON scrollback(session_id, id)"
             )
-            # Projects are explicit rows, keyed by their working directory —
-            # sessions reference that path rather than an id, so there is no
-            # foreign key and a session can still be created anywhere.
+
+        # The two ALTERs above are all SQLite can do in place; the rest of the
+        # move to id-linked projects needs a table rebuild.
+        self._migrate_v2()
+
+        with self._lock, self._conn:
+            # After the rebuild, so an unmigrated database does not trip over a
+            # column it does not have yet.
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_project_id "
+                "ON sessions(project_id)"
+            )
+
+    def _migrate_v2(self) -> None:
+        """Rebuild `projects` and `sessions` around a real foreign key.
+
+        Before this, a session's project link was string equality between
+        `sessions.working_dir` and `projects.path` — which stops working the
+        moment a session runs somewhere else, like a worktree. The 12-step
+        rebuild is unavoidable: SQLite cannot add a `REFERENCES` column with a
+        non-NULL default, and `projects` needs a new primary key.
+
+        A no-op on a fresh database (`init` already creates the new shape) and
+        on one that has been through this before.
+        """
+        with self._lock:
+            session_columns = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(sessions)")
+            }
+            if "project_id" in session_columns:
+                return
+
+            # Detection keys off `sessions` rather than `projects`, because
+            # `init` may just have created `projects` in the new shape on a
+            # database old enough to predate it entirely.
+            project_columns = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(projects)")
+            }
+
+            # Both must be outside a transaction: foreign_keys is silently
+            # ignored inside one, and autocommit makes the BEGIN below ours.
+            previous_isolation = self._conn.isolation_level
+            self._conn.isolation_level = None
+            self._conn.execute("PRAGMA foreign_keys = OFF")
+            try:
+                self._conn.execute("BEGIN")
+                try:
+                    self._rebuild_v2(project_columns)
+                    violations = self._conn.execute(
+                        "PRAGMA foreign_key_check"
+                    ).fetchall()
+                    if violations:
+                        raise RuntimeError(
+                            f"Migration left {len(violations)} foreign key "
+                            f"violations; database untouched"
+                        )
+                    self._conn.execute("COMMIT")
+                except Exception:
+                    self._conn.execute("ROLLBACK")
+                    raise
+            finally:
+                self._conn.execute("PRAGMA foreign_keys = ON")
+                self._conn.isolation_level = previous_isolation
+
+    def _rebuild_v2(self, project_columns: set[str]) -> None:
+        """The copy half of `_migrate_v2`, inside its transaction."""
+        self._conn.execute(
+            """
+            CREATE TABLE projects_new (
+                id TEXT PRIMARY KEY,
+                path TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE sessions_new (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                working_dir TEXT NOT NULL,
+                owns_worktree INTEGER NOT NULL DEFAULT 0,
+                agent TEXT NOT NULL,
+                agent_session_id TEXT,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                last_active_at TEXT NOT NULL,
+                auto_approve_write INTEGER NOT NULL DEFAULT 0,
+                auto_approve_command INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+
+        insert_project = (
+            "INSERT INTO projects_new (id, path, name, created_at) "
+            "VALUES (?, ?, ?, ?)"
+        )
+        if "id" in project_columns:
+            # `init` created the table in the new shape on a database that
+            # never had projects; there is nothing in it, but copy anyway.
+            self._conn.execute(
+                "INSERT INTO projects_new (id, path, name, created_at) "
+                "SELECT id, path, name, created_at FROM projects"
+            )
+        else:
+            for row in self._conn.execute(
+                "SELECT path, name, created_at FROM projects"
+            ).fetchall():
+                self._conn.execute(
+                    insert_project,
+                    (str(uuid.uuid4()), row["path"], row["name"], row["created_at"]),
+                )
+
+        # Sessions resolve to a project by *normalised* path: `create_session`
+        # never normalised `working_dir` while `create_project` did, so a
+        # legacy `/p/demo/` has to find the existing `/p/demo` project rather
+        # than mint a second one for the same directory.
+        by_path = {
+            os.path.normpath(row["path"]): row["id"]
+            for row in self._conn.execute("SELECT id, path FROM projects_new")
+        }
+
+        for row in self._conn.execute(
+            "SELECT DISTINCT working_dir FROM sessions"
+        ).fetchall():
+            path = os.path.normpath(row["working_dir"])
+            if path in by_path:
+                continue
+            # An orphan: a session created at a path no project row matched.
+            # It was invisible in the UI while still holding scrollback rows,
+            # so adopt it into a project rather than dropping it.
+            project_id = str(uuid.uuid4())
+            self._conn.execute(
+                insert_project,
+                (project_id, path, PurePosixPath(path).name, utc_now()),
+            )
+            by_path[path] = project_id
+
+        for row in self._conn.execute("SELECT * FROM sessions").fetchall():
+            session = dict(row)
             self._conn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS projects (
-                    path TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    created_at TEXT NOT NULL
+                INSERT INTO sessions_new (
+                    id, name, project_id, working_dir, owns_worktree, agent,
+                    agent_session_id, status, created_at, last_active_at,
+                    auto_approve_write, auto_approve_command
                 )
-                """
+                VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session["id"],
+                    session["name"],
+                    by_path[os.path.normpath(session["working_dir"])],
+                    session["working_dir"],
+                    session["agent"],
+                    session["agent_session_id"],
+                    session["status"],
+                    session["created_at"],
+                    session["last_active_at"],
+                    session["auto_approve_write"],
+                    session["auto_approve_command"],
+                ),
             )
+
+        self._conn.execute("DROP TABLE projects")
+        self._conn.execute("DROP TABLE sessions")
+        # Without legacy_alter_table the rename tries to fix up references in
+        # other tables and can rewrite scrollback's foreign key; with it,
+        # scrollback's existing REFERENCES sessions(id) simply resolves to the
+        # table that now has that name.
+        self._conn.execute("PRAGMA legacy_alter_table = ON")
+        self._conn.execute("ALTER TABLE projects_new RENAME TO projects")
+        self._conn.execute("ALTER TABLE sessions_new RENAME TO sessions")
+        self._conn.execute("PRAGMA legacy_alter_table = OFF")
 
     def close(self) -> None:
         with self._lock:
@@ -123,13 +318,30 @@ class Database:
     def list_sessions(self) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(
-                """
-                SELECT id, name, working_dir, agent, agent_session_id, status,
-                       created_at, last_active_at,
-                       auto_approve_write, auto_approve_command
+                f"""
+                SELECT {_SESSION_COLUMNS}
                 FROM sessions
                 ORDER BY last_active_at DESC, created_at DESC
                 """
+            ).fetchall()
+        return [_row_to_session(row) for row in rows]
+
+    def list_sessions_for_project(self, project_id: str) -> list[dict[str, Any]]:
+        """Every session belonging to a project, worktrees included.
+
+        The link is the foreign key, not the working directory, so a session
+        running in a worktree somewhere else still comes back here — which is
+        what `delete_project`'s teardown sweep depends on.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT {_SESSION_COLUMNS}
+                FROM sessions
+                WHERE project_id = ?
+                ORDER BY last_active_at DESC, created_at DESC
+                """,
+                (project_id,),
             ).fetchall()
         return [_row_to_session(row) for row in rows]
 
@@ -137,13 +349,13 @@ class Database:
     # projects with no sessions, which report 0 / NULL. SQLite sorts NULL below
     # everything, so DESC already puts never-used projects last.
     _PROJECT_QUERY = """
-        SELECT p.path, p.name,
+        SELECT p.id, p.path, p.name,
                COUNT(s.id) AS session_count,
                MAX(s.last_active_at) AS last_active_at
         FROM projects p
-        LEFT JOIN sessions s ON s.working_dir = p.path
+        LEFT JOIN sessions s ON s.project_id = p.id
         {where}
-        GROUP BY p.path, p.name
+        GROUP BY p.id, p.path, p.name
         ORDER BY last_active_at DESC, p.path ASC
     """
 
@@ -155,10 +367,20 @@ class Database:
         return [dict(row) for row in rows]
 
     def get_project(self, path: str) -> dict[str, Any] | None:
+        """Look a project up by path — how the HTTP API addresses one."""
         with self._lock:
             row = self._conn.execute(
                 self._PROJECT_QUERY.format(where="WHERE p.path = ?"),
                 (path,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_project_by_id(self, project_id: str) -> dict[str, Any] | None:
+        """Look a project up by id — how sessions refer to one."""
+        with self._lock:
+            row = self._conn.execute(
+                self._PROJECT_QUERY.format(where="WHERE p.id = ?"),
+                (project_id,),
             ).fetchone()
         return dict(row) if row else None
 
@@ -179,28 +401,51 @@ class Database:
         """
         with self._lock, self._conn:
             self._conn.execute(
-                "INSERT OR IGNORE INTO projects (path, name, created_at) "
-                "VALUES (?, ?, ?)",
-                (path, name, utc_now()),
+                "INSERT OR IGNORE INTO projects (id, path, name, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (str(uuid.uuid4()), path, name, utc_now()),
             )
         project = self.get_project(path)
         if project is None:
             raise KeyError(f"Unknown project: {path}")
         return project
 
-    def create_session(self, name: str, working_dir: str, agent: str) -> dict[str, Any]:
+    def create_session(
+        self,
+        name: str,
+        project_id: str,
+        working_dir: str,
+        agent: str,
+        owns_worktree: bool = False,
+    ) -> dict[str, Any]:
+        """Create a session belonging to a project.
+
+        `working_dir` is the cwd the agent runs in and nothing else — usually
+        the project's own path, but a worktree elsewhere when the server made
+        one. `owns_worktree` records that we created that directory and are the
+        ones responsible for removing it.
+        """
         session_id = str(uuid.uuid4())
         now = utc_now()
         with self._lock, self._conn:
             self._conn.execute(
                 """
                 INSERT INTO sessions (
-                    id, name, working_dir, agent, agent_session_id, status,
-                    created_at, last_active_at
+                    id, name, project_id, working_dir, owns_worktree, agent,
+                    agent_session_id, status, created_at, last_active_at
                 )
-                VALUES (?, ?, ?, ?, NULL, 'idle', ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, NULL, 'idle', ?, ?)
                 """,
-                (session_id, name, working_dir, agent, now, now),
+                (
+                    session_id,
+                    name,
+                    project_id,
+                    working_dir,
+                    1 if owns_worktree else 0,
+                    agent,
+                    now,
+                    now,
+                ),
             )
         return self.require_session(session_id)
 
@@ -215,10 +460,8 @@ class Database:
     def get_session(self, session_id: str) -> dict[str, Any] | None:
         with self._lock:
             row = self._conn.execute(
-                """
-                SELECT id, name, working_dir, agent, agent_session_id, status,
-                       created_at, last_active_at,
-                       auto_approve_write, auto_approve_command
+                f"""
+                SELECT {_SESSION_COLUMNS}
                 FROM sessions
                 WHERE id = ?
                 """,

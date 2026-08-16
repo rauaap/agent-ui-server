@@ -49,6 +49,7 @@ ClaudeCodeAdapter
               --permission-prompt-tool stdio --permission-mode default --verbose
               [--resume <claude_session_id>]   # omitted on the first turn
     |  Bash mode (no agent) .... shell.py  ->  bash -lc '<command>'
+    |  Per-session worktrees ... git.py    ->  git worktree add/remove (argv, no shell)
 SQLite .......................... db.py  ->  sessions.db (metadata + scrollback)
 ```
 
@@ -65,6 +66,7 @@ agent-ui-server/
 ├── agent.py         # AgentAdapter base + ClaudeCodeAdapter (stream-json) + OpenCodeAdapter (ACP)
 ├── opencode_permissions.json  # Default OpenCode permission config (gates tools to "ask")
 ├── shell.py         # Bash mode — one-shot `bash -lc`, timeout + output caps
+├── git.py           # Per-session worktrees — `git` via argv, never through a shell
 ├── db.py            # SQLite — session metadata + append-only scrollback
 ├── pyproject.toml   # Dependencies (managed with uv)
 ├── Dockerfile       # Fedora + uv + Claude Code CLI + nested Podman
@@ -141,8 +143,11 @@ The container image is Fedora-based and ships `uv`, the Claude Code CLI, the
 OpenCode CLI, `git`, and a nested **Podman** stack (`privileged: true` + `/dev/fuse` +
 `fuse-overlayfs`) so agents can run containers inside their working directory.
 Host networking is used so the container sees the WireGuard interface directly.
-Project directories are bind-mounted at `/projects`; create sessions with
-`working_dir` values like `/projects/<name>`.
+Project directories are bind-mounted at `/projects`; create projects with
+`path` values like `/projects/<name>`, and sessions with a matching
+`project_path`. A session's worktree must live under the same bind mount to be
+visible inside the container — a sibling like `/projects/<name>-<branch>` is the
+shape the client suggests.
 
 Both paths run the same entry point (`main.py`), so host/port behavior is
 identical whether you use uv or Compose.
@@ -160,6 +165,8 @@ identical whether you use uv or Compose.
 | `WEB_ROOT`     | unset         | Directory of static files to serve at `/`; unset serves no UI |
 | `BASH_TIMEOUT_SECONDS` | `120` | Bash mode: how long a command may run before it is killed |
 | `BASH_OUTPUT_LIMIT`    | `102400` | Bash mode: bytes kept per stream before output is truncated |
+| `GIT_TIMEOUT_SECONDS`  | `30`  | Worktrees: how long a `git` invocation may run before it is killed |
+| `GIT_OUTPUT_LIMIT`     | `4096` | Worktrees: bytes of git output kept for an error message |
 
 ### Serving a web client
 
@@ -188,17 +195,22 @@ and access is still "you are on the WireGuard network or you are not."
 | `POST`   | `/projects`             | Create a project: `mkdir -p` + row (`path`, `name`) → `201`      |
 | `DELETE` | `/projects`             | Forget a project and its sessions (`path`); disk untouched       |
 | `GET`    | `/sessions`             | List all sessions with metadata                                  |
-| `POST`   | `/sessions`             | Create a session (`name`, `working_dir`, `agent`) → `201`        |
+| `POST`   | `/sessions`             | Create a session (`name`, `project_path`, `agent`, `worktree`) → `201` |
 | `PATCH`  | `/sessions/{id}`        | Update a session: rename (`name`) and/or set auto-approve toggles |
 | `POST`   | `/sessions/{id}/turn`   | Send a prompt and spawn a turn → `202`                           |
 | `POST`   | `/sessions/{id}/bash`   | Run a shell command (`command`), bypassing the agent → `202`     |
 | `POST`   | `/sessions/{id}/stop`   | Stop the running process and any shell command, status → `idle`  |
 | `DELETE` | `/sessions/{id}`        | Stop the process and delete the session and its scrollback       |
 
-`POST /sessions` requires an absolute `working_dir`; the directory is created
-(`mkdir -p`) if missing. `agent` is one of the registered adapters —
-`"claude-code"` (the default) or `"opencode"`. Starting a turn on a session that
-is not `idle` returns `409`.
+`POST /sessions` requires an absolute `project_path` naming a project that
+already exists — a session belongs to a project by foreign key, so an
+unregistered path is a `404`; create the project first. (`working_dir` is still
+accepted as a deprecated alias for `project_path`, for clients written before
+the rename.) The directory is created (`mkdir -p`) if missing. `agent` is one of
+the registered adapters — `"claude-code"` (the default) or `"opencode"`. The
+optional `worktree` block runs the session in its own git worktree instead; see
+[Worktrees](#worktrees). Starting a turn on a session that is not `idle` returns
+`409`.
 
 `PATCH /sessions/{id}` is a partial update; every field is optional and only the
 supplied ones are applied. `name` (a non-empty 1–120 char label, trimmed)
@@ -216,21 +228,35 @@ configured projects root: a project exists because it was created through
 
 ```jsonc
 [
-  { "path": "/projects/agent-ui", "name": "agent-ui", "exists": true,
+  { "id": "3f2b…", "path": "/projects/agent-ui", "name": "agent-ui",
+    "exists": true, "is_git_repo": true,
     "session_count": 3, "last_active_at": "2026-07-28T09:14:02Z" },
-  { "path": "/projects/scratch",  "name": "scratch",  "exists": false,
+  { "id": "9c14…", "path": "/projects/scratch",  "name": "scratch",
+    "exists": false, "is_git_repo": false,
     "session_count": 0, "last_active_at": null }
 ]
 ```
 
 `session_count` and `last_active_at` are a `LEFT JOIN` onto `sessions` matched on
-`working_dir`, so a project with no sessions yet reports `0` / `null`. Results
-are sorted by `last_active_at` descending — SQLite sorts `NULL` below everything,
-so never-used projects land last — then by `path` ascending.
+`sessions.project_id`, so a project with no sessions yet reports `0` / `null` —
+and a session running in a worktree somewhere else still counts towards the
+project it was cut from. Results are sorted by `last_active_at` descending —
+SQLite sorts `NULL` below everything, so never-used projects land last — then by
+`path` ascending.
+
+`id` is the project's uuid. It exists so a project's `path` can change later
+without taking its sessions with it, and it is what sessions store; the HTTP API
+itself is still addressed by `path` everywhere.
 
 `exists` is a `stat` of the stored path at request time, not a discovery scan.
 Because the row is the record, a directory removed outside the app leaves the
 project in place; the flag is how a client can say so and offer to forget it.
+
+`is_git_repo` is one more `exists`, on `<path>/.git` — a hint so a client can
+hide the worktree toggle for projects that cannot have one. It is only a hint:
+`POST /sessions` runs the real check. A `.git` *file* counts, so a project that
+is itself a worktree reads as a repo; a project in a subdirectory of a repo
+reads as `false`, which is deliberate.
 
 #### `POST /projects`
 
@@ -254,22 +280,74 @@ Takes `{ "path": "/projects/foo", "name": "foo" }`, creates the directory
 Takes `{ "path": "/projects/foo" }` and **never touches the filesystem** — the
 directory and everything the agent wrote in it stay exactly where they are.
 
-What it does remove is the row *and every session whose `working_dir` matches*,
-along with their scrollback: sessions are reachable only through their project,
-so leaving them would strand history with no way to open or delete it. The
-response reports the count (`{"status": "deleted", "sessions_deleted": 2}`) so a
-client can say up front what will be lost. Running sessions are stopped first,
-exactly as `DELETE /sessions/{id}` does. Unknown path → `404`.
+What it does remove is the row *and every session belonging to it*, along with
+their scrollback: sessions are reachable only through their project, so leaving
+them would strand history with no way to open or delete it. Worktrees the server
+created for those sessions are removed under the same never-forced policy as
+`DELETE /sessions/{id}`:
+
+```jsonc
+{ "status": "deleted", "sessions_deleted": 3,
+  "worktrees_removed": 1,
+  "worktree_errors": [
+    { "session": "fix login", "path": "/projects/app-fix-login",
+      "error": "fatal: '…' contains modified or untracked files, …" }
+  ] }
+```
+
+Running sessions are stopped first. Unknown path → `404`.
 
 The path travels in the body rather than the URL for the same reason there are
 no nested `/projects/{path}/sessions` routes: a filesystem path does not belong
-in a URL segment. `GET /sessions` already carries `working_dir` on every row, so
-clients group locally.
+in a URL segment. `GET /sessions` already carries `project_id` and `working_dir`
+on every row, so clients group locally.
 
-Sessions are **not** restricted to projects: `POST /sessions` still takes any
-absolute `working_dir` and does its own `mkdir -p`. Nothing reconciles the two
-afterwards, so a session whose `working_dir` has no project row simply does not
-appear in a client that browses by project. Create the project first.
+Sessions **are** restricted to projects: `sessions.project_id` is `NOT NULL`
+with a real foreign key, so `POST /sessions` at an unregistered path is a `404`
+rather than a session nothing in the UI can reach.
+
+#### Worktrees
+
+`POST /sessions` takes an optional `worktree` block so two sessions on one
+project can work on separate branches without fighting over a single checkout:
+
+```jsonc
+{ "name": "fix login", "project_path": "/projects/app",
+  "worktree": { "path": "/projects/app-fix-login", "branch": "fix-login" } }
+```
+
+The worktree is created first (`git worktree add -b <branch> <path>`, always a
+**new** branch off the project's current HEAD) and the session then runs there:
+`working_dir` is the worktree, `owns_worktree` is true, and the session still
+belongs to the project. If anything fails, **no session is created** — and if
+the row insert fails after git succeeded, the worktree is removed again, so a
+worktree nothing owns cannot be left behind.
+
+It is one request rather than two on purpose. A client that dies between a
+separate "create worktree" call and the session insert would leave exactly that
+unowned directory, with nothing to ever clean it up.
+
+Failure modes, all `400` with the reason in `detail`: the project is not a git
+repository, the branch name is not one git accepts (`git check-ref-format`), the
+branch already exists, the target path is the project directory itself, or the
+target path exists and is not an empty directory. An empty directory *is*
+accepted — that is git's own rule.
+
+`DELETE /sessions/{id}` removes the worktree when (and only when) the server
+created it:
+
+```jsonc
+{ "status": "deleted", "worktree_removed": false,
+  "worktree_error": "fatal: '…' contains modified or untracked files, use --force to delete it" }
+```
+
+Removal is **never forced**, so a worktree with uncommitted work refuses and is
+left on disk — the session is deleted either way, hence still `200`. Expect this
+to be the *common* outcome rather than an edge case: git counts untracked files
+as dirty, so any session whose agent created a single new file will refuse.
+Clients should phrase it as a notice, not an error. A worktree the user made by
+hand is never touched, however the session points at it: `owns_worktree` records
+provenance, not what the directory happens to be.
 
 ### WebSocket
 
@@ -423,15 +501,17 @@ reach this gate. Tools with no category (e.g. `WebFetch`) always prompt.
 
 ### `projects`
 
-| Column       | Type    | Notes                                                        |
-|--------------|---------|--------------------------------------------------------------|
-| `path`       | TEXT PK | Absolute working directory, normalised — the project's identity |
-| `name`       | TEXT    | Display label; defaults to the path's last segment but may differ |
-| `created_at` | TEXT    | ISO 8601 (UTC, `Z`)                                          |
+| Column       | Type      | Notes                                                        |
+|--------------|-----------|--------------------------------------------------------------|
+| `id`         | TEXT PK   | uuid4 — the project's identity, and what sessions reference   |
+| `path`       | TEXT UQ   | Absolute working directory, normalised; how the HTTP API addresses a project |
+| `name`       | TEXT      | Display label; defaults to the path's last segment but may differ |
+| `created_at` | TEXT      | ISO 8601 (UTC, `Z`)                                          |
 
-Sessions join to a project on `sessions.working_dir = projects.path`. There is
-deliberately **no foreign key**: `POST /sessions` accepts any absolute directory,
-and a session must never be blocked because its directory has no project row.
+Sessions join to a project on `sessions.project_id = projects.id`, a real
+foreign key (`ON DELETE CASCADE`). Identity is the uuid rather than the path
+precisely so `working_dir` is free to point somewhere else — a worktree — with
+the project link intact.
 
 ### `sessions`
 
@@ -439,7 +519,9 @@ and a session must never be blocked because its directory has no project row.
 |---------------------|---------|-------------------------------------------------------------|
 | `id`                | TEXT PK | Internal UUID                                               |
 | `name`              | TEXT    | Human-readable label                                        |
-| `working_dir`       | TEXT    | Absolute path inside the container, e.g. `/projects/foo`    |
+| `project_id`        | TEXT FK | References `projects.id` (`ON DELETE CASCADE`), `NOT NULL`  |
+| `working_dir`       | TEXT    | The cwd the agent runs in — the project directory, or this session's worktree |
+| `owns_worktree`     | INTEGER | `0`/`1` — the server created `working_dir` and cleans it up (default `0`) |
 | `agent`             | TEXT    | Which adapter to use, e.g. `claude-code` or `opencode`      |
 | `agent_session_id`  | TEXT    | The agent's own resume id; `NULL` until the first turn completes |
 | `status`            | TEXT    | `idle` \| `running` \| `awaiting_approval`                  |
@@ -461,6 +543,25 @@ and a session must never be blocked because its directory has no project row.
 SQLite runs in WAL mode with foreign keys on. On startup, any session left in a
 non-`idle` state (from a crash or restart) is reset to `idle`, since no
 subprocess survives a backend restart.
+
+The `ON DELETE CASCADE` from sessions to projects is a backstop only:
+`DELETE /projects` still sweeps its sessions explicitly through
+`teardown_session`, which does much more than delete a row — it stops the agent,
+cancels any bash command, closes subscribers, and removes worktrees.
+
+#### Migration
+
+Databases predating the project foreign key are rebuilt on open (`_migrate_v2`).
+SQLite cannot add a `REFERENCES` column with a non-`NULL` default and cannot
+re-key a table, so both tables go through the documented 12-step rebuild inside
+one transaction. Existing rows keep their `working_dir` verbatim and resolve to
+a project by *normalised* path — `create_session` never normalised it while
+`create_project` did, so a legacy `/p/demo/` joins the existing `/p/demo` rather
+than minting a duplicate. A session whose path matched no project at all (an
+orphan, invisible in the UI but still holding scrollback) is adopted into a
+project created for it. Every migrated row gets `owns_worktree = 0`: a
+pre-existing session that happens to sit in a worktree was not created by us, so
+its directory is not ours to delete.
 
 ### In-memory state
 
@@ -530,12 +631,16 @@ uv sync                                        # install dependencies
 uv run python -m unittest discover -s tests    # run the test suite
 ```
 
-The tests cover the SQLite session/scrollback lifecycle, the `ClaudeCodeAdapter`
+The tests cover the SQLite session/scrollback lifecycle, the schema migration
+(built from a hand-written old-shaped database), the `ClaudeCodeAdapter`
 stream-json parsing (assistant text/tool blocks, permission and `can_use_tool`
-normalization, nested `session_id` extraction), and bash mode end to end
-(timeout, process-group kill, output truncation, turn independence). No *agent*
-subprocess is spawned in tests; the bash-mode tests do spawn a real, short-lived
-`/bin/bash`.
+normalization, nested `session_id` extraction), bash mode end to end (timeout,
+process-group kill, output truncation, turn independence), and worktrees
+end to end (creation, every `400`, rollback on a failed insert, and teardown of
+clean, dirty and hand-deleted worktrees). No *agent* subprocess is spawned in
+tests; the bash-mode tests spawn a real short-lived `/bin/bash`, and the
+worktree tests `git init` a real repository in a temporary directory — neither
+needs the network.
 
 ## Dependencies
 
@@ -549,3 +654,6 @@ from the standard library. No ORM, no task queue, no message broker.
   model, no GPU) → transcription used as a prompt
 - Session forking
 - Per-session tool allowlists
+- Worktrees: attach to an existing branch or commit-ish, an explicit "delete
+  anyway" that passes `--force`, and adopting worktrees already on disk
+- Moving a project's path (`projects.id` exists for it; no endpoint yet)

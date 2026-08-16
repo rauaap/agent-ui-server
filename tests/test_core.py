@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path, PurePosixPath
@@ -11,6 +13,7 @@ import asyncio
 from fastapi import HTTPException
 
 import db as db_module
+import git
 import shell
 from agent import (
     ApprovalDecision,
@@ -23,15 +26,55 @@ from agent import (
 from db import Database
 
 
+def make_session(
+    database: Database,
+    path: str,
+    name: str = "demo",
+    agent: str = "claude-code",
+) -> dict[str, Any]:
+    """Create a session running in `path`, registering its project first.
+
+    Sessions belong to a project by foreign key now, so almost every test needs
+    a project row even when the project is not what it is testing.
+    """
+    project = database.create_project(path, PurePosixPath(path).name)
+    return database.create_session(
+        name=name,
+        project_id=project["id"],
+        working_dir=path,
+        agent=agent,
+    )
+
+
+def init_repo(path: Path) -> None:
+    """A git repository with one commit, which is what a worktree needs.
+
+    `git worktree add -b` cannot branch from an unborn HEAD, so a freshly
+    `git init`-ed directory is not enough.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    run_git(path, "init", "--quiet", "--initial-branch=main")
+    run_git(path, "config", "user.email", "test@example.invalid")
+    run_git(path, "config", "user.name", "Test")
+    run_git(path, "commit", "--quiet", "--allow-empty", "-m", "root")
+
+
+def run_git(cwd: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
 class DatabaseTests(unittest.TestCase):
     def test_session_and_scrollback_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             database = Database(Path(tmpdir) / "sessions.db")
-            session = database.create_session(
-                name="demo",
-                working_dir="/projects/demo",
-                agent="claude-code",
-            )
+            session = make_session(database, "/projects/demo")
 
             self.assertEqual(session["status"], "idle")
             self.assertEqual(session["name"], "demo")
@@ -55,11 +98,7 @@ class DatabaseTests(unittest.TestCase):
     def test_rename_session_updates_name(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             database = Database(Path(tmpdir) / "sessions.db")
-            session = database.create_session(
-                name="demo",
-                working_dir="/projects/demo",
-                agent="claude-code",
-            )
+            session = make_session(database, "/projects/demo")
 
             renamed = database.rename_session(session["id"], "renamed")
             self.assertEqual(renamed["name"], "renamed")
@@ -74,11 +113,7 @@ class DatabaseTests(unittest.TestCase):
     def test_auto_approve_defaults_off_and_toggles(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             database = Database(Path(tmpdir) / "sessions.db")
-            session = database.create_session(
-                name="demo",
-                working_dir="/projects/demo",
-                agent="claude-code",
-            )
+            session = make_session(database, "/projects/demo")
 
             # New sessions start with both toggles off, exposed as bools.
             self.assertIs(session["auto_approve_write"], False)
@@ -126,11 +161,14 @@ class ProjectTableTests(unittest.TestCase):
     def test_projects_carry_session_aggregates(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             database = Database(Path(tmpdir) / "sessions.db")
-            database.create_project("/projects/shared", "shared")
+            shared = database.create_project("/projects/shared", "shared")
             database.create_project("/projects/empty", "empty")
             for name in ("one", "two"):
                 database.create_session(
-                    name=name, working_dir="/projects/shared", agent="claude-code"
+                    name=name,
+                    project_id=shared["id"],
+                    working_dir="/projects/shared",
+                    agent="claude-code",
                 )
 
             projects = {p["path"]: p for p in database.list_projects()}
@@ -151,9 +189,7 @@ class ProjectTableTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             database = Database(Path(tmpdir) / "sessions.db")
             database.create_project("/projects/demo", "demo")
-            database.create_session(
-                name="other", working_dir="/projects/demo-2", agent="claude-code"
-            )
+            make_session(database, "/projects/demo-2", name="other")
 
             self.assertEqual(
                 database.get_project("/projects/demo")["session_count"], 0
@@ -161,11 +197,47 @@ class ProjectTableTests(unittest.TestCase):
             self.assertIsNone(database.get_project("/projects/missing"))
             database.close()
 
+    def test_aggregates_follow_the_project_link_not_the_working_dir(self) -> None:
+        # A worktree session runs outside the project directory entirely; the
+        # foreign key is what keeps it on the project's card.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Database(Path(tmpdir) / "sessions.db")
+            project = database.create_project("/projects/demo", "demo")
+            session = database.create_session(
+                name="feature",
+                project_id=project["id"],
+                working_dir="/projects/demo-feature",
+                agent="claude-code",
+                owns_worktree=True,
+            )
+
+            self.assertIs(session["owns_worktree"], True)
+            listed = database.get_project("/projects/demo")
+            self.assertEqual(listed["session_count"], 1)
+            self.assertEqual(listed["last_active_at"], session["last_active_at"])
+            self.assertEqual(
+                [s["id"] for s in database.list_sessions_for_project(project["id"])],
+                [session["id"]],
+            )
+            database.close()
+
+    def test_get_project_by_id_matches_the_path_lookup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Database(Path(tmpdir) / "sessions.db")
+            project = database.create_project("/projects/demo", "demo")
+
+            self.assertEqual(database.get_project_by_id(project["id"]), project)
+            self.assertIsNone(database.get_project_by_id("missing"))
+            database.close()
+
     def test_projects_sorted_by_recency_with_never_used_last(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             database = Database(Path(tmpdir) / "sessions.db")
+            projects = {}
             for path in ("/p/older", "/p/newer", "/p/b-idle", "/p/a-idle"):
-                database.create_project(path, PurePosixPath(path).name)
+                projects[path] = database.create_project(
+                    path, PurePosixPath(path).name
+                )
 
             # Pin the clock so the two active projects differ by more than the
             # one-second resolution of the stored timestamps.
@@ -174,10 +246,16 @@ class ProjectTableTests(unittest.TestCase):
             db_module.utc_now = lambda: next(stamps)
             try:
                 database.create_session(
-                    name="a", working_dir="/p/older", agent="claude-code"
+                    name="a",
+                    project_id=projects["/p/older"]["id"],
+                    working_dir="/p/older",
+                    agent="claude-code",
                 )
                 database.create_session(
-                    name="b", working_dir="/p/newer", agent="claude-code"
+                    name="b",
+                    project_id=projects["/p/newer"]["id"],
+                    working_dir="/p/newer",
+                    agent="claude-code",
                 )
             finally:
                 db_module.utc_now = original
@@ -200,6 +278,276 @@ class ProjectTableTests(unittest.TestCase):
             self.assertEqual([p["path"] for p in projects], ["/projects/demo"])
             self.assertEqual(projects[0]["name"], "demo")
             database.close()
+
+
+class MigrationTests(unittest.TestCase):
+    """Opening a pre-worktree database rebuilds it around a real foreign key."""
+
+    LEGACY_SESSIONS = """
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            working_dir TEXT NOT NULL,
+            agent TEXT NOT NULL,
+            agent_session_id TEXT,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            last_active_at TEXT NOT NULL,
+            auto_approve_write INTEGER NOT NULL DEFAULT 0,
+            auto_approve_command INTEGER NOT NULL DEFAULT 0
+        )
+    """
+    LEGACY_PROJECTS = """
+        CREATE TABLE projects (
+            path TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """
+    LEGACY_SCROLLBACK = """
+        CREATE TABLE scrollback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            ts TEXT NOT NULL,
+            type TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        )
+    """
+
+    def build_legacy(
+        self,
+        path: Path,
+        projects: list[tuple[str, str]],
+        sessions: list[tuple[str, str, str]],
+    ) -> None:
+        """Write a database in the old shape: path-keyed projects, no FK."""
+        conn = sqlite3.connect(path)
+        with conn:
+            for statement in (
+                self.LEGACY_SESSIONS,
+                self.LEGACY_PROJECTS,
+                self.LEGACY_SCROLLBACK,
+            ):
+                conn.execute(statement)
+            for project_path, name in projects:
+                conn.execute(
+                    "INSERT INTO projects (path, name, created_at) VALUES (?, ?, ?)",
+                    (project_path, name, "2026-01-01T00:00:00Z"),
+                )
+            for session_id, name, working_dir in sessions:
+                conn.execute(
+                    """
+                    INSERT INTO sessions (
+                        id, name, working_dir, agent, agent_session_id, status,
+                        created_at, last_active_at,
+                        auto_approve_write, auto_approve_command
+                    )
+                    VALUES (?, ?, ?, 'claude-code', 'resume-1', 'idle',
+                            ?, ?, 1, 0)
+                    """,
+                    (
+                        session_id,
+                        name,
+                        working_dir,
+                        "2026-01-02T00:00:00Z",
+                        "2026-01-03T00:00:00Z",
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO scrollback (session_id, ts, type, payload) "
+                    "VALUES (?, ?, 'input', ?)",
+                    (session_id, "2026-01-03T00:00:00Z", '{"text":"hello"}'),
+                )
+        conn.close()
+
+    def test_sessions_keep_their_data_and_gain_a_project_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sessions.db"
+            self.build_legacy(
+                path,
+                projects=[("/p/demo", "demo")],
+                sessions=[("s1", "one", "/p/demo"), ("s2", "two", "/p/demo")],
+            )
+
+            database = Database(path)
+
+            project = database.get_project("/p/demo")
+            self.assertTrue(project["id"])
+            self.assertEqual(project["session_count"], 2)
+            sessions = {s["id"]: s for s in database.list_sessions()}
+            self.assertEqual(set(sessions), {"s1", "s2"})
+            for session in sessions.values():
+                self.assertEqual(session["project_id"], project["id"])
+                self.assertEqual(session["working_dir"], "/p/demo")
+                # Nothing here was created by us, so nothing here is ours to
+                # delete later.
+                self.assertIs(session["owns_worktree"], False)
+                # The rest of the row rides through untouched.
+                self.assertEqual(session["agent_session_id"], "resume-1")
+                self.assertIs(session["auto_approve_write"], True)
+                self.assertEqual(session["created_at"], "2026-01-02T00:00:00Z")
+            database.close()
+
+    def test_orphan_session_is_adopted_into_a_new_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sessions.db"
+            # A session created at a path no project row matched: invisible in
+            # the UI before, holding scrollback rows nothing could reach.
+            self.build_legacy(
+                path,
+                projects=[],
+                sessions=[("s1", "orphan", "/p/nowhere")],
+            )
+
+            database = Database(path)
+
+            projects = database.list_projects()
+            self.assertEqual([p["path"] for p in projects], ["/p/nowhere"])
+            self.assertEqual(projects[0]["name"], "nowhere")
+            self.assertEqual(projects[0]["session_count"], 1)
+            self.assertEqual(
+                database.get_session("s1")["project_id"], projects[0]["id"]
+            )
+            database.close()
+
+    def test_unnormalised_working_dir_joins_the_existing_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sessions.db"
+            # `create_session` never normalised working_dir while
+            # `create_project` did, so both spellings mean one project.
+            self.build_legacy(
+                path,
+                projects=[("/p/demo", "demo")],
+                sessions=[("s1", "slashed", "/p/demo/")],
+            )
+
+            database = Database(path)
+
+            self.assertEqual(len(database.list_projects()), 1)
+            project = database.get_project("/p/demo")
+            self.assertEqual(project["session_count"], 1)
+            session = database.get_session("s1")
+            self.assertEqual(session["project_id"], project["id"])
+            # The cwd itself is copied verbatim; only the join normalises.
+            self.assertEqual(session["working_dir"], "/p/demo/")
+            database.close()
+
+    def test_scrollback_survives_and_still_cascades(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sessions.db"
+            self.build_legacy(
+                path,
+                projects=[("/p/demo", "demo")],
+                sessions=[("s1", "one", "/p/demo")],
+            )
+
+            database = Database(path)
+
+            rows = database.recent_scrollback("s1")
+            self.assertEqual([row["payload"] for row in rows], [{"text": "hello"}])
+            # The rename must not have left scrollback's foreign key pointing
+            # at a table that no longer exists.
+            database.delete_session("s1")
+            self.assertEqual(database.recent_scrollback("s1"), [])
+            database.close()
+
+    def test_reopening_a_migrated_database_changes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sessions.db"
+            self.build_legacy(
+                path,
+                projects=[("/p/demo", "demo")],
+                sessions=[("s1", "one", "/p/demo")],
+            )
+
+            database = Database(path)
+            first = database.get_project("/p/demo")
+            database.close()
+
+            database = Database(path)
+            self.assertEqual(database.get_project("/p/demo"), first)
+            self.assertEqual(len(database.list_projects()), 1)
+            self.assertEqual(database.get_session("s1")["project_id"], first["id"])
+            database.close()
+
+    def test_database_predating_the_projects_table_migrates_too(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sessions.db"
+            conn = sqlite3.connect(path)
+            with conn:
+                # Old enough to have neither projects nor the renamed resume
+                # column: it has to migrate through both steps.
+                conn.execute(
+                    """
+                    CREATE TABLE sessions (
+                        id TEXT PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        working_dir TEXT NOT NULL,
+                        agent TEXT NOT NULL,
+                        claude_session_id TEXT,
+                        status TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        last_active_at TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    "INSERT INTO sessions VALUES "
+                    "('s1', 'one', '/p/ancient', 'claude-code', 'resume-1', "
+                    "'idle', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"
+                )
+            conn.close()
+
+            database = Database(path)
+
+            session = database.get_session("s1")
+            self.assertEqual(session["agent_session_id"], "resume-1")
+            self.assertIs(session["auto_approve_write"], False)
+            self.assertIs(session["owns_worktree"], False)
+            self.assertEqual(
+                [p["path"] for p in database.list_projects()], ["/p/ancient"]
+            )
+            self.assertEqual(
+                session["project_id"], database.get_project("/p/ancient")["id"]
+            )
+            database.close()
+
+
+class GitModuleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_is_git_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir) / "repo"
+            init_repo(repo)
+            plain = Path(tmpdir) / "plain"
+            plain.mkdir()
+
+            self.assertTrue(await git.is_git_repo(str(repo)))
+            self.assertFalse(await git.is_git_repo(str(plain)))
+            self.assertFalse(await git.is_git_repo(str(Path(tmpdir) / "gone")))
+
+    async def test_check_branch_name_uses_gits_own_rules(self) -> None:
+        self.assertTrue(await git.check_branch_name("fix-login"))
+        self.assertTrue(await git.check_branch_name("feature/fix-login"))
+        for bad in ("with space", "..", "-leading-dash", "trailing.lock", "a~b"):
+            self.assertFalse(await git.check_branch_name(bad), bad)
+
+    async def test_metacharacters_are_not_interpreted(self) -> None:
+        # The whole reason this does not go through `shell.run_command`: a
+        # branch name like this must be rejected as a name, not executed.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir) / "repo"
+            init_repo(repo)
+            marker = Path(tmpdir) / "pwned"
+
+            error = await git.add_worktree(
+                str(repo),
+                str(Path(tmpdir) / "wt"),
+                f"x; touch {marker}",
+            )
+
+            self.assertIsNotNone(error)
+            self.assertFalse(marker.exists())
 
 
 class CreateProjectTests(unittest.IsolatedAsyncioTestCase):
@@ -234,9 +582,7 @@ class CreateProjectTests(unittest.IsolatedAsyncioTestCase):
             database = Database(Path(tmpdir) / "sessions.db")
             target = str(Path(tmpdir) / "used")
             await self._create(database, target)
-            database.create_session(
-                name="one", working_dir=target, agent="claude-code"
-            )
+            make_session(database, target, name="one")
 
             again = await self._create(database, target)
             self.assertEqual(again["session_count"], 1)
@@ -331,6 +677,25 @@ class CreateProjectTests(unittest.IsolatedAsyncioTestCase):
                 main.db = original
             database.close()
 
+    async def test_is_git_repo_hint_marks_repositories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Database(Path(tmpdir) / "sessions.db")
+            plain = await self._create(database, str(Path(tmpdir) / "plain"))
+            self.assertFalse(plain["is_git_repo"])
+
+            repo = Path(tmpdir) / "repo"
+            init_repo(repo)
+            adopted = await self._create(database, str(repo))
+            self.assertTrue(adopted["is_git_repo"])
+
+            # A project that is itself a worktree has `.git` as a file, and
+            # still counts.
+            worktree = Path(tmpdir) / "wt"
+            run_git(repo, "worktree", "add", "-b", "side", str(worktree))
+            nested = await self._create(database, str(worktree))
+            self.assertTrue(nested["is_git_repo"])
+            database.close()
+
     async def test_undeletable_path_is_a_400_not_a_crash(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             database = Database(Path(tmpdir) / "sessions.db")
@@ -344,6 +709,311 @@ class CreateProjectTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(caught.exception.status_code, 400)
             self.assertEqual(database.list_projects(), [])
             database.close()
+
+
+class SessionEndpointTestCase(unittest.IsolatedAsyncioTestCase):
+    """Drives main's session endpoints against a temporary database."""
+
+    def setUp(self) -> None:
+        import main
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmpdir = Path(self._tmp.name)
+        self.database = Database(self.tmpdir / "sessions.db")
+        self.main = main
+        self._original_db = main.db
+        main.db = self.database
+
+    def tearDown(self) -> None:
+        self.main.db = self._original_db
+        self.database.close()
+        self._tmp.cleanup()
+
+    def make_project(self, name: str = "repo", repo: bool = True) -> dict[str, Any]:
+        path = self.tmpdir / name
+        if repo:
+            init_repo(path)
+        else:
+            path.mkdir()
+        return self.database.create_project(str(path), name)
+
+    async def create(self, **kwargs: Any) -> dict[str, Any]:
+        return await self.main.create_session(
+            self.main.CreateSessionRequest(**kwargs)
+        )
+
+
+class CreateSessionTests(SessionEndpointTestCase):
+    async def test_without_worktree_runs_in_the_project_directory(self) -> None:
+        project = self.make_project(repo=False)
+
+        session = await self.create(name="plain", project_path=project["path"])
+
+        self.assertEqual(session["working_dir"], project["path"])
+        self.assertEqual(session["project_id"], project["id"])
+        self.assertIs(session["owns_worktree"], False)
+
+    async def test_working_dir_is_accepted_as_a_deprecated_alias(self) -> None:
+        project = self.make_project(repo=False)
+
+        session = await self.create(name="legacy", working_dir=project["path"])
+
+        self.assertEqual(session["working_dir"], project["path"])
+        self.assertEqual(session["project_id"], project["id"])
+
+    async def test_unregistered_project_is_404(self) -> None:
+        with self.assertRaises(HTTPException) as caught:
+            await self.create(
+                name="nope", project_path=str(self.tmpdir / "unregistered")
+            )
+
+        self.assertEqual(caught.exception.status_code, 404)
+        self.assertEqual(self.database.list_sessions(), [])
+        self.assertFalse((self.tmpdir / "unregistered").exists())
+
+    async def test_unknown_agent_is_400(self) -> None:
+        project = self.make_project(repo=False)
+        with self.assertRaises(HTTPException) as caught:
+            await self.create(
+                name="nope", project_path=project["path"], agent="gpt-whatever"
+            )
+        self.assertEqual(caught.exception.status_code, 400)
+
+    async def test_worktree_session_gets_its_own_directory_and_branch(self) -> None:
+        project = self.make_project()
+        worktree = self.tmpdir / "repo-fix-login"
+
+        session = await self.create(
+            name="fix login",
+            project_path=project["path"],
+            worktree={"path": str(worktree), "branch": "fix-login"},
+        )
+
+        self.assertEqual(session["working_dir"], str(worktree))
+        self.assertIs(session["owns_worktree"], True)
+        # A real worktree on a real new branch, not just a directory.
+        self.assertTrue((worktree / ".git").is_file())
+        self.assertEqual(
+            run_git(worktree, "rev-parse", "--abbrev-ref", "HEAD"), "fix-login"
+        )
+        # And it still belongs to the project it was cut from.
+        listed = self.database.get_project(project["path"])
+        self.assertEqual(listed["session_count"], 1)
+
+    async def test_empty_target_directory_is_taken_over(self) -> None:
+        project = self.make_project()
+        worktree = self.tmpdir / "prepared"
+        worktree.mkdir()
+
+        session = await self.create(
+            name="fix",
+            project_path=project["path"],
+            worktree={"path": str(worktree), "branch": "fix"},
+        )
+
+        self.assertEqual(session["working_dir"], str(worktree))
+
+    async def test_non_repo_project_is_400_and_creates_nothing(self) -> None:
+        project = self.make_project(repo=False)
+        worktree = self.tmpdir / "wt"
+
+        with self.assertRaises(HTTPException) as caught:
+            await self.create(
+                name="fix",
+                project_path=project["path"],
+                worktree={"path": str(worktree), "branch": "fix"},
+            )
+
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertEqual(caught.exception.detail, "project is not a git repository")
+        self.assertEqual(self.database.list_sessions(), [])
+        self.assertFalse(worktree.exists())
+
+    async def test_non_empty_target_path_is_400(self) -> None:
+        project = self.make_project()
+        worktree = self.tmpdir / "occupied"
+        worktree.mkdir()
+        (worktree / "keep.txt").write_text("mine")
+
+        with self.assertRaises(HTTPException) as caught:
+            await self.create(
+                name="fix",
+                project_path=project["path"],
+                worktree={"path": str(worktree), "branch": "fix"},
+            )
+
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertEqual(self.database.list_sessions(), [])
+        # Refusing must not disturb what is already there.
+        self.assertEqual((worktree / "keep.txt").read_text(), "mine")
+
+    async def test_invalid_branch_name_is_400(self) -> None:
+        project = self.make_project()
+
+        with self.assertRaises(HTTPException) as caught:
+            await self.create(
+                name="fix",
+                project_path=project["path"],
+                worktree={"path": str(self.tmpdir / "wt"), "branch": "bad name"},
+            )
+
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertEqual(caught.exception.detail, "invalid branch name")
+        self.assertFalse((self.tmpdir / "wt").exists())
+
+    async def test_existing_branch_is_400(self) -> None:
+        project = self.make_project()
+        run_git(Path(project["path"]), "branch", "taken")
+
+        with self.assertRaises(HTTPException) as caught:
+            await self.create(
+                name="fix",
+                project_path=project["path"],
+                worktree={"path": str(self.tmpdir / "wt"), "branch": "taken"},
+            )
+
+        # v1 always cuts a new branch, so git's refusal is the answer; its own
+        # message goes through so the client can show something specific.
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertIn("taken", caught.exception.detail)
+        self.assertEqual(self.database.list_sessions(), [])
+
+    async def test_worktree_at_the_project_path_is_400(self) -> None:
+        project = self.make_project()
+
+        with self.assertRaises(HTTPException) as caught:
+            await self.create(
+                name="fix",
+                project_path=project["path"],
+                worktree={"path": project["path"] + "/", "branch": "fix"},
+            )
+
+        self.assertEqual(caught.exception.status_code, 400)
+
+    async def test_failed_insert_takes_the_worktree_back(self) -> None:
+        project = self.make_project()
+        worktree = self.tmpdir / "rolled-back"
+
+        def explode(**kwargs: Any) -> dict[str, Any]:
+            raise sqlite3.OperationalError("database is locked")
+
+        self.database.create_session = explode
+        with self.assertRaises(sqlite3.OperationalError):
+            await self.create(
+                name="fix",
+                project_path=project["path"],
+                worktree={"path": str(worktree), "branch": "fix"},
+            )
+
+        # Nothing owns the worktree, so it must not survive the failure.
+        self.assertFalse(worktree.exists())
+        self.assertEqual(
+            run_git(Path(project["path"]), "worktree", "list", "--porcelain").count(
+                "worktree "
+            ),
+            1,
+        )
+
+
+class TeardownWorktreeTests(SessionEndpointTestCase):
+    async def worktree_session(self, name: str = "fix") -> tuple[dict, Path, dict]:
+        project = self.make_project()
+        worktree = self.tmpdir / f"repo-{name}"
+        session = await self.create(
+            name=name,
+            project_path=project["path"],
+            worktree={"path": str(worktree), "branch": name},
+        )
+        return project, worktree, session
+
+    async def test_clean_worktree_is_removed(self) -> None:
+        _, worktree, session = await self.worktree_session()
+
+        result = await self.main.delete_session(session["id"])
+
+        self.assertEqual(result["status"], "deleted")
+        self.assertTrue(result["worktree_removed"])
+        self.assertIsNone(result["worktree_error"])
+        self.assertFalse(worktree.exists())
+        self.assertIsNone(self.database.get_session(session["id"]))
+
+    async def test_dirty_worktree_is_left_in_place_and_reported(self) -> None:
+        _, worktree, session = await self.worktree_session()
+        # An untracked file counts as dirty, so this is the *common* case for
+        # any session that did some work — not an edge case.
+        (worktree / "new_file.py").write_text("print('hi')")
+
+        result = await self.main.delete_session(session["id"])
+
+        # The session is deleted regardless; the directory is not.
+        self.assertEqual(result["status"], "deleted")
+        self.assertFalse(result["worktree_removed"])
+        self.assertIn("untracked", result["worktree_error"])
+        self.assertTrue(worktree.is_dir())
+        self.assertEqual((worktree / "new_file.py").read_text(), "print('hi')")
+        self.assertIsNone(self.database.get_session(session["id"]))
+
+    async def test_directory_removed_by_hand_is_a_success(self) -> None:
+        _, worktree, session = await self.worktree_session()
+        subprocess.run(["rm", "-rf", str(worktree)], check=True)
+
+        result = await self.main.delete_session(session["id"])
+
+        # git prunes its own admin files and exits 0; nothing to report.
+        self.assertTrue(result["worktree_removed"])
+        self.assertIsNone(result["worktree_error"])
+
+    async def test_a_worktree_we_did_not_create_is_left_alone(self) -> None:
+        project = self.make_project()
+        # Made by hand, outside the app: a worktree, but not ours to delete.
+        worktree = self.tmpdir / "by-hand"
+        run_git(Path(project["path"]), "worktree", "add", "-b", "manual", str(worktree))
+        session = self.database.create_session(
+            name="borrowed",
+            project_id=project["id"],
+            working_dir=str(worktree),
+            agent="claude-code",
+        )
+
+        result = await self.main.delete_session(session["id"])
+
+        self.assertFalse(result["worktree_removed"])
+        self.assertIsNone(result["worktree_error"])
+        self.assertTrue(worktree.is_dir())
+
+    async def test_delete_project_sweeps_worktrees_and_reports_counts(self) -> None:
+        project = self.make_project()
+        clean = await self.create(
+            name="clean",
+            project_path=project["path"],
+            worktree={"path": str(self.tmpdir / "wt-clean"), "branch": "clean"},
+        )
+        dirty = await self.create(
+            name="dirty",
+            project_path=project["path"],
+            worktree={"path": str(self.tmpdir / "wt-dirty"), "branch": "dirty"},
+        )
+        plain = await self.create(name="plain", project_path=project["path"])
+        (self.tmpdir / "wt-dirty" / "scratch.txt").write_text("x")
+
+        result = await self.main.delete_project(
+            self.main.DeleteProjectRequest(path=project["path"])
+        )
+
+        self.assertEqual(result["sessions_deleted"], 3)
+        self.assertEqual(result["worktrees_removed"], 1)
+        self.assertEqual(len(result["worktree_errors"]), 1)
+        self.assertEqual(result["worktree_errors"][0]["session"], "dirty")
+        self.assertEqual(
+            result["worktree_errors"][0]["path"], str(self.tmpdir / "wt-dirty")
+        )
+        self.assertFalse((self.tmpdir / "wt-clean").exists())
+        self.assertTrue((self.tmpdir / "wt-dirty").is_dir())
+        # The project directory itself is never touched.
+        self.assertTrue(Path(project["path"]).is_dir())
+        self.assertEqual(self.database.list_sessions(), [])
+        for session in (clean, dirty, plain):
+            self.assertIsNone(self.database.get_session(session["id"]))
 
 
 class DeleteProjectTests(unittest.IsolatedAsyncioTestCase):
@@ -363,23 +1033,27 @@ class DeleteProjectTests(unittest.IsolatedAsyncioTestCase):
             target = Path(tmpdir) / "doomed"
             target.mkdir()
             (target / "work.txt").write_text("the agent's output")
-            database.create_project(str(target), "doomed")
+            doomed = database.create_project(str(target), "doomed")
 
             for name in ("one", "two"):
                 database.create_session(
-                    name=name, working_dir=str(target), agent="claude-code"
+                    name=name,
+                    project_id=doomed["id"],
+                    working_dir=str(target),
+                    agent="claude-code",
                 )
-            keeper = database.create_session(
-                name="elsewhere",
-                working_dir=str(Path(tmpdir) / "other"),
-                agent="claude-code",
+            keeper = make_session(
+                database, str(Path(tmpdir) / "other"), name="elsewhere"
             )
 
             result = await self._delete(database, str(target))
 
             self.assertEqual(result["sessions_deleted"], 2)
-            self.assertEqual(database.list_projects(), [])
-            # Sessions in other directories are untouched.
+            self.assertEqual(result["worktrees_removed"], 0)
+            self.assertEqual(result["worktree_errors"], [])
+            self.assertEqual([p["path"] for p in database.list_projects()],
+                             [str(Path(tmpdir) / "other")])
+            # Sessions belonging to another project are untouched.
             self.assertEqual(
                 [s["id"] for s in database.list_sessions()], [keeper["id"]]
             )
@@ -392,10 +1066,7 @@ class DeleteProjectTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             database = Database(Path(tmpdir) / "sessions.db")
             target = str(Path(tmpdir) / "doomed")
-            database.create_project(target, "doomed")
-            session = database.create_session(
-                name="one", working_dir=target, agent="claude-code"
-            )
+            session = make_session(database, target, name="one")
             database.append_scrollback(session["id"], "input", {"text": "hello"})
 
             await self._delete(database, target)
@@ -802,9 +1473,7 @@ class RunTurnAutoApproveTests(unittest.IsolatedAsyncioTestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             main.db = Database(Path(tmpdir) / "sessions.db")
-            session = main.db.create_session(
-                name="demo", working_dir=tmpdir, agent="fake"
-            )
+            session = make_session(main.db, tmpdir, agent="fake")
             if auto_command:
                 main.db.set_auto_approve(session["id"], command=True)
 
@@ -1093,9 +1762,7 @@ class BashModeTests(unittest.IsolatedAsyncioTestCase):
         import main
 
         main.db = Database(Path(tmpdir) / "sessions.db")
-        session = main.db.create_session(
-            name="demo", working_dir=tmpdir, agent="claude-code"
-        )
+        session = make_session(main.db, tmpdir)
         return main, session
 
     async def _capture(self, main):
