@@ -10,3 +10,4 @@ tests/__pycache__
 sessions.db
 sessions.db-shm
 sessions.db-wal
+dist

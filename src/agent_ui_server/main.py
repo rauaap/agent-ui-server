@@ -10,10 +10,9 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-import git
-import shell
-from agent import AgentAdapter, ClaudeCodeAdapter, OpenCodeAdapter
-from db import Database
+from . import git, shell
+from .agent import AgentAdapter, ClaudeCodeAdapter, OpenCodeAdapter
+from .db import Database
 
 
 SCROLLBACK_REPLAY_LIMIT = 200

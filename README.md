@@ -62,13 +62,14 @@ with the `session_id` captured from the previous turn's `result` event.
 
 ```
 agent-ui-server/
-├── main.py          # FastAPI app — REST routes, WebSocket endpoint, turn orchestration
-├── agent.py         # AgentAdapter base + ClaudeCodeAdapter (stream-json) + OpenCodeAdapter (ACP)
-├── opencode_permissions.json  # Default OpenCode permission config (gates tools to "ask")
-├── shell.py         # Bash mode — one-shot `bash -lc`, timeout + output caps
-├── git.py           # Per-session worktrees — `git` via argv, never through a shell
-├── db.py            # SQLite — session metadata + append-only scrollback
-├── pyproject.toml   # Dependencies (managed with uv)
+├── src/agent_ui_server/
+│   ├── main.py      # FastAPI app — REST routes, WebSocket endpoint, turn orchestration
+│   ├── agent.py     # AgentAdapter base + ClaudeCodeAdapter (stream-json) + OpenCodeAdapter (ACP)
+│   ├── opencode_permissions.json  # Default OpenCode permission config (gates tools to "ask")
+│   ├── shell.py     # Bash mode — one-shot `bash -lc`, timeout + output caps
+│   ├── git.py       # Per-session worktrees — `git` via argv, never through a shell
+│   └── db.py        # SQLite — session metadata + append-only scrollback
+├── pyproject.toml   # Package metadata + dependencies (managed with uv)
 ├── Dockerfile       # Fedora + uv + Claude Code CLI + nested Podman
 ├── compose.yaml     # Host-network service, bind mounts, named auth volume
 ├── docs/            # Design notes + the WebSocket event schema reference
@@ -108,13 +109,19 @@ on the host. Log in to Claude Code once — credentials live in `~/.claude`:
 
 ```sh
 claude login
-uv run main.py
+uv sync
+uv run agent-ui-server
 ```
+
+`uv sync` installs the project itself (a `src/` layout package, built with
+hatchling), so `agent-ui-server` is on the path inside the venv. It can equally
+be installed anywhere else — `uv tool install .`, `uv pip install .`, `pipx
+install .` — or run as `python -m agent_ui_server`.
 
 Bind explicitly to the WireGuard interface:
 
 ```sh
-WIREGUARD_IP=10.0.0.1 PORT=8000 uv run main.py
+WIREGUARD_IP=10.0.0.1 PORT=8000 uv run agent-ui-server
 ```
 
 ### With Docker / Podman Compose
@@ -149,8 +156,8 @@ Project directories are bind-mounted at `/projects`; create projects with
 visible inside the container — a sibling like `/projects/<name>-<branch>` is the
 shape the client suggests.
 
-Both paths run the same entry point (`main.py`), so host/port behavior is
-identical whether you use uv or Compose.
+Both paths run the same entry point (the `agent-ui-server` console script), so
+host/port behavior is identical whether you use uv or Compose.
 
 ### Configuration
 
@@ -177,7 +184,7 @@ desktop client, [rauaap/agent-ui-desktop](https://github.com/rauaap/agent-ui-des
 is a zero-build static app meant to be pointed at exactly this:
 
 ```sh
-WEB_ROOT=../agent-ui-desktop uv run main.py
+WEB_ROOT=../agent-ui-desktop uv run agent-ui-server
 ```
 
 The mount is registered after every route, so `/projects`, `/sessions` and
@@ -627,9 +634,13 @@ Codex remains future work — its approval handling needs a persistent
 ## Development
 
 ```sh
-uv sync                                        # install dependencies
+uv sync                                        # install deps + the project (editable)
 uv run python -m unittest discover -s tests    # run the test suite
+uv build                                       # build a wheel + sdist into dist/
 ```
+
+The tests import the installed package (`from agent_ui_server import ...`), so
+`uv sync` has to have run at least once.
 
 The tests cover the SQLite session/scrollback lifecycle, the schema migration
 (built from a hand-written old-shaped database), the `ClaudeCodeAdapter`

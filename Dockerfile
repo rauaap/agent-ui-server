@@ -15,9 +15,12 @@ RUN mkdir -p /home/agent
 
 WORKDIR /app
 
+# Dependencies first, without the project itself: this layer stays cached
+# across source changes.
 COPY pyproject.toml uv.lock ./
-RUN uv sync --locked --no-dev
+RUN uv sync --locked --no-dev --no-install-project
 
 COPY . .
+RUN uv sync --locked --no-dev
 
-CMD ["uv", "run", "--no-sync", "main.py"]
+CMD ["uv", "run", "--no-sync", "agent-ui-server"]

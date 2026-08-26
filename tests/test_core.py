@@ -12,10 +12,9 @@ import asyncio
 
 from fastapi import HTTPException
 
-import db as db_module
-import git
-import shell
-from agent import (
+from agent_ui_server import db as db_module
+from agent_ui_server import git, shell
+from agent_ui_server.agent import (
     ApprovalDecision,
     ClaudeCodeAdapter,
     OpenCodeAdapter,
@@ -23,7 +22,7 @@ from agent import (
     _option_behavior,
     _resolve_decision,
 )
-from db import Database
+from agent_ui_server.db import Database
 
 
 def make_session(
@@ -552,7 +551,7 @@ class GitModuleTests(unittest.IsolatedAsyncioTestCase):
 
 class CreateProjectTests(unittest.IsolatedAsyncioTestCase):
     async def _create(self, database: Database, path: str) -> dict[str, Any]:
-        import main
+        from agent_ui_server import main
 
         original = main.db
         main.db = database
@@ -624,7 +623,7 @@ class CreateProjectTests(unittest.IsolatedAsyncioTestCase):
             database = Database(Path(tmpdir) / "sessions.db")
             target = str(Path(tmpdir) / "some-dir")
 
-            import main
+            from agent_ui_server import main
 
             original = main.db
             main.db = database
@@ -662,7 +661,7 @@ class CreateProjectTests(unittest.IsolatedAsyncioTestCase):
             target = Path(tmpdir) / "vanishing"
             await self._create(database, str(target))
 
-            import main
+            from agent_ui_server import main
 
             original = main.db
             main.db = database
@@ -715,7 +714,7 @@ class SessionEndpointTestCase(unittest.IsolatedAsyncioTestCase):
     """Drives main's session endpoints against a temporary database."""
 
     def setUp(self) -> None:
-        import main
+        from agent_ui_server import main
 
         self._tmp = tempfile.TemporaryDirectory()
         self.tmpdir = Path(self._tmp.name)
@@ -1018,7 +1017,7 @@ class TeardownWorktreeTests(SessionEndpointTestCase):
 
 class DeleteProjectTests(unittest.IsolatedAsyncioTestCase):
     async def _delete(self, database: Database, path: str) -> dict[str, Any]:
-        import main
+        from agent_ui_server import main
 
         original = main.db
         main.db = database
@@ -1469,7 +1468,7 @@ class _AutoApproveAdapter:
 
 class RunTurnAutoApproveTests(unittest.IsolatedAsyncioTestCase):
     async def _drive(self, *, auto_command: bool, category: str):
-        import main
+        from agent_ui_server import main
 
         with tempfile.TemporaryDirectory() as tmpdir:
             main.db = Database(Path(tmpdir) / "sessions.db")
@@ -1759,7 +1758,7 @@ class BashModeTests(unittest.IsolatedAsyncioTestCase):
     """main.begin_bash / run_bash: the parts that must not touch turn state."""
 
     async def _session(self, tmpdir: str):
-        import main
+        from agent_ui_server import main
 
         main.db = Database(Path(tmpdir) / "sessions.db")
         session = make_session(main.db, tmpdir)
@@ -1775,7 +1774,7 @@ class BashModeTests(unittest.IsolatedAsyncioTestCase):
         return events
 
     async def test_echo_then_output_without_status_changes(self) -> None:
-        import main
+        from agent_ui_server import main
 
         original = main.broadcast
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1808,7 +1807,7 @@ class BashModeTests(unittest.IsolatedAsyncioTestCase):
                 main_mod.db.close()
 
     async def test_runs_while_the_agent_turn_is_running(self) -> None:
-        import main
+        from agent_ui_server import main
 
         original = main.broadcast
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1829,7 +1828,7 @@ class BashModeTests(unittest.IsolatedAsyncioTestCase):
                 main_mod.db.close()
 
     async def test_second_command_while_one_is_in_flight_is_rejected(self) -> None:
-        import main
+        from agent_ui_server import main
 
         original = main.broadcast
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1847,7 +1846,7 @@ class BashModeTests(unittest.IsolatedAsyncioTestCase):
                 main_mod.db.close()
 
     async def test_cancel_bash_reports_the_stop(self) -> None:
-        import main
+        from agent_ui_server import main
 
         original = main.broadcast
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1866,7 +1865,7 @@ class BashModeTests(unittest.IsolatedAsyncioTestCase):
                 main_mod.db.close()
 
     async def test_unknown_session_is_404(self) -> None:
-        import main
+        from agent_ui_server import main
 
         with tempfile.TemporaryDirectory() as tmpdir:
             main_mod, _ = await self._session(tmpdir)

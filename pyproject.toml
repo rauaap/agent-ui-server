@@ -2,6 +2,7 @@
 name = "agent-ui-server"
 version = "0.1.0"
 description = "Mobile-first web UI for controlling Claude Code agent sessions."
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115.0",
@@ -9,5 +10,12 @@ dependencies = [
     "uvicorn[standard]>=0.30.0",
 ]
 
-[tool.uv]
-package = false
+[project.scripts]
+agent-ui-server = "agent_ui_server.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_ui_server"]
