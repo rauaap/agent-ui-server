@@ -5,6 +5,7 @@ import os
 import sqlite3
 import threading
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -58,14 +59,14 @@ class Database:
 
     def init(self) -> None:
         with self._lock, self._conn:
-            # Projects have their own uuid identity: `path` is still how the
-            # HTTP API addresses one and is still unique, but sessions link to
-            # the id, so a project's path can change without taking its
-            # sessions with it.
+            # Projects have their own identity: `path` is still how the HTTP
+            # API addresses one and is still unique, but sessions link to the
+            # id, so a project's path can change without taking its sessions
+            # with it.
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS projects (
-                    id TEXT PRIMARY KEY,
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
                     path TEXT NOT NULL UNIQUE,
                     name TEXT NOT NULL,
                     created_at TEXT NOT NULL
@@ -75,9 +76,9 @@ class Database:
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS sessions (
-                    id TEXT PRIMARY KEY,
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT NOT NULL,
-                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
                     working_dir TEXT NOT NULL,
                     owns_worktree INTEGER NOT NULL DEFAULT 0,
                     agent TEXT NOT NULL,
@@ -114,7 +115,7 @@ class Database:
                 """
                 CREATE TABLE IF NOT EXISTS scrollback (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id TEXT NOT NULL,
+                    session_id INTEGER NOT NULL,
                     ts TEXT NOT NULL,
                     type TEXT NOT NULL,
                     payload TEXT NOT NULL,
@@ -122,21 +123,24 @@ class Database:
                 )
                 """
             )
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_scrollback_session_id_id "
-                "ON scrollback(session_id, id)"
-            )
 
         # The two ALTERs above are all SQLite can do in place; the rest of the
-        # move to id-linked projects needs a table rebuild.
+        # move to id-linked projects needs a table rebuild, and so does the
+        # move off uuid ids.
         self._migrate_v2()
+        self._migrate_v3()
 
         with self._lock, self._conn:
-            # After the rebuild, so an unmigrated database does not trip over a
-            # column it does not have yet.
+            # After the rebuilds: an unmigrated database would trip over a
+            # column it does not have yet, and a rebuilt table drops the
+            # indexes that pointed at the table it replaced.
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_sessions_project_id "
                 "ON sessions(project_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_scrollback_session_id_id "
+                "ON scrollback(session_id, id)"
             )
 
     def _migrate_v2(self) -> None:
@@ -167,30 +171,38 @@ class Database:
                 for row in self._conn.execute("PRAGMA table_info(projects)")
             }
 
-            # Both must be outside a transaction: foreign_keys is silently
-            # ignored inside one, and autocommit makes the BEGIN below ours.
-            previous_isolation = self._conn.isolation_level
-            self._conn.isolation_level = None
-            self._conn.execute("PRAGMA foreign_keys = OFF")
+            self._rebuild_tables(lambda: self._rebuild_v2(project_columns))
+
+    def _rebuild_tables(self, rebuild: Callable[[], None]) -> None:
+        """Run a whole-table rebuild in one transaction, foreign keys off.
+
+        Both PRAGMAs must be set outside a transaction: `foreign_keys` is
+        silently ignored inside one, and autocommit makes the BEGIN ours. The
+        closing `foreign_key_check` is what turns a botched copy into a
+        rollback instead of a database full of dangling rows.
+        """
+        previous_isolation = self._conn.isolation_level
+        self._conn.isolation_level = None
+        self._conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            self._conn.execute("BEGIN")
             try:
-                self._conn.execute("BEGIN")
-                try:
-                    self._rebuild_v2(project_columns)
-                    violations = self._conn.execute(
-                        "PRAGMA foreign_key_check"
-                    ).fetchall()
-                    if violations:
-                        raise RuntimeError(
-                            f"Migration left {len(violations)} foreign key "
-                            f"violations; database untouched"
-                        )
-                    self._conn.execute("COMMIT")
-                except Exception:
-                    self._conn.execute("ROLLBACK")
-                    raise
-            finally:
-                self._conn.execute("PRAGMA foreign_keys = ON")
-                self._conn.isolation_level = previous_isolation
+                rebuild()
+                violations = self._conn.execute(
+                    "PRAGMA foreign_key_check"
+                ).fetchall()
+                if violations:
+                    raise RuntimeError(
+                        f"Migration left {len(violations)} foreign key "
+                        f"violations; database untouched"
+                    )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+        finally:
+            self._conn.execute("PRAGMA foreign_keys = ON")
+            self._conn.isolation_level = previous_isolation
 
     def _rebuild_v2(self, project_columns: set[str]) -> None:
         """The copy half of `_migrate_v2`, inside its transaction."""
@@ -305,6 +317,152 @@ class Database:
         self._conn.execute("ALTER TABLE sessions_new RENAME TO sessions")
         self._conn.execute("PRAGMA legacy_alter_table = OFF")
 
+    def _migrate_v3(self) -> None:
+        """Renumber projects and sessions from uuid strings to integer ids.
+
+        The uuids were never argued for: `sessions.id` was a uuid from the
+        first version of this file and `projects.id` copied it. Nothing here
+        needs one — the server has no auth, so unguessable ids protect
+        nothing, and `scrollback` has always shown the alternative works.
+        `INTEGER PRIMARY KEY` aliases the rowid, so the `project_id` and
+        `session_id` joins stop comparing 36-byte strings and the tables lose
+        a redundant index apiece.
+
+        **Ids are renumbered, not preserved.** Anything holding an old uuid —
+        a bookmarked URL, a client's stored session — stops resolving once
+        this runs. Acceptable for a local single-user server, and there is no
+        way to renumber without it.
+
+        A no-op on a fresh database and on one that has been through this
+        before; `_migrate_v2` runs first, so by here every database has the
+        id-linked shape and differs only in the type of the ids.
+        """
+        with self._lock:
+            declared = {
+                row["name"]: row["type"]
+                for row in self._conn.execute("PRAGMA table_info(sessions)")
+            }
+            if declared.get("id", "INTEGER").upper() != "TEXT":
+                return
+            self._rebuild_tables(self._rebuild_v3)
+
+    def _rebuild_v3(self) -> None:
+        """The copy half of `_migrate_v3`, inside its transaction.
+
+        Unlike v2 this has to rebuild `scrollback` as well, since its
+        `session_id` holds the ids being renumbered.
+        """
+        self._conn.execute(
+            """
+            CREATE TABLE projects_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE sessions_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                working_dir TEXT NOT NULL,
+                owns_worktree INTEGER NOT NULL DEFAULT 0,
+                agent TEXT NOT NULL,
+                agent_session_id TEXT,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                last_active_at TEXT NOT NULL,
+                auto_approve_write INTEGER NOT NULL DEFAULT 0,
+                auto_approve_command INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE scrollback_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL,
+                ts TEXT NOT NULL,
+                type TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+            )
+            """
+        )
+
+        # Copied oldest-first so the new ids run in creation order rather than
+        # in whatever order the uuids happened to sort.
+        project_ids: dict[str, int] = {}
+        for row in self._conn.execute(
+            "SELECT id, path, name, created_at FROM projects ORDER BY created_at, rowid"
+        ).fetchall():
+            cursor = self._conn.execute(
+                "INSERT INTO projects_new (path, name, created_at) VALUES (?, ?, ?)",
+                (row["path"], row["name"], row["created_at"]),
+            )
+            project_ids[row["id"]] = cursor.lastrowid
+
+        session_ids: dict[str, int] = {}
+        for row in self._conn.execute(
+            "SELECT * FROM sessions ORDER BY created_at, rowid"
+        ).fetchall():
+            cursor = self._conn.execute(
+                """
+                INSERT INTO sessions_new (
+                    name, project_id, working_dir, owns_worktree, agent,
+                    agent_session_id, status, created_at, last_active_at,
+                    auto_approve_write, auto_approve_command
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["name"],
+                    project_ids[row["project_id"]],
+                    row["working_dir"],
+                    row["owns_worktree"],
+                    row["agent"],
+                    row["agent_session_id"],
+                    row["status"],
+                    row["created_at"],
+                    row["last_active_at"],
+                    row["auto_approve_write"],
+                    row["auto_approve_command"],
+                ),
+            )
+            session_ids[row["id"]] = cursor.lastrowid
+
+        for row in self._conn.execute(
+            "SELECT session_id, ts, type, payload FROM scrollback ORDER BY id"
+        ).fetchall():
+            # Scrollback whose session is already gone: the foreign key was
+            # declared from the start, but `PRAGMA foreign_keys` is per
+            # connection, so a row written by something that never set it can
+            # still be here. Dropping it beats failing the whole migration on
+            # the `foreign_key_check` at the end.
+            session_id = session_ids.get(row["session_id"])
+            if session_id is None:
+                continue
+            self._conn.execute(
+                "INSERT INTO scrollback_new (session_id, ts, type, payload) "
+                "VALUES (?, ?, ?, ?)",
+                (session_id, row["ts"], row["type"], row["payload"]),
+            )
+
+        self._conn.execute("DROP TABLE scrollback")
+        self._conn.execute("DROP TABLE sessions")
+        self._conn.execute("DROP TABLE projects")
+        # As in v2: without this the renames try to fix up references from
+        # other tables, and scrollback_new's own REFERENCES would be rewritten
+        # to point at the table it is replacing.
+        self._conn.execute("PRAGMA legacy_alter_table = ON")
+        self._conn.execute("ALTER TABLE projects_new RENAME TO projects")
+        self._conn.execute("ALTER TABLE sessions_new RENAME TO sessions")
+        self._conn.execute("ALTER TABLE scrollback_new RENAME TO scrollback")
+        self._conn.execute("PRAGMA legacy_alter_table = OFF")
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
@@ -326,7 +484,7 @@ class Database:
             ).fetchall()
         return [_row_to_session(row) for row in rows]
 
-    def list_sessions_for_project(self, project_id: str) -> list[dict[str, Any]]:
+    def list_sessions_for_project(self, project_id: int) -> list[dict[str, Any]]:
         """Every session belonging to a project, worktrees included.
 
         The link is the foreign key, not the working directory, so a session
@@ -375,7 +533,7 @@ class Database:
             ).fetchone()
         return dict(row) if row else None
 
-    def get_project_by_id(self, project_id: str) -> dict[str, Any] | None:
+    def get_project_by_id(self, project_id: int) -> dict[str, Any] | None:
         """Look a project up by id — how sessions refer to one."""
         with self._lock:
             row = self._conn.execute(
@@ -401,9 +559,9 @@ class Database:
         """
         with self._lock, self._conn:
             self._conn.execute(
-                "INSERT OR IGNORE INTO projects (id, path, name, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (str(uuid.uuid4()), path, name, utc_now()),
+                "INSERT OR IGNORE INTO projects (path, name, created_at) "
+                "VALUES (?, ?, ?)",
+                (path, name, utc_now()),
             )
         project = self.get_project(path)
         if project is None:
@@ -413,7 +571,7 @@ class Database:
     def create_session(
         self,
         name: str,
-        project_id: str,
+        project_id: int,
         working_dir: str,
         agent: str,
         owns_worktree: bool = False,
@@ -425,19 +583,17 @@ class Database:
         one. `owns_worktree` records that we created that directory and are the
         ones responsible for removing it.
         """
-        session_id = str(uuid.uuid4())
         now = utc_now()
         with self._lock, self._conn:
-            self._conn.execute(
+            cursor = self._conn.execute(
                 """
                 INSERT INTO sessions (
-                    id, name, project_id, working_dir, owns_worktree, agent,
+                    name, project_id, working_dir, owns_worktree, agent,
                     agent_session_id, status, created_at, last_active_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, NULL, 'idle', ?, ?)
+                VALUES (?, ?, ?, ?, ?, NULL, 'idle', ?, ?)
                 """,
                 (
-                    session_id,
                     name,
                     project_id,
                     working_dir,
@@ -447,9 +603,10 @@ class Database:
                     now,
                 ),
             )
+            session_id = cursor.lastrowid
         return self.require_session(session_id)
 
-    def delete_session(self, session_id: str) -> bool:
+    def delete_session(self, session_id: int) -> bool:
         with self._lock, self._conn:
             cursor = self._conn.execute(
                 "DELETE FROM sessions WHERE id = ?",
@@ -457,7 +614,7 @@ class Database:
             )
         return cursor.rowcount > 0
 
-    def get_session(self, session_id: str) -> dict[str, Any] | None:
+    def get_session(self, session_id: int) -> dict[str, Any] | None:
         with self._lock:
             row = self._conn.execute(
                 f"""
@@ -469,13 +626,13 @@ class Database:
             ).fetchone()
         return _row_to_session(row) if row else None
 
-    def require_session(self, session_id: str) -> dict[str, Any]:
+    def require_session(self, session_id: int) -> dict[str, Any]:
         session = self.get_session(session_id)
         if session is None:
             raise KeyError(f"Unknown session: {session_id}")
         return session
 
-    def update_status(self, session_id: str, status: str) -> None:
+    def update_status(self, session_id: int, status: str) -> None:
         if status not in VALID_STATUSES:
             raise ValueError(f"Invalid status: {status}")
         with self._lock, self._conn:
@@ -486,7 +643,7 @@ class Database:
         if cursor.rowcount == 0:
             raise KeyError(f"Unknown session: {session_id}")
 
-    def rename_session(self, session_id: str, name: str) -> dict[str, Any]:
+    def rename_session(self, session_id: int, name: str) -> dict[str, Any]:
         with self._lock, self._conn:
             cursor = self._conn.execute(
                 "UPDATE sessions SET name = ? WHERE id = ?",
@@ -498,7 +655,7 @@ class Database:
 
     def set_auto_approve(
         self,
-        session_id: str,
+        session_id: int,
         *,
         write: bool | None = None,
         command: bool | None = None,
@@ -530,7 +687,7 @@ class Database:
             raise KeyError(f"Unknown session: {session_id}")
         return self.require_session(session_id)
 
-    def touch_session(self, session_id: str) -> None:
+    def touch_session(self, session_id: int) -> None:
         with self._lock, self._conn:
             cursor = self._conn.execute(
                 "UPDATE sessions SET last_active_at = ? WHERE id = ?",
@@ -539,7 +696,7 @@ class Database:
         if cursor.rowcount == 0:
             raise KeyError(f"Unknown session: {session_id}")
 
-    def set_agent_session_id(self, session_id: str, agent_session_id: str) -> None:
+    def set_agent_session_id(self, session_id: int, agent_session_id: str) -> None:
         with self._lock, self._conn:
             cursor = self._conn.execute(
                 """
@@ -554,7 +711,7 @@ class Database:
 
     def append_scrollback(
         self,
-        session_id: str,
+        session_id: int,
         event_type: str,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
@@ -577,7 +734,7 @@ class Database:
             "payload": payload,
         }
 
-    def recent_scrollback(self, session_id: str, limit: int = 200) -> list[dict[str, Any]]:
+    def recent_scrollback(self, session_id: int, limit: int = 200) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(
                 """

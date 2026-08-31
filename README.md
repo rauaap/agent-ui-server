@@ -235,10 +235,10 @@ configured projects root: a project exists because it was created through
 
 ```jsonc
 [
-  { "id": "3f2b…", "path": "/projects/agent-ui", "name": "agent-ui",
+  { "id": 1, "path": "/projects/agent-ui", "name": "agent-ui",
     "exists": true, "is_git_repo": true,
     "session_count": 3, "last_active_at": "2026-07-28T09:14:02Z" },
-  { "id": "9c14…", "path": "/projects/scratch",  "name": "scratch",
+  { "id": 2, "path": "/projects/scratch",  "name": "scratch",
     "exists": false, "is_git_repo": false,
     "session_count": 0, "last_active_at": null }
 ]
@@ -251,9 +251,12 @@ project it was cut from. Results are sorted by `last_active_at` descending —
 SQLite sorts `NULL` below everything, so never-used projects land last — then by
 `path` ascending.
 
-`id` is the project's uuid. It exists so a project's `path` can change later
-without taking its sessions with it, and it is what sessions store; the HTTP API
-itself is still addressed by `path` everywhere.
+`id` is the project's identity, and a JSON **number** — not a string. It exists
+so a project's `path` can change later without taking its sessions with it, and
+it is what sessions store; the HTTP API itself is still addressed by `path`
+everywhere. Client code that compares, stores or renders an id should read
+[docs/client_ids.md](docs/client_ids.md) first — the number/string distinction
+has sharp edges in a browser.
 
 `exists` is a `stat` of the stored path at request time, not a discovery scan.
 Because the row is the record, a directory removed outside the app leaves the
@@ -510,13 +513,13 @@ reach this gate. Tools with no category (e.g. `WebFetch`) always prompt.
 
 | Column       | Type      | Notes                                                        |
 |--------------|-----------|--------------------------------------------------------------|
-| `id`         | TEXT PK   | uuid4 — the project's identity, and what sessions reference   |
+| `id`         | INTEGER PK | Autoincrement — the project's identity, and what sessions reference |
 | `path`       | TEXT UQ   | Absolute working directory, normalised; how the HTTP API addresses a project |
 | `name`       | TEXT      | Display label; defaults to the path's last segment but may differ |
 | `created_at` | TEXT      | ISO 8601 (UTC, `Z`)                                          |
 
 Sessions join to a project on `sessions.project_id = projects.id`, a real
-foreign key (`ON DELETE CASCADE`). Identity is the uuid rather than the path
+foreign key (`ON DELETE CASCADE`). Identity is the id rather than the path
 precisely so `working_dir` is free to point somewhere else — a worktree — with
 the project link intact.
 
@@ -524,9 +527,9 @@ the project link intact.
 
 | Column              | Type    | Notes                                                       |
 |---------------------|---------|-------------------------------------------------------------|
-| `id`                | TEXT PK | Internal UUID                                               |
+| `id`                | INTEGER PK | Autoincrement — never reused, so a stale URL cannot hit a later session |
 | `name`              | TEXT    | Human-readable label                                        |
-| `project_id`        | TEXT FK | References `projects.id` (`ON DELETE CASCADE`), `NOT NULL`  |
+| `project_id`        | INTEGER FK | References `projects.id` (`ON DELETE CASCADE`), `NOT NULL` |
 | `working_dir`       | TEXT    | The cwd the agent runs in — the project directory, or this session's worktree |
 | `owns_worktree`     | INTEGER | `0`/`1` — the server created `working_dir` and cleans it up (default `0`) |
 | `agent`             | TEXT    | Which adapter to use, e.g. `claude-code` or `opencode`      |
@@ -542,7 +545,7 @@ the project link intact.
 | Column       | Type    | Notes                                                                          |
 |--------------|---------|--------------------------------------------------------------------------------|
 | `id`         | INTEGER | Autoincrement PK                                                               |
-| `session_id` | TEXT FK | References `sessions.id` (`ON DELETE CASCADE`)                                 |
+| `session_id` | INTEGER FK | References `sessions.id` (`ON DELETE CASCADE`)                              |
 | `ts`         | TEXT    | ISO 8601                                                                       |
 | `type`       | TEXT    | `input` \| `output` \| `tool_use` \| `approval_request` \| `approval_response` \| `question` \| `question_response` \| `bash_input` \| `bash_output` \| `error` |
 | `payload`    | TEXT    | JSON blob                                                                      |

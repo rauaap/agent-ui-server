@@ -23,11 +23,11 @@ adapters: dict[str, AgentAdapter] = {
     "claude-code": ClaudeCodeAdapter(),
     "opencode": OpenCodeAdapter(),
 }
-subscribers: dict[str, set[WebSocket]] = defaultdict(set)
-running_tasks: dict[str, asyncio.Task[None]] = {}
+subscribers: dict[int, set[WebSocket]] = defaultdict(set)
+running_tasks: dict[int, asyncio.Task[None]] = {}
 # Bash-mode commands are tracked separately from agent turns on purpose: they
 # are allowed to run alongside one, so they must not share the turn's slot.
-bash_tasks: dict[str, asyncio.Task[None]] = {}
+bash_tasks: dict[int, asyncio.Task[None]] = {}
 turn_lock = asyncio.Lock()
 
 
@@ -310,7 +310,7 @@ async def create_session(payload: CreateSessionRequest) -> dict[str, Any]:
 
 @app.patch("/sessions/{session_id}")
 async def update_session(
-    session_id: str, payload: UpdateSessionRequest
+    session_id: int, payload: UpdateSessionRequest
 ) -> dict[str, Any]:
     require_session_or_404(session_id)
     session: dict[str, Any] | None = None
@@ -338,7 +338,7 @@ async def update_session(
 
 
 @app.post("/sessions/{session_id}/stop")
-async def stop_session(session_id: str) -> dict[str, str]:
+async def stop_session(session_id: int) -> dict[str, str]:
     session = require_session_or_404(session_id)
     adapter = adapters[session["agent"]]
     await adapter.stop(session)
@@ -351,7 +351,7 @@ async def stop_session(session_id: str) -> dict[str, str]:
 
 
 @app.delete("/sessions/{session_id}")
-async def delete_session(session_id: str) -> dict[str, Any]:
+async def delete_session(session_id: int) -> dict[str, Any]:
     """Delete a session, and its worktree if the server made one.
 
     Still a 200 when the worktree could not be removed: the session *is*
@@ -368,19 +368,19 @@ async def delete_session(session_id: str) -> dict[str, Any]:
 
 
 @app.post("/sessions/{session_id}/turn", status_code=202)
-async def start_turn(session_id: str, payload: TurnRequest) -> dict[str, str]:
+async def start_turn(session_id: int, payload: TurnRequest) -> dict[str, str]:
     await begin_turn(session_id, payload.prompt)
     return {"status": "running"}
 
 
 @app.post("/sessions/{session_id}/bash", status_code=202)
-async def start_bash(session_id: str, payload: BashRequest) -> dict[str, str]:
+async def start_bash(session_id: int, payload: BashRequest) -> dict[str, str]:
     await begin_bash(session_id, payload.command)
     return {"status": "running"}
 
 
 @app.websocket("/ws/sessions/{session_id}")
-async def session_websocket(websocket: WebSocket, session_id: str) -> None:
+async def session_websocket(websocket: WebSocket, session_id: int) -> None:
     session = db.get_session(session_id)
     if session is None:
         await websocket.close(code=1008)
@@ -462,7 +462,7 @@ async def session_websocket(websocket: WebSocket, session_id: str) -> None:
             subscribers.pop(session_id, None)
 
 
-async def begin_turn(session_id: str, prompt: str) -> None:
+async def begin_turn(session_id: int, prompt: str) -> None:
     async with turn_lock:
         session = require_session_or_404(session_id)
         existing_task = running_tasks.get(session_id)
@@ -481,7 +481,7 @@ async def begin_turn(session_id: str, prompt: str) -> None:
         running_tasks[session_id] = task
 
 
-async def run_turn(session_id: str, prompt: str) -> None:
+async def run_turn(session_id: int, prompt: str) -> None:
     session = db.require_session(session_id)
     adapter = adapters[session["agent"]]
     followup_prompt: str | None = None
@@ -566,7 +566,7 @@ async def run_turn(session_id: str, prompt: str) -> None:
             pass
 
 
-async def begin_bash(session_id: str, command: str) -> None:
+async def begin_bash(session_id: int, command: str) -> None:
     """Start a one-shot shell command in the session's working directory.
 
     Deliberately none of what `begin_turn` does: no turn lock, no status
@@ -588,7 +588,7 @@ async def begin_bash(session_id: str, command: str) -> None:
     bash_tasks[session_id] = asyncio.create_task(run_bash(session_id, command))
 
 
-async def run_bash(session_id: str, command: str) -> None:
+async def run_bash(session_id: int, command: str) -> None:
     try:
         session = db.require_session(session_id)
         result = await shell.run_command(command, cwd=session["working_dir"])
@@ -607,7 +607,7 @@ async def run_bash(session_id: str, command: str) -> None:
         bash_tasks.pop(session_id, None)
 
 
-async def report_bash_error(session_id: str, message: str) -> None:
+async def report_bash_error(session_id: int, message: str) -> None:
     """Record a command failure, unless the session itself is already gone.
 
     Deleting a session cancels its command, so the cancellation lands with the
@@ -620,7 +620,7 @@ async def report_bash_error(session_id: str, message: str) -> None:
     await broadcast(session_id, {"type": "error", "message": message})
 
 
-async def cancel_bash(session_id: str) -> None:
+async def cancel_bash(session_id: int) -> None:
     """Kill this session's in-flight command, if any, and wait for it to end."""
     task = bash_tasks.pop(session_id, None)
     if task is None or task.done():
@@ -630,7 +630,7 @@ async def cancel_bash(session_id: str) -> None:
 
 
 async def handle_approval(
-    session_id: str,
+    session_id: int,
     request_id: str,
     behavior: str,
     option_id: str | None = None,
@@ -657,7 +657,7 @@ async def handle_approval(
 
 
 async def handle_question_answer(
-    session_id: str,
+    session_id: int,
     request_id: str,
     answers: Any,
 ) -> None:
@@ -672,13 +672,13 @@ async def handle_question_answer(
     await broadcast(session_id, {"type": "status", "status": "running"})
 
 
-async def replay_scrollback(websocket: WebSocket, session_id: str) -> None:
+async def replay_scrollback(websocket: WebSocket, session_id: int) -> None:
     for row in db.recent_scrollback(session_id, SCROLLBACK_REPLAY_LIMIT):
         payload = row["payload"] if isinstance(row["payload"], dict) else {}
         await websocket.send_json({"type": row["type"], **payload})
 
 
-async def broadcast(session_id: str, message: dict[str, Any]) -> None:
+async def broadcast(session_id: int, message: dict[str, Any]) -> None:
     stale: list[WebSocket] = []
     for websocket in list(subscribers.get(session_id, set())):
         try:
@@ -783,7 +783,7 @@ def normalize_project_path(raw: str) -> str:
     return path
 
 
-def require_session_or_404(session_id: str) -> dict[str, Any]:
+def require_session_or_404(session_id: int) -> dict[str, Any]:
     session = db.get_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")

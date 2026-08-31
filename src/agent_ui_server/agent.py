@@ -155,9 +155,9 @@ class ClaudeCodeAdapter(AgentAdapter):
 
     def __init__(self, executable: str | None = None) -> None:
         self.executable = executable or os.environ.get("CLAUDE_BIN", "claude")
-        self.processes: dict[str, asyncio.subprocess.Process] = {}
+        self.processes: dict[int, asyncio.subprocess.Process] = {}
         self.pending_approvals: dict[str, asyncio.Future[ApprovalDecision]] = {}
-        self.pending_sessions: dict[str, str] = {}
+        self.pending_sessions: dict[str, int] = {}
         self.pending_options: dict[str, list[dict[str, Any]]] = {}
         # Pending AskUserQuestion calls: the future resolves to the validated
         # answers, and the spec is kept alongside so send_answer can validate.
@@ -310,7 +310,7 @@ class ClaudeCodeAdapter(AgentAdapter):
 
     async def _events_from_json(
         self,
-        session_id: str,
+        session_id: int,
         process: asyncio.subprocess.Process,
         event: dict[str, Any],
     ) -> AsyncIterator[AgentEvent]:
@@ -663,7 +663,7 @@ class ClaudeCodeAdapter(AgentAdapter):
         process.stdin.write((json.dumps(payload) + "\n").encode("utf-8"))
         await process.stdin.drain()
 
-    async def _clear_session_approvals(self, session_id: str, reason: str) -> None:
+    async def _clear_session_approvals(self, session_id: int, reason: str) -> None:
         request_ids = [
             request_id
             for request_id, pending_session_id in self.pending_sessions.items()
@@ -743,9 +743,9 @@ class OpenCodeAdapter(AgentAdapter):
         self.config_path = (
             config_path or os.environ.get("OPENCODE_CONFIG") or self.DEFAULT_CONFIG
         )
-        self.processes: dict[str, asyncio.subprocess.Process] = {}
+        self.processes: dict[int, asyncio.subprocess.Process] = {}
         self.pending_approvals: dict[str, asyncio.Future[ApprovalDecision]] = {}
-        self.pending_sessions: dict[str, str] = {}
+        self.pending_sessions: dict[str, int] = {}
         self.pending_options: dict[str, list[dict[str, Any]]] = {}
 
     async def start_turn(
@@ -1188,7 +1188,7 @@ class OpenCodeAdapter(AgentAdapter):
                 await process.wait()
         return process.returncode
 
-    async def _clear_session_approvals(self, session_id: str, reason: str) -> None:
+    async def _clear_session_approvals(self, session_id: int, reason: str) -> None:
         request_ids = [
             request_id
             for request_id, pending_session_id in self.pending_sessions.items()

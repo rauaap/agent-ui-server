@@ -360,6 +360,16 @@ class MigrationTests(unittest.TestCase):
                 )
         conn.close()
 
+    def sessions_by_name(self, database: Database) -> dict[str, dict]:
+        """Migrated sessions keyed by name.
+
+        The legacy ids in these fixtures are uuid-shaped strings, and the
+        migration renumbers them, so a test cannot ask for `"s1"` afterwards.
+        Name is the only field that survives a migration unchanged and is
+        unique within each fixture.
+        """
+        return {session["name"]: session for session in database.list_sessions()}
+
     def test_sessions_keep_their_data_and_gain_a_project_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "sessions.db"
@@ -374,8 +384,8 @@ class MigrationTests(unittest.TestCase):
             project = database.get_project("/p/demo")
             self.assertTrue(project["id"])
             self.assertEqual(project["session_count"], 2)
-            sessions = {s["id"]: s for s in database.list_sessions()}
-            self.assertEqual(set(sessions), {"s1", "s2"})
+            sessions = self.sessions_by_name(database)
+            self.assertEqual(set(sessions), {"one", "two"})
             for session in sessions.values():
                 self.assertEqual(session["project_id"], project["id"])
                 self.assertEqual(session["working_dir"], "/p/demo")
@@ -406,7 +416,8 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual(projects[0]["name"], "nowhere")
             self.assertEqual(projects[0]["session_count"], 1)
             self.assertEqual(
-                database.get_session("s1")["project_id"], projects[0]["id"]
+                self.sessions_by_name(database)["orphan"]["project_id"],
+                projects[0]["id"],
             )
             database.close()
 
@@ -426,7 +437,7 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual(len(database.list_projects()), 1)
             project = database.get_project("/p/demo")
             self.assertEqual(project["session_count"], 1)
-            session = database.get_session("s1")
+            session = self.sessions_by_name(database)["slashed"]
             self.assertEqual(session["project_id"], project["id"])
             # The cwd itself is copied verbatim; only the join normalises.
             self.assertEqual(session["working_dir"], "/p/demo/")
@@ -443,12 +454,13 @@ class MigrationTests(unittest.TestCase):
 
             database = Database(path)
 
-            rows = database.recent_scrollback("s1")
+            session_id = self.sessions_by_name(database)["one"]["id"]
+            rows = database.recent_scrollback(session_id)
             self.assertEqual([row["payload"] for row in rows], [{"text": "hello"}])
             # The rename must not have left scrollback's foreign key pointing
             # at a table that no longer exists.
-            database.delete_session("s1")
-            self.assertEqual(database.recent_scrollback("s1"), [])
+            database.delete_session(session_id)
+            self.assertEqual(database.recent_scrollback(session_id), [])
             database.close()
 
     def test_reopening_a_migrated_database_changes_nothing(self) -> None:
@@ -467,7 +479,9 @@ class MigrationTests(unittest.TestCase):
             database = Database(path)
             self.assertEqual(database.get_project("/p/demo"), first)
             self.assertEqual(len(database.list_projects()), 1)
-            self.assertEqual(database.get_session("s1")["project_id"], first["id"])
+            self.assertEqual(
+                self.sessions_by_name(database)["one"]["project_id"], first["id"]
+            )
             database.close()
 
     def test_database_predating_the_projects_table_migrates_too(self) -> None:
@@ -500,7 +514,7 @@ class MigrationTests(unittest.TestCase):
 
             database = Database(path)
 
-            session = database.get_session("s1")
+            session = self.sessions_by_name(database)["one"]
             self.assertEqual(session["agent_session_id"], "resume-1")
             self.assertIs(session["auto_approve_write"], False)
             self.assertIs(session["owns_worktree"], False)
@@ -510,6 +524,120 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual(
                 session["project_id"], database.get_project("/p/ancient")["id"]
             )
+            database.close()
+
+    def test_uuid_ids_become_integers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sessions.db"
+            self.build_legacy(
+                path,
+                projects=[("/p/demo", "demo")],
+                sessions=[("s1", "one", "/p/demo"), ("s2", "two", "/p/demo")],
+            )
+
+            database = Database(path)
+
+            project = database.get_project("/p/demo")
+            self.assertIsInstance(project["id"], int)
+            sessions = self.sessions_by_name(database)
+            for session in sessions.values():
+                self.assertIsInstance(session["id"], int)
+                self.assertEqual(session["project_id"], project["id"])
+            # Renumbered in creation order, and each session keeps its own
+            # scrollback rather than inheriting another's.
+            self.assertLess(sessions["one"]["id"], sessions["two"]["id"])
+            for name in ("one", "two"):
+                rows = database.recent_scrollback(sessions[name]["id"])
+                self.assertEqual(
+                    [row["payload"] for row in rows], [{"text": "hello"}]
+                )
+            database.close()
+
+    V2_SCHEMA = """
+        CREATE TABLE projects (
+            id TEXT PRIMARY KEY,
+            path TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            working_dir TEXT NOT NULL,
+            owns_worktree INTEGER NOT NULL DEFAULT 0,
+            agent TEXT NOT NULL,
+            agent_session_id TEXT,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            last_active_at TEXT NOT NULL,
+            auto_approve_write INTEGER NOT NULL DEFAULT 0,
+            auto_approve_command INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE scrollback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            ts TEXT NOT NULL,
+            type TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+        INSERT INTO projects VALUES
+            ('p-uuid', '/p/demo', 'demo', '2026-01-01T00:00:00Z');
+        INSERT INTO sessions VALUES
+            ('s-uuid', 'one', 'p-uuid', '/p/demo', 0, 'claude-code', 'resume-1',
+             'idle', '2026-01-02T00:00:00Z', '2026-01-03T00:00:00Z', 1, 0);
+        INSERT INTO scrollback (session_id, ts, type, payload) VALUES
+            ('s-uuid', '2026-01-03T00:00:00Z', 'input', '{"text":"hello"}');
+    """
+
+    def test_scrollback_orphaned_before_the_migration_is_dropped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sessions.db"
+            # Seeded in the *v2* shape — project_id already there, ids still
+            # uuids — so `_migrate_v2` returns early and this exercises v3
+            # alone. `PRAGMA foreign_keys` is per connection, so a writer that
+            # never set it can leave scrollback pointing at a session that is
+            # gone; renumbering must drop that row rather than fail outright.
+            conn = sqlite3.connect(path)
+            with conn:
+                conn.executescript(self.V2_SCHEMA)
+                conn.execute(
+                    "INSERT INTO scrollback (session_id, ts, type, payload) "
+                    "VALUES ('vanished', '2026-01-03T00:00:00Z', 'input', '{}')"
+                )
+            conn.close()
+
+            database = Database(path)
+
+            session = self.sessions_by_name(database)["one"]
+            self.assertIsInstance(session["id"], int)
+            self.assertEqual(
+                [row["payload"] for row in database.recent_scrollback(session["id"])],
+                [{"text": "hello"}],
+            )
+            database.close()
+
+    def test_ids_are_not_reused_after_a_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Database(Path(tmpdir) / "sessions.db")
+            project = database.create_project("/p/demo", "demo")
+            first = database.create_session(
+                name="first",
+                project_id=project["id"],
+                working_dir="/p/demo",
+                agent="claude-code",
+            )
+            database.delete_session(first["id"])
+            second = database.create_session(
+                name="second",
+                project_id=project["id"],
+                working_dir="/p/demo",
+                agent="claude-code",
+            )
+            # AUTOINCREMENT, not a bare rowid: a client holding the deleted
+            # session's URL must not land on its replacement.
+            self.assertNotEqual(second["id"], first["id"])
             database.close()
 
 
