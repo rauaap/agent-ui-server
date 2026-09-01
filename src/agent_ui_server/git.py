@@ -45,8 +45,11 @@ async def check_branch_name(name: str) -> bool:
 async def add_worktree(repo: str, path: str, branch: str) -> str | None:
     """Create a worktree at `path` on a new `branch`. Returns git's error, if any.
 
-    `git worktree add` creates the directory itself, so the caller must not
-    pre-create it.
+    `path` may already exist as long as it is an **empty** directory — git's own
+    rule — and the caller is expected to have created it. This command is not
+    atomic: it writes the new branch ref before creating the leading
+    directories, so letting it create them itself means a filesystem failure
+    leaves an orphaned branch with no worktree attached to it.
     """
     code, _, stderr = await _run(
         "-C", repo, "worktree", "add", "-b", branch, path

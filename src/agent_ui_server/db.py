@@ -18,17 +18,30 @@ VALID_STATUSES = {"idle", "running", "awaiting_approval"}
 # categories are switchable; the keys here are the column suffixes.
 AUTO_APPROVE_CATEGORIES = ("write", "command")
 
-# Every sessions column stored as 0/1 that the API exposes as a bool. Kept
-# apart from AUTO_APPROVE_CATEGORIES, which also drives `set_auto_approve` and
-# so must stay a list of *toggles*.
+# Every sessions column stored as 0/1 that the API exposes as a bool. A
+# separate name from AUTO_APPROVE_CATEGORIES, which also drives
+# `set_auto_approve` and so must stay a list of *toggles*, even though the two
+# happen to hold the same columns today.
 BOOL_COLUMNS = tuple(
     f"auto_approve_{category}" for category in AUTO_APPROVE_CATEGORIES
-) + ("owns_worktree",)
+)
 
-_SESSION_COLUMNS = """
-    id, name, project_id, working_dir, owns_worktree, agent, agent_session_id,
-    status, created_at, last_active_at,
-    auto_approve_write, auto_approve_command
+# A session row with `working_dir` computed rather than stored. A session runs
+# in its worktree when it has one and in its project's directory otherwise —
+# there is no third possibility, so keeping a copy on the row would only be a
+# second place for the same path to live, and to drift once several sessions
+# share one worktree.
+_SESSION_QUERY = """
+    SELECT s.id, s.name, s.project_id, s.worktree_id,
+           COALESCE(w.path, p.path) AS working_dir,
+           s.agent, s.agent_session_id, s.status,
+           s.created_at, s.last_active_at,
+           s.auto_approve_write, s.auto_approve_command
+    FROM sessions s
+    JOIN projects p ON p.id = s.project_id
+    LEFT JOIN worktrees w ON w.id = s.worktree_id
+    {where}
+    ORDER BY s.last_active_at DESC, s.created_at DESC
 """
 
 
@@ -73,14 +86,32 @@ class Database:
                 )
                 """
             )
+            # A worktree is its own entity, created and removed through its own
+            # endpoints, so any number of sessions can attach to one and the
+            # last session leaving does not take it with them. The row's
+            # existence is the record that we created the directory and are the
+            # ones responsible for removing it.
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS worktrees (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    path TEXT NOT NULL UNIQUE,
+                    branch TEXT,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            # `worktree_id` NULL means the session runs in its project's own
+            # directory. The RESTRICT is a backstop: `delete_worktree` refuses
+            # while sessions are attached, so nothing should reach it.
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS sessions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT NOT NULL,
                     project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-                    working_dir TEXT NOT NULL,
-                    owns_worktree INTEGER NOT NULL DEFAULT 0,
+                    worktree_id INTEGER REFERENCES worktrees(id) ON DELETE RESTRICT,
                     agent TEXT NOT NULL,
                     agent_session_id TEXT,
                     status TEXT NOT NULL,
@@ -125,10 +156,11 @@ class Database:
             )
 
         # The two ALTERs above are all SQLite can do in place; the rest of the
-        # move to id-linked projects needs a table rebuild, and so does the
-        # move off uuid ids.
+        # move to id-linked projects needs a table rebuild, and so do the moves
+        # off uuid ids and off a stored working directory.
         self._migrate_v2()
         self._migrate_v3()
+        self._migrate_v4()
 
         with self._lock, self._conn:
             # After the rebuilds: an unmigrated database would trip over a
@@ -137,6 +169,14 @@ class Database:
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_sessions_project_id "
                 "ON sessions(project_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_worktree_id "
+                "ON sessions(worktree_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_worktrees_project_id "
+                "ON worktrees(project_id)"
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_scrollback_session_id_id "
@@ -463,6 +503,108 @@ class Database:
         self._conn.execute("ALTER TABLE scrollback_new RENAME TO scrollback")
         self._conn.execute("PRAGMA legacy_alter_table = OFF")
 
+    def _migrate_v4(self) -> None:
+        """Move the worktree out of the session and into its own table.
+
+        `sessions.working_dir` was a free-form directory string paired with an
+        `owns_worktree` flag, which is what a worktree looked like before it had
+        a row of its own. Both go: the cwd is derived (`_SESSION_QUERY`), and
+        "we created this directory" is now recorded by a `worktrees` row
+        existing at all.
+
+        Session ids are preserved, so unlike `_migrate_v3` this leaves
+        `scrollback` alone.
+
+        A no-op on a fresh database and on one that has been through this
+        before; `_migrate_v2` and `_migrate_v3` run first, so by here every
+        database has integer ids and a real `project_id`.
+        """
+        with self._lock:
+            columns = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(sessions)")
+            }
+            if "worktree_id" in columns:
+                return
+            self._rebuild_tables(self._rebuild_v4)
+
+    def _rebuild_v4(self) -> None:
+        """The copy half of `_migrate_v4`, inside its transaction."""
+        self._conn.execute(
+            """
+            CREATE TABLE sessions_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                worktree_id INTEGER REFERENCES worktrees(id) ON DELETE RESTRICT,
+                agent TEXT NOT NULL,
+                agent_session_id TEXT,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                last_active_at TEXT NOT NULL,
+                auto_approve_write INTEGER NOT NULL DEFAULT 0,
+                auto_approve_command INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+
+        # One worktree row per owned directory, not per session: nothing can
+        # produce two sessions owning one path today, but the new schema has a
+        # UNIQUE on it, so a database that somehow holds a pair must converge on
+        # a single row rather than fail the migration.
+        worktree_ids: dict[str, int] = {}
+        for row in self._conn.execute("SELECT * FROM sessions ORDER BY id").fetchall():
+            worktree_id: int | None = None
+            # Anything not explicitly owned lands on NULL — meaning "runs in the
+            # project directory". No code path writes an unowned session to a
+            # directory other than its project's, and if one somehow did, the
+            # cost of landing here is a corrected cwd, whereas minting a
+            # worktree row for it would mark a directory we never created as
+            # ours to delete.
+            if row["owns_worktree"]:
+                path = row["working_dir"]
+                worktree_id = worktree_ids.get(path)
+                if worktree_id is None:
+                    cursor = self._conn.execute(
+                        "INSERT INTO worktrees (project_id, path, branch, created_at) "
+                        "VALUES (?, ?, NULL, ?)",
+                        (row["project_id"], path, row["created_at"]),
+                    )
+                    worktree_id = cursor.lastrowid
+                    worktree_ids[path] = worktree_id
+
+            self._conn.execute(
+                """
+                INSERT INTO sessions_new (
+                    id, name, project_id, worktree_id, agent, agent_session_id,
+                    status, created_at, last_active_at,
+                    auto_approve_write, auto_approve_command
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["id"],
+                    row["name"],
+                    row["project_id"],
+                    worktree_id,
+                    row["agent"],
+                    row["agent_session_id"],
+                    row["status"],
+                    row["created_at"],
+                    row["last_active_at"],
+                    row["auto_approve_write"],
+                    row["auto_approve_command"],
+                ),
+            )
+
+        self._conn.execute("DROP TABLE sessions")
+        # As in v2 and v3: without this the rename tries to fix up references
+        # from other tables, and scrollback's FK would be rewritten to point at
+        # the table being replaced.
+        self._conn.execute("PRAGMA legacy_alter_table = ON")
+        self._conn.execute("ALTER TABLE sessions_new RENAME TO sessions")
+        self._conn.execute("PRAGMA legacy_alter_table = OFF")
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
@@ -476,11 +618,7 @@ class Database:
     def list_sessions(self) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(
-                f"""
-                SELECT {_SESSION_COLUMNS}
-                FROM sessions
-                ORDER BY last_active_at DESC, created_at DESC
-                """
+                _SESSION_QUERY.format(where="")
             ).fetchall()
         return [_row_to_session(row) for row in rows]
 
@@ -493,13 +631,22 @@ class Database:
         """
         with self._lock:
             rows = self._conn.execute(
-                f"""
-                SELECT {_SESSION_COLUMNS}
-                FROM sessions
-                WHERE project_id = ?
-                ORDER BY last_active_at DESC, created_at DESC
-                """,
+                _SESSION_QUERY.format(where="WHERE s.project_id = ?"),
                 (project_id,),
+            ).fetchall()
+        return [_row_to_session(row) for row in rows]
+
+    def list_sessions_for_worktree(self, worktree_id: int) -> list[dict[str, Any]]:
+        """Every session attached to a worktree.
+
+        What `DELETE /worktrees/{id}` checks before removing anything: a
+        worktree with sessions in it is refused rather than pulled out from
+        under them.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                _SESSION_QUERY.format(where="WHERE s.worktree_id = ?"),
+                (worktree_id,),
             ).fetchall()
         return [_row_to_session(row) for row in rows]
 
@@ -543,8 +690,21 @@ class Database:
         return dict(row) if row else None
 
     def delete_project(self, path: str) -> bool:
-        """Forget a project. Its sessions are removed by the caller first."""
+        """Forget a project, its worktrees and any sessions still on it.
+
+        The caller sweeps sessions first — teardown does much more than delete a
+        row — so the explicit DELETE here is normally a no-op. It is not left to
+        the cascade because `sessions.worktree_id` is RESTRICT: a cascade that
+        happened to reach `worktrees` while a session still pointed at one would
+        abort the whole delete. Doing sessions first makes the order ours rather
+        than SQLite's.
+        """
         with self._lock, self._conn:
+            self._conn.execute(
+                "DELETE FROM sessions WHERE project_id = "
+                "(SELECT id FROM projects WHERE path = ?)",
+                (path,),
+            )
             cursor = self._conn.execute(
                 "DELETE FROM projects WHERE path = ?",
                 (path,),
@@ -568,40 +728,102 @@ class Database:
             raise KeyError(f"Unknown project: {path}")
         return project
 
+    # A worktree row plus the session count its card shows, mirroring
+    # `_PROJECT_QUERY`. The LEFT JOIN keeps worktrees nothing is attached to —
+    # which, now that they outlive sessions, is an ordinary state rather than
+    # the leak it used to be.
+    _WORKTREE_QUERY = """
+        SELECT w.id, w.project_id, w.path, w.branch, w.created_at,
+               COUNT(s.id) AS session_count
+        FROM worktrees w
+        LEFT JOIN sessions s ON s.worktree_id = w.id
+        {where}
+        GROUP BY w.id, w.project_id, w.path, w.branch, w.created_at
+        ORDER BY w.created_at DESC, w.id DESC
+    """
+
+    def list_worktrees(self, project_id: int | None = None) -> list[dict[str, Any]]:
+        """Every worktree, or every worktree of one project."""
+        where = "WHERE w.project_id = ?" if project_id is not None else ""
+        params = (project_id,) if project_id is not None else ()
+        with self._lock:
+            rows = self._conn.execute(
+                self._WORKTREE_QUERY.format(where=where), params
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_worktree(self, worktree_id: int) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                self._WORKTREE_QUERY.format(where="WHERE w.id = ?"),
+                (worktree_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_worktree_by_path(self, path: str) -> dict[str, Any] | None:
+        """Look a worktree up by directory — how `POST /worktrees` spots a repeat."""
+        with self._lock:
+            row = self._conn.execute(
+                self._WORKTREE_QUERY.format(where="WHERE w.path = ?"),
+                (path,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def create_worktree(
+        self, project_id: int, path: str, branch: str
+    ) -> dict[str, Any]:
+        """Record a worktree the server just created on disk.
+
+        `path` is UNIQUE, so this raises `sqlite3.IntegrityError` if the
+        directory is already registered — the caller creates the directory
+        first, and must take it back if this fails.
+        """
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                "INSERT INTO worktrees (project_id, path, branch, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (project_id, path, branch, utc_now()),
+            )
+            worktree_id = cursor.lastrowid
+        worktree = self.get_worktree(worktree_id)
+        if worktree is None:
+            raise KeyError(f"Unknown worktree: {worktree_id}")
+        return worktree
+
+    def delete_worktree(self, worktree_id: int) -> bool:
+        """Forget a worktree. The caller removes the directory first."""
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                "DELETE FROM worktrees WHERE id = ?",
+                (worktree_id,),
+            )
+        return cursor.rowcount > 0
+
     def create_session(
         self,
         name: str,
         project_id: int,
-        working_dir: str,
         agent: str,
-        owns_worktree: bool = False,
+        worktree_id: int | None = None,
     ) -> dict[str, Any]:
         """Create a session belonging to a project.
 
-        `working_dir` is the cwd the agent runs in and nothing else — usually
-        the project's own path, but a worktree elsewhere when the server made
-        one. `owns_worktree` records that we created that directory and are the
-        ones responsible for removing it.
+        With a `worktree_id` the session runs in that worktree; without one it
+        runs in the project's own directory. Nothing about the cwd is stored —
+        the returned session's `working_dir` is derived from whichever link is
+        set, so it stays correct if either path is ever changed.
         """
         now = utc_now()
         with self._lock, self._conn:
             cursor = self._conn.execute(
                 """
                 INSERT INTO sessions (
-                    name, project_id, working_dir, owns_worktree, agent,
+                    name, project_id, worktree_id, agent,
                     agent_session_id, status, created_at, last_active_at
                 )
-                VALUES (?, ?, ?, ?, ?, NULL, 'idle', ?, ?)
+                VALUES (?, ?, ?, ?, NULL, 'idle', ?, ?)
                 """,
-                (
-                    name,
-                    project_id,
-                    working_dir,
-                    1 if owns_worktree else 0,
-                    agent,
-                    now,
-                    now,
-                ),
+                (name, project_id, worktree_id, agent, now, now),
             )
             session_id = cursor.lastrowid
         return self.require_session(session_id)
@@ -617,11 +839,7 @@ class Database:
     def get_session(self, session_id: int) -> dict[str, Any] | None:
         with self._lock:
             row = self._conn.execute(
-                f"""
-                SELECT {_SESSION_COLUMNS}
-                FROM sessions
-                WHERE id = ?
-                """,
+                _SESSION_QUERY.format(where="WHERE s.id = ?"),
                 (session_id,),
             ).fetchone()
         return _row_to_session(row) if row else None

@@ -40,7 +40,6 @@ def make_session(
     return database.create_session(
         name=name,
         project_id=project["id"],
-        working_dir=path,
         agent=agent,
     )
 
@@ -166,7 +165,6 @@ class ProjectTableTests(unittest.TestCase):
                 database.create_session(
                     name=name,
                     project_id=shared["id"],
-                    working_dir="/projects/shared",
                     agent="claude-code",
                 )
 
@@ -202,15 +200,19 @@ class ProjectTableTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             database = Database(Path(tmpdir) / "sessions.db")
             project = database.create_project("/projects/demo", "demo")
+            worktree = database.create_worktree(
+                project_id=project["id"],
+                path="/projects/demo-feature",
+                branch="feature",
+            )
             session = database.create_session(
                 name="feature",
                 project_id=project["id"],
-                working_dir="/projects/demo-feature",
                 agent="claude-code",
-                owns_worktree=True,
+                worktree_id=worktree["id"],
             )
 
-            self.assertIs(session["owns_worktree"], True)
+            self.assertEqual(session["working_dir"], "/projects/demo-feature")
             listed = database.get_project("/projects/demo")
             self.assertEqual(listed["session_count"], 1)
             self.assertEqual(listed["last_active_at"], session["last_active_at"])
@@ -247,13 +249,11 @@ class ProjectTableTests(unittest.TestCase):
                 database.create_session(
                     name="a",
                     project_id=projects["/p/older"]["id"],
-                    working_dir="/p/older",
                     agent="claude-code",
                 )
                 database.create_session(
                     name="b",
                     project_id=projects["/p/newer"]["id"],
-                    working_dir="/p/newer",
                     agent="claude-code",
                 )
             finally:
@@ -389,9 +389,9 @@ class MigrationTests(unittest.TestCase):
             for session in sessions.values():
                 self.assertEqual(session["project_id"], project["id"])
                 self.assertEqual(session["working_dir"], "/p/demo")
-                # Nothing here was created by us, so nothing here is ours to
-                # delete later.
-                self.assertIs(session["owns_worktree"], False)
+                # Nothing here was created by us, so no worktree row is minted
+                # and the cwd falls through to the project directory.
+                self.assertIsNone(session["worktree_id"])
                 # The rest of the row rides through untouched.
                 self.assertEqual(session["agent_session_id"], "resume-1")
                 self.assertIs(session["auto_approve_write"], True)
@@ -439,8 +439,10 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual(project["session_count"], 1)
             session = self.sessions_by_name(database)["slashed"]
             self.assertEqual(session["project_id"], project["id"])
-            # The cwd itself is copied verbatim; only the join normalises.
-            self.assertEqual(session["working_dir"], "/p/demo/")
+            # The trailing slash does not survive: the cwd is no longer stored
+            # on the session at all, it is read from the project it resolved
+            # to. Same directory, one spelling.
+            self.assertEqual(session["working_dir"], "/p/demo")
             database.close()
 
     def test_scrollback_survives_and_still_cascades(self) -> None:
@@ -517,7 +519,7 @@ class MigrationTests(unittest.TestCase):
             session = self.sessions_by_name(database)["one"]
             self.assertEqual(session["agent_session_id"], "resume-1")
             self.assertIs(session["auto_approve_write"], False)
-            self.assertIs(session["owns_worktree"], False)
+            self.assertIsNone(session["worktree_id"])
             self.assertEqual(
                 [p["path"] for p in database.list_projects()], ["/p/ancient"]
             )
@@ -618,6 +620,157 @@ class MigrationTests(unittest.TestCase):
             )
             database.close()
 
+    V3_SCHEMA = """
+        CREATE TABLE projects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            path TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            working_dir TEXT NOT NULL,
+            owns_worktree INTEGER NOT NULL DEFAULT 0,
+            agent TEXT NOT NULL,
+            agent_session_id TEXT,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            last_active_at TEXT NOT NULL,
+            auto_approve_write INTEGER NOT NULL DEFAULT 0,
+            auto_approve_command INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE scrollback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER NOT NULL,
+            ts TEXT NOT NULL,
+            type TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+        INSERT INTO projects VALUES
+            (1, '/p/demo', 'demo', '2026-01-01T00:00:00Z');
+        INSERT INTO sessions VALUES
+            (10, 'plain', 1, '/p/demo', 0, 'claude-code', 'resume-1',
+             'idle', '2026-01-02T00:00:00Z', '2026-01-03T00:00:00Z', 0, 0),
+            (11, 'owned', 1, '/p/demo-fix', 1, 'claude-code', 'resume-2',
+             'idle', '2026-01-02T00:00:00Z', '2026-01-04T00:00:00Z', 0, 0);
+        INSERT INTO scrollback (session_id, ts, type, payload) VALUES
+            (11, '2026-01-03T00:00:00Z', 'input', '{"text":"hello"}');
+    """
+
+    def test_owned_worktree_becomes_a_worktree_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sessions.db"
+            # Seeded in the v3 shape, so v2 and v3 both return early and this
+            # exercises v4 alone.
+            conn = sqlite3.connect(path)
+            with conn:
+                conn.executescript(self.V3_SCHEMA)
+            conn.close()
+
+            database = Database(path)
+
+            worktrees = database.list_worktrees()
+            self.assertEqual([w["path"] for w in worktrees], ["/p/demo-fix"])
+            # Nothing recorded which branch it was cut on, so it stays unknown
+            # rather than being guessed at.
+            self.assertIsNone(worktrees[0]["branch"])
+            self.assertEqual(worktrees[0]["session_count"], 1)
+
+            sessions = self.sessions_by_name(database)
+            self.assertIsNone(sessions["plain"]["worktree_id"])
+            self.assertEqual(sessions["plain"]["working_dir"], "/p/demo")
+            self.assertEqual(sessions["owned"]["worktree_id"], worktrees[0]["id"])
+            self.assertEqual(sessions["owned"]["working_dir"], "/p/demo-fix")
+            database.close()
+
+    def test_session_ids_and_scrollback_survive_v4(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sessions.db"
+            conn = sqlite3.connect(path)
+            with conn:
+                conn.executescript(self.V3_SCHEMA)
+            conn.close()
+
+            database = Database(path)
+
+            # Unlike v3, this migration does not renumber, so scrollback is left
+            # alone entirely and the old ids still resolve.
+            self.assertEqual(
+                sorted(s["id"] for s in database.list_sessions()), [10, 11]
+            )
+            self.assertEqual(
+                [row["payload"] for row in database.recent_scrollback(11)],
+                [{"text": "hello"}],
+            )
+            database.close()
+
+    def test_two_sessions_owning_one_path_converge_on_one_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sessions.db"
+            # Not reachable through the old API, but `worktrees.path` is UNIQUE,
+            # so a database that somehow holds the pair must migrate rather than
+            # fail on the second insert.
+            conn = sqlite3.connect(path)
+            with conn:
+                conn.executescript(self.V3_SCHEMA)
+                conn.execute(
+                    "INSERT INTO sessions VALUES "
+                    "(12, 'twin', 1, '/p/demo-fix', 1, 'claude-code', NULL, "
+                    "'idle', '2026-01-02T00:00:00Z', '2026-01-05T00:00:00Z', 0, 0)"
+                )
+            conn.close()
+
+            database = Database(path)
+
+            worktrees = database.list_worktrees()
+            self.assertEqual(len(worktrees), 1)
+            self.assertEqual(worktrees[0]["session_count"], 2)
+            sessions = self.sessions_by_name(database)
+            self.assertEqual(
+                sessions["owned"]["worktree_id"], sessions["twin"]["worktree_id"]
+            )
+            database.close()
+
+    def test_deleting_a_project_takes_its_worktrees_whatever_the_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Database(Path(tmpdir) / "sessions.db")
+            project = database.create_project("/p/demo", "demo")
+            worktree = database.create_worktree(project["id"], "/p/demo-fix", "fix")
+            database.create_session(
+                name="attached",
+                project_id=project["id"],
+                agent="claude-code",
+                worktree_id=worktree["id"],
+            )
+
+            # `sessions.worktree_id` is RESTRICT, so a cascade that reached
+            # `worktrees` before `sessions` would abort the whole delete.
+            self.assertTrue(database.delete_project("/p/demo"))
+            self.assertEqual(database.list_worktrees(), [])
+            self.assertEqual(database.list_sessions(), [])
+            database.close()
+
+    def test_worktree_in_use_cannot_be_deleted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Database(Path(tmpdir) / "sessions.db")
+            project = database.create_project("/p/demo", "demo")
+            worktree = database.create_worktree(project["id"], "/p/demo-fix", "fix")
+            database.create_session(
+                name="attached",
+                project_id=project["id"],
+                agent="claude-code",
+                worktree_id=worktree["id"],
+            )
+
+            # The endpoint answers 409 before reaching this; the constraint is
+            # the backstop behind that check.
+            with self.assertRaises(sqlite3.IntegrityError):
+                database.delete_worktree(worktree["id"])
+            database.close()
+
     def test_ids_are_not_reused_after_a_delete(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             database = Database(Path(tmpdir) / "sessions.db")
@@ -625,14 +778,12 @@ class MigrationTests(unittest.TestCase):
             first = database.create_session(
                 name="first",
                 project_id=project["id"],
-                working_dir="/p/demo",
                 agent="claude-code",
             )
             database.delete_session(first["id"])
             second = database.create_session(
                 name="second",
                 project_id=project["id"],
-                working_dir="/p/demo",
                 agent="claude-code",
             )
             # AUTOINCREMENT, not a bare rowid: a client holding the deleted
@@ -869,6 +1020,21 @@ class SessionEndpointTestCase(unittest.IsolatedAsyncioTestCase):
             self.main.CreateSessionRequest(**kwargs)
         )
 
+    async def create_worktree(self, **kwargs: Any) -> dict[str, Any]:
+        return await self.main.create_worktree(
+            self.main.CreateWorktreeRequest(**kwargs)
+        )
+
+    async def worktree_for(
+        self, project: dict[str, Any], name: str = "fix"
+    ) -> tuple[dict[str, Any], Path]:
+        """A worktree of `project` at `<tmpdir>/<name>`, on a branch of that name."""
+        path = self.tmpdir / name
+        worktree = await self.create_worktree(
+            project_path=project["path"], path=str(path), branch=name
+        )
+        return worktree, path
+
 
 class CreateSessionTests(SessionEndpointTestCase):
     async def test_without_worktree_runs_in_the_project_directory(self) -> None:
@@ -878,7 +1044,7 @@ class CreateSessionTests(SessionEndpointTestCase):
 
         self.assertEqual(session["working_dir"], project["path"])
         self.assertEqual(session["project_id"], project["id"])
-        self.assertIs(session["owns_worktree"], False)
+        self.assertIsNone(session["worktree_id"])
 
     async def test_working_dir_is_accepted_as_a_deprecated_alias(self) -> None:
         project = self.make_project(repo=False)
@@ -906,82 +1072,210 @@ class CreateSessionTests(SessionEndpointTestCase):
             )
         self.assertEqual(caught.exception.status_code, 400)
 
-    async def test_worktree_session_gets_its_own_directory_and_branch(self) -> None:
+    async def test_session_attaches_to_an_existing_worktree(self) -> None:
         project = self.make_project()
-        worktree = self.tmpdir / "repo-fix-login"
+        worktree, path = await self.worktree_for(project, "repo-fix-login")
 
         session = await self.create(
             name="fix login",
             project_path=project["path"],
-            worktree={"path": str(worktree), "branch": "fix-login"},
+            worktree_id=worktree["id"],
         )
 
-        self.assertEqual(session["working_dir"], str(worktree))
-        self.assertIs(session["owns_worktree"], True)
-        # A real worktree on a real new branch, not just a directory.
-        self.assertTrue((worktree / ".git").is_file())
-        self.assertEqual(
-            run_git(worktree, "rev-parse", "--abbrev-ref", "HEAD"), "fix-login"
-        )
-        # And it still belongs to the project it was cut from.
+        self.assertEqual(session["worktree_id"], worktree["id"])
+        self.assertEqual(session["working_dir"], str(path))
+        # And it still belongs to the project the worktree was cut from.
         listed = self.database.get_project(project["path"])
         self.assertEqual(listed["session_count"], 1)
 
-    async def test_empty_target_directory_is_taken_over(self) -> None:
+    async def test_several_sessions_share_one_worktree(self) -> None:
+        # The whole point of the rework: a worktree is not owned by whichever
+        # session happened to create it.
         project = self.make_project()
-        worktree = self.tmpdir / "prepared"
-        worktree.mkdir()
+        worktree, path = await self.worktree_for(project)
 
-        session = await self.create(
-            name="fix",
-            project_path=project["path"],
-            worktree={"path": str(worktree), "branch": "fix"},
+        first = await self.create(
+            name="one", project_path=project["path"], worktree_id=worktree["id"]
+        )
+        second = await self.create(
+            name="two", project_path=project["path"], worktree_id=worktree["id"]
         )
 
-        self.assertEqual(session["working_dir"], str(worktree))
+        self.assertEqual(first["working_dir"], str(path))
+        self.assertEqual(second["working_dir"], str(path))
+        self.assertEqual(
+            self.database.get_worktree(worktree["id"])["session_count"], 2
+        )
 
-    async def test_non_repo_project_is_400_and_creates_nothing(self) -> None:
-        project = self.make_project(repo=False)
-        worktree = self.tmpdir / "wt"
+    async def test_unknown_worktree_is_404(self) -> None:
+        project = self.make_project()
+
+        with self.assertRaises(HTTPException) as caught:
+            await self.create(
+                name="fix", project_path=project["path"], worktree_id=999
+            )
+
+        self.assertEqual(caught.exception.status_code, 404)
+        self.assertEqual(self.database.list_sessions(), [])
+
+    async def test_worktree_from_another_project_is_400(self) -> None:
+        project = self.make_project("one")
+        other = self.make_project("two")
+        worktree, _ = await self.worktree_for(other, "two-fix")
 
         with self.assertRaises(HTTPException) as caught:
             await self.create(
                 name="fix",
                 project_path=project["path"],
-                worktree={"path": str(worktree), "branch": "fix"},
+                worktree_id=worktree["id"],
+            )
+
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertEqual(self.database.list_sessions(), [])
+
+    async def test_attaching_to_a_deleted_directory_does_not_recreate_it(self) -> None:
+        project = self.make_project()
+        worktree, path = await self.worktree_for(project)
+        subprocess.run(["rm", "-rf", str(path)], check=True)
+
+        session = await self.create(
+            name="fix", project_path=project["path"], worktree_id=worktree["id"]
+        )
+
+        # A plain mkdir here would hand the agent a directory that looks like a
+        # worktree and is not one. The row stays, flagged as gone, so the client
+        # can offer to clean it up.
+        self.assertEqual(session["working_dir"], str(path))
+        self.assertFalse(path.exists())
+        listed = await self.main.list_worktrees(project_path=project["path"])
+        self.assertIs(listed[0]["exists"], False)
+
+
+class NormalizeProjectPathTests(unittest.TestCase):
+    def setUp(self) -> None:
+        from agent_ui_server import main
+
+        self.normalize = main.normalize_project_path
+
+    def test_collapses_dots_and_duplicate_slashes(self) -> None:
+        self.assertEqual(self.normalize("/projects//app/"), "/projects/app")
+        self.assertEqual(self.normalize("  /projects/app/../app  "), "/projects/app")
+
+    def test_leading_double_slash_is_collapsed(self) -> None:
+        # `os.path.normpath` keeps exactly two leading slashes, so without the
+        # explicit collapse this is a second spelling of the same directory and
+        # the UNIQUE on projects.path / worktrees.path never sees the clash. A
+        # client joining a path template onto a top-level project produces it.
+        self.assertEqual(self.normalize("//app-fix"), "/app-fix")
+        self.assertEqual(self.normalize("//projects/app"), "/projects/app")
+
+    def test_relative_and_root_are_400(self) -> None:
+        for path in ("app", "./app", "//", "/", "/projects/.."):
+            with self.assertRaises(HTTPException) as caught:
+                self.normalize(path)
+            self.assertEqual(caught.exception.status_code, 400)
+
+
+class CreateWorktreeTests(SessionEndpointTestCase):
+    async def test_creates_a_directory_on_a_new_branch(self) -> None:
+        project = self.make_project()
+        path = self.tmpdir / "repo-fix-login"
+
+        worktree = await self.create_worktree(
+            project_path=project["path"],
+            path=str(path),
+            branch="fix-login",
+        )
+
+        self.assertEqual(worktree["path"], str(path))
+        self.assertEqual(worktree["branch"], "fix-login")
+        self.assertEqual(worktree["project_id"], project["id"])
+        # Nothing is attached yet, which is an ordinary state now rather than
+        # the leak it would have been before.
+        self.assertEqual(worktree["session_count"], 0)
+        self.assertIs(worktree["exists"], True)
+        # A real worktree on a real new branch, not just a directory.
+        self.assertTrue((path / ".git").is_file())
+        self.assertEqual(
+            run_git(path, "rev-parse", "--abbrev-ref", "HEAD"), "fix-login"
+        )
+
+    async def test_listing_is_scoped_to_a_project(self) -> None:
+        one = self.make_project("one")
+        two = self.make_project("two")
+        await self.worktree_for(one, "one-a")
+        await self.worktree_for(one, "one-b")
+        await self.worktree_for(two, "two-a")
+
+        scoped = await self.main.list_worktrees(project_path=one["path"])
+        everything = await self.main.list_worktrees()
+
+        self.assertEqual(
+            sorted(w["path"] for w in scoped),
+            [str(self.tmpdir / "one-a"), str(self.tmpdir / "one-b")],
+        )
+        self.assertEqual(len(everything), 3)
+
+    async def test_empty_target_directory_is_taken_over(self) -> None:
+        project = self.make_project()
+        path = self.tmpdir / "prepared"
+        path.mkdir()
+
+        worktree = await self.create_worktree(
+            project_path=project["path"], path=str(path), branch="fix"
+        )
+
+        self.assertEqual(worktree["path"], str(path))
+
+    async def test_non_repo_project_is_400_and_creates_nothing(self) -> None:
+        project = self.make_project(repo=False)
+        path = self.tmpdir / "wt"
+
+        with self.assertRaises(HTTPException) as caught:
+            await self.create_worktree(
+                project_path=project["path"], path=str(path), branch="fix"
             )
 
         self.assertEqual(caught.exception.status_code, 400)
         self.assertEqual(caught.exception.detail, "project is not a git repository")
-        self.assertEqual(self.database.list_sessions(), [])
-        self.assertFalse(worktree.exists())
+        self.assertEqual(self.database.list_worktrees(), [])
+        self.assertFalse(path.exists())
+
+    async def test_unregistered_project_is_404(self) -> None:
+        with self.assertRaises(HTTPException) as caught:
+            await self.create_worktree(
+                project_path=str(self.tmpdir / "unregistered"),
+                path=str(self.tmpdir / "wt"),
+                branch="fix",
+            )
+
+        self.assertEqual(caught.exception.status_code, 404)
+        self.assertEqual(self.database.list_worktrees(), [])
 
     async def test_non_empty_target_path_is_400(self) -> None:
         project = self.make_project()
-        worktree = self.tmpdir / "occupied"
-        worktree.mkdir()
-        (worktree / "keep.txt").write_text("mine")
+        path = self.tmpdir / "occupied"
+        path.mkdir()
+        (path / "keep.txt").write_text("mine")
 
         with self.assertRaises(HTTPException) as caught:
-            await self.create(
-                name="fix",
-                project_path=project["path"],
-                worktree={"path": str(worktree), "branch": "fix"},
+            await self.create_worktree(
+                project_path=project["path"], path=str(path), branch="fix"
             )
 
         self.assertEqual(caught.exception.status_code, 400)
-        self.assertEqual(self.database.list_sessions(), [])
+        self.assertEqual(self.database.list_worktrees(), [])
         # Refusing must not disturb what is already there.
-        self.assertEqual((worktree / "keep.txt").read_text(), "mine")
+        self.assertEqual((path / "keep.txt").read_text(), "mine")
 
     async def test_invalid_branch_name_is_400(self) -> None:
         project = self.make_project()
 
         with self.assertRaises(HTTPException) as caught:
-            await self.create(
-                name="fix",
+            await self.create_worktree(
                 project_path=project["path"],
-                worktree={"path": str(self.tmpdir / "wt"), "branch": "bad name"},
+                path=str(self.tmpdir / "wt"),
+                branch="bad name",
             )
 
         self.assertEqual(caught.exception.status_code, 400)
@@ -993,47 +1287,108 @@ class CreateSessionTests(SessionEndpointTestCase):
         run_git(Path(project["path"]), "branch", "taken")
 
         with self.assertRaises(HTTPException) as caught:
-            await self.create(
-                name="fix",
+            await self.create_worktree(
                 project_path=project["path"],
-                worktree={"path": str(self.tmpdir / "wt"), "branch": "taken"},
+                path=str(self.tmpdir / "wt"),
+                branch="taken",
             )
 
         # v1 always cuts a new branch, so git's refusal is the answer; its own
         # message goes through so the client can show something specific.
         self.assertEqual(caught.exception.status_code, 400)
         self.assertIn("taken", caught.exception.detail)
-        self.assertEqual(self.database.list_sessions(), [])
+        self.assertEqual(self.database.list_worktrees(), [])
 
     async def test_worktree_at_the_project_path_is_400(self) -> None:
         project = self.make_project()
 
         with self.assertRaises(HTTPException) as caught:
-            await self.create(
-                name="fix",
+            await self.create_worktree(
                 project_path=project["path"],
-                worktree={"path": project["path"] + "/", "branch": "fix"},
+                path=project["path"] + "/",
+                branch="fix",
             )
 
         self.assertEqual(caught.exception.status_code, 400)
 
+    async def test_undiggable_path_is_400_and_leaves_no_branch(self) -> None:
+        project = self.make_project()
+        locked = self.tmpdir / "locked"
+        locked.mkdir()
+        locked.chmod(0o500)
+
+        with self.assertRaises(HTTPException) as caught:
+            await self.create_worktree(
+                project_path=project["path"],
+                path=str(locked / "wt"),
+                branch="fix",
+            )
+
+        # Restored before the assertions rather than in a cleanup, which would
+        # run after tearDown has already removed the temporary directory.
+        locked.chmod(0o700)
+        self.assertEqual(caught.exception.status_code, 400)
+        # `mkdir`'s errno, not git's `could not create leading directories of
+        # '…/.git'`.
+        self.assertIn("Could not create worktree directory", caught.exception.detail)
+        self.assertIn("Permission denied", caught.exception.detail)
+        # The point of creating the directory first: `git worktree add` writes
+        # the branch ref before the leading directories, so letting it fail here
+        # would leave `fix` behind and make the retry complain that the branch
+        # already exists.
+        branches = run_git(
+            Path(project["path"]), "branch", "--list", "--format=%(refname:short)"
+        )
+        self.assertEqual(branches.split(), ["main"])
+        self.assertEqual(self.database.list_worktrees(), [])
+
+    async def test_path_that_is_already_a_worktree_is_409(self) -> None:
+        project = self.make_project()
+        _, path = await self.worktree_for(project)
+
+        with self.assertRaises(HTTPException) as caught:
+            await self.create_worktree(
+                project_path=project["path"], path=str(path), branch="other"
+            )
+
+        # The cause, not the symptom: without this check git's own refusal
+        # blames a non-empty directory, which is not what went wrong.
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertIn("already exists", caught.exception.detail)
+        self.assertIn("fix", caught.exception.detail)
+        self.assertEqual(len(self.database.list_worktrees()), 1)
+
+    async def test_repeat_path_is_409_even_once_the_directory_is_gone(self) -> None:
+        project = self.make_project()
+        _, path = await self.worktree_for(project)
+        subprocess.run(["rm", "-rf", str(path)], check=True)
+
+        with self.assertRaises(HTTPException) as caught:
+            await self.create_worktree(
+                project_path=project["path"], path=str(path), branch="other"
+            )
+
+        # `path` is UNIQUE, so reaching git here would do the work and then fail
+        # the insert. git refuses this one too, but only with a message about
+        # its own admin files.
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertIn("already exists", caught.exception.detail)
+
     async def test_failed_insert_takes_the_worktree_back(self) -> None:
         project = self.make_project()
-        worktree = self.tmpdir / "rolled-back"
+        path = self.tmpdir / "rolled-back"
 
         def explode(**kwargs: Any) -> dict[str, Any]:
             raise sqlite3.OperationalError("database is locked")
 
-        self.database.create_session = explode
+        self.database.create_worktree = explode
         with self.assertRaises(sqlite3.OperationalError):
-            await self.create(
-                name="fix",
-                project_path=project["path"],
-                worktree={"path": str(worktree), "branch": "fix"},
+            await self.create_worktree(
+                project_path=project["path"], path=str(path), branch="fix"
             )
 
-        # Nothing owns the worktree, so it must not survive the failure.
-        self.assertFalse(worktree.exists())
+        # No row will ever claim the directory, so it must not survive.
+        self.assertFalse(path.exists())
         self.assertEqual(
             run_git(Path(project["path"]), "worktree", "list", "--porcelain").count(
                 "worktree "
@@ -1042,86 +1397,136 @@ class CreateSessionTests(SessionEndpointTestCase):
         )
 
 
-class TeardownWorktreeTests(SessionEndpointTestCase):
-    async def worktree_session(self, name: str = "fix") -> tuple[dict, Path, dict]:
-        project = self.make_project()
-        worktree = self.tmpdir / f"repo-{name}"
-        session = await self.create(
-            name=name,
-            project_path=project["path"],
-            worktree={"path": str(worktree), "branch": name},
-        )
-        return project, worktree, session
-
+class DeleteWorktreeTests(SessionEndpointTestCase):
     async def test_clean_worktree_is_removed(self) -> None:
-        _, worktree, session = await self.worktree_session()
+        project = self.make_project()
+        worktree, path = await self.worktree_for(project)
 
-        result = await self.main.delete_session(session["id"])
+        result = await self.main.delete_worktree(worktree["id"])
 
         self.assertEqual(result["status"], "deleted")
-        self.assertTrue(result["worktree_removed"])
-        self.assertIsNone(result["worktree_error"])
-        self.assertFalse(worktree.exists())
-        self.assertIsNone(self.database.get_session(session["id"]))
+        self.assertFalse(path.exists())
+        self.assertIsNone(self.database.get_worktree(worktree["id"]))
 
-    async def test_dirty_worktree_is_left_in_place_and_reported(self) -> None:
-        _, worktree, session = await self.worktree_session()
+    async def test_dirty_worktree_is_409_and_keeps_its_row(self) -> None:
+        project = self.make_project()
+        worktree, path = await self.worktree_for(project)
         # An untracked file counts as dirty, so this is the *common* case for
-        # any session that did some work — not an edge case.
-        (worktree / "new_file.py").write_text("print('hi')")
+        # any worktree an agent did work in — not an edge case.
+        (path / "new_file.py").write_text("print('hi')")
 
-        result = await self.main.delete_session(session["id"])
+        with self.assertRaises(HTTPException) as caught:
+            await self.main.delete_worktree(worktree["id"])
 
-        # The session is deleted regardless; the directory is not.
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertIn("untracked", caught.exception.detail)
+        self.assertTrue(path.is_dir())
+        self.assertEqual((path / "new_file.py").read_text(), "print('hi')")
+        # The row is the worktree: dropping it while the directory survives is
+        # exactly the orphan this rework exists to prevent.
+        self.assertIsNotNone(self.database.get_worktree(worktree["id"]))
+
+    async def test_attached_sessions_are_409_and_nothing_is_removed(self) -> None:
+        project = self.make_project()
+        worktree, path = await self.worktree_for(project)
+        await self.create(
+            name="busy", project_path=project["path"], worktree_id=worktree["id"]
+        )
+
+        with self.assertRaises(HTTPException) as caught:
+            await self.main.delete_worktree(worktree["id"])
+
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertIn("busy", caught.exception.detail)
+        self.assertTrue(path.is_dir())
+        self.assertIsNotNone(self.database.get_worktree(worktree["id"]))
+
+    async def test_removable_once_the_last_session_is_deleted(self) -> None:
+        project = self.make_project()
+        worktree, path = await self.worktree_for(project)
+        session = await self.create(
+            name="done", project_path=project["path"], worktree_id=worktree["id"]
+        )
+
+        await self.main.delete_session(session["id"])
+        result = await self.main.delete_worktree(worktree["id"])
+
         self.assertEqual(result["status"], "deleted")
-        self.assertFalse(result["worktree_removed"])
-        self.assertIn("untracked", result["worktree_error"])
-        self.assertTrue(worktree.is_dir())
-        self.assertEqual((worktree / "new_file.py").read_text(), "print('hi')")
-        self.assertIsNone(self.database.get_session(session["id"]))
+        self.assertFalse(path.exists())
 
     async def test_directory_removed_by_hand_is_a_success(self) -> None:
-        _, worktree, session = await self.worktree_session()
-        subprocess.run(["rm", "-rf", str(worktree)], check=True)
-
-        result = await self.main.delete_session(session["id"])
-
-        # git prunes its own admin files and exits 0; nothing to report.
-        self.assertTrue(result["worktree_removed"])
-        self.assertIsNone(result["worktree_error"])
-
-    async def test_a_worktree_we_did_not_create_is_left_alone(self) -> None:
         project = self.make_project()
-        # Made by hand, outside the app: a worktree, but not ours to delete.
-        worktree = self.tmpdir / "by-hand"
-        run_git(Path(project["path"]), "worktree", "add", "-b", "manual", str(worktree))
-        session = self.database.create_session(
-            name="borrowed",
-            project_id=project["id"],
-            working_dir=str(worktree),
-            agent="claude-code",
+        worktree, path = await self.worktree_for(project)
+        subprocess.run(["rm", "-rf", str(path)], check=True)
+
+        result = await self.main.delete_worktree(worktree["id"])
+
+        # git prunes its own admin files and exits 0, so this is how a row left
+        # behind by a hand-deleted directory gets tidied up.
+        self.assertEqual(result["status"], "deleted")
+        self.assertIsNone(self.database.get_worktree(worktree["id"]))
+
+    async def test_unknown_worktree_is_404(self) -> None:
+        with self.assertRaises(HTTPException) as caught:
+            await self.main.delete_worktree(999)
+
+        self.assertEqual(caught.exception.status_code, 404)
+
+
+class TeardownWorktreeTests(SessionEndpointTestCase):
+    async def test_deleting_a_session_leaves_its_worktree_alone(self) -> None:
+        project = self.make_project()
+        worktree, path = await self.worktree_for(project)
+        session = await self.create(
+            name="fix", project_path=project["path"], worktree_id=worktree["id"]
         )
 
         result = await self.main.delete_session(session["id"])
 
-        self.assertFalse(result["worktree_removed"])
-        self.assertIsNone(result["worktree_error"])
-        self.assertTrue(worktree.is_dir())
+        # The worktree outlives the session that used it, clean or not.
+        self.assertEqual(result, {"status": "deleted"})
+        self.assertTrue(path.is_dir())
+        self.assertIsNotNone(self.database.get_worktree(worktree["id"]))
+        self.assertIsNone(self.database.get_session(session["id"]))
+
+    async def test_one_session_leaving_does_not_disturb_the_others(self) -> None:
+        project = self.make_project()
+        worktree, path = await self.worktree_for(project)
+        leaving = await self.create(
+            name="one", project_path=project["path"], worktree_id=worktree["id"]
+        )
+        staying = await self.create(
+            name="two", project_path=project["path"], worktree_id=worktree["id"]
+        )
+
+        await self.main.delete_session(leaving["id"])
+
+        self.assertTrue(path.is_dir())
+        self.assertEqual(
+            self.database.get_session(staying["id"])["working_dir"], str(path)
+        )
+        self.assertEqual(
+            self.database.get_worktree(worktree["id"])["session_count"], 1
+        )
 
     async def test_delete_project_sweeps_worktrees_and_reports_counts(self) -> None:
         project = self.make_project()
-        clean = await self.create(
-            name="clean",
-            project_path=project["path"],
-            worktree={"path": str(self.tmpdir / "wt-clean"), "branch": "clean"},
-        )
-        dirty = await self.create(
-            name="dirty",
-            project_path=project["path"],
-            worktree={"path": str(self.tmpdir / "wt-dirty"), "branch": "dirty"},
-        )
-        plain = await self.create(name="plain", project_path=project["path"])
-        (self.tmpdir / "wt-dirty" / "scratch.txt").write_text("x")
+        clean, clean_path = await self.worktree_for(project, "wt-clean")
+        dirty, dirty_path = await self.worktree_for(project, "wt-dirty")
+        sessions = [
+            await self.create(
+                name="clean",
+                project_path=project["path"],
+                worktree_id=clean["id"],
+            ),
+            await self.create(
+                name="dirty",
+                project_path=project["path"],
+                worktree_id=dirty["id"],
+            ),
+            await self.create(name="plain", project_path=project["path"]),
+        ]
+        (dirty_path / "scratch.txt").write_text("x")
 
         result = await self.main.delete_project(
             self.main.DeleteProjectRequest(path=project["path"])
@@ -1129,18 +1534,27 @@ class TeardownWorktreeTests(SessionEndpointTestCase):
 
         self.assertEqual(result["sessions_deleted"], 3)
         self.assertEqual(result["worktrees_removed"], 1)
-        self.assertEqual(len(result["worktree_errors"]), 1)
-        self.assertEqual(result["worktree_errors"][0]["session"], "dirty")
         self.assertEqual(
-            result["worktree_errors"][0]["path"], str(self.tmpdir / "wt-dirty")
+            result["worktree_errors"],
+            [
+                {
+                    "path": str(dirty_path),
+                    "error": result["worktree_errors"][0]["error"],
+                }
+            ],
         )
-        self.assertFalse((self.tmpdir / "wt-clean").exists())
-        self.assertTrue((self.tmpdir / "wt-dirty").is_dir())
+        self.assertIn("untracked", result["worktree_errors"][0]["error"])
+        self.assertFalse(clean_path.exists())
+        self.assertTrue(dirty_path.is_dir())
         # The project directory itself is never touched.
         self.assertTrue(Path(project["path"]).is_dir())
+        # Rows go regardless — including the dirty worktree's, by cascade.
         self.assertEqual(self.database.list_sessions(), [])
-        for session in (clean, dirty, plain):
+        self.assertEqual(self.database.list_worktrees(), [])
+        for session in sessions:
             self.assertIsNone(self.database.get_session(session["id"]))
+
+
 
 
 class DeleteProjectTests(unittest.IsolatedAsyncioTestCase):
@@ -1166,7 +1580,6 @@ class DeleteProjectTests(unittest.IsolatedAsyncioTestCase):
                 database.create_session(
                     name=name,
                     project_id=doomed["id"],
-                    working_dir=str(target),
                     agent="claude-code",
                 )
             keeper = make_session(

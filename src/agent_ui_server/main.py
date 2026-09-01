@@ -54,30 +54,30 @@ class DeleteProjectRequest(BaseModel):
     path: str = Field(min_length=1)
 
 
-class WorktreeSpec(BaseModel):
-    """Where to put this session's worktree, and what to call its branch.
+class CreateWorktreeRequest(BaseModel):
+    """A worktree under a project: where to put it, what to call its branch.
 
     The branch is always new and always cut from the project's current HEAD;
     attaching to an existing branch is not offered.
     """
 
+    project_path: str = Field(min_length=1)
     path: str = Field(min_length=1)
     branch: str = Field(min_length=1, max_length=200)
 
 
 class CreateSessionRequest(BaseModel):
-    """A session under a project, optionally running in its own worktree.
+    """A session under a project, optionally attached to one of its worktrees.
 
-    Creating the worktree is part of *this* request rather than one the client
-    makes first: ownership has to be atomic, or a client that dies between the
-    two calls leaves a worktree on disk that no session row claims and nothing
-    will ever clean up.
+    The worktree must already exist — it is created by `POST /worktrees`, and
+    any number of sessions can attach to the same one. Without a `worktree_id`
+    the session runs in the project's own directory.
     """
 
     name: str = Field(min_length=1, max_length=120)
     project_path: str = Field(min_length=1)
     agent: str = "claude-code"
-    worktree: WorktreeSpec | None = None
+    worktree_id: int | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -202,23 +202,23 @@ async def delete_project(payload: DeleteProjectRequest) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="Project not found")
 
     doomed = db.list_sessions_for_project(project["id"])
+    for session in doomed:
+        await teardown_session(session)
+
+    # Sessions first: a worktree with any still attached would refuse to go,
+    # and by here they are all gone.
     worktrees_removed = 0
     worktree_errors: list[dict[str, str]] = []
-    for session in doomed:
-        error = await teardown_session(session)
-        if not session["owns_worktree"]:
-            continue
+    for worktree in db.list_worktrees(project["id"]):
+        error = await git.remove_worktree(project["path"], worktree["path"])
         if error is None:
             worktrees_removed += 1
         else:
-            worktree_errors.append(
-                {
-                    "session": session["name"],
-                    "path": session["working_dir"],
-                    "error": error,
-                }
-            )
+            worktree_errors.append({"path": worktree["path"], "error": error})
 
+    # The worktree rows go with the project either way, by cascade. A directory
+    # git refused to remove stays on disk — as the project's own directory
+    # always has — and is reported above rather than blocking the delete.
     db.delete_project(path)
     return {
         "status": "deleted",
@@ -237,9 +237,9 @@ async def list_sessions() -> list[dict[str, Any]]:
 async def create_session(payload: CreateSessionRequest) -> dict[str, Any]:
     """Create a session under an existing project.
 
-    Without a `worktree` block the session runs in the project directory, as it
-    always has. With one, the worktree is created first and the session runs
-    there instead — and if anything about that fails, no session is created.
+    Without a `worktree_id` the session runs in the project directory, as it
+    always has. With one it runs in that worktree instead, alongside however
+    many other sessions are already attached to it.
     """
     if payload.agent not in adapters:
         raise HTTPException(status_code=400, detail="Unknown agent")
@@ -252,7 +252,20 @@ async def create_session(payload: CreateSessionRequest) -> dict[str, Any]:
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    if payload.worktree is None:
+    if payload.worktree_id is not None:
+        worktree = db.get_worktree(payload.worktree_id)
+        if worktree is None:
+            raise HTTPException(status_code=404, detail="Worktree not found")
+        if worktree["project_id"] != project["id"]:
+            raise HTTPException(
+                status_code=400,
+                detail="worktree belongs to a different project",
+            )
+        # No mkdir: the directory is git's, and re-creating one the user
+        # removed by hand would produce a plain directory the agent would run
+        # in as though it were a worktree. `GET /worktrees` reports `exists` so
+        # the client can offer to clean it up instead.
+    else:
         try:
             Path(project_path).mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -260,23 +273,67 @@ async def create_session(payload: CreateSessionRequest) -> dict[str, Any]:
                 status_code=400,
                 detail=f"Could not create working directory: {exc}",
             )
-        return db.create_session(
-            name=name,
-            project_id=project["id"],
-            working_dir=project_path,
-            agent=payload.agent,
-        )
 
-    worktree_path = normalize_project_path(payload.worktree.path)
-    branch = payload.worktree.branch.strip()
+    return db.create_session(
+        name=name,
+        project_id=project["id"],
+        agent=payload.agent,
+        worktree_id=payload.worktree_id,
+    )
+
+
+@app.get("/worktrees")
+async def list_worktrees(project_path: str | None = None) -> list[dict[str, Any]]:
+    """Every worktree, or every worktree of one project."""
+    project_id: int | None = None
+    if project_path is not None:
+        project = db.get_project(normalize_project_path(project_path))
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+        project_id = project["id"]
+    return [
+        with_worktree_existence(worktree)
+        for worktree in db.list_worktrees(project_id)
+    ]
+
+
+@app.post("/worktrees", status_code=201)
+async def create_worktree(payload: CreateWorktreeRequest) -> dict[str, Any]:
+    """Create a git worktree for a project, on a new branch off its HEAD.
+
+    A worktree is its own thing now, so this succeeding commits the server to
+    nothing else: it may sit with no sessions attached for as long as the user
+    likes, and it is removed only by `DELETE /worktrees/{id}`.
+    """
+    project_path = normalize_project_path(payload.project_path)
+    project = db.get_project(project_path)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    worktree_path = normalize_project_path(payload.path)
+    branch = payload.branch.strip()
     if worktree_path == project_path:
         raise HTTPException(
             status_code=400,
             detail="worktree path must differ from the project directory",
         )
+    # Checked before the directory is: a client that derives the path from a
+    # template hits this whenever two worktrees would be named the same way, and
+    # both of the errors further down describe the symptom rather than the
+    # cause. `path` is UNIQUE, so this is also what keeps the insert from
+    # failing after git has already done the work.
+    existing = db.get_worktree_by_path(worktree_path)
+    if existing is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"a worktree already exists at {worktree_path}"
+                + (f" on branch {existing['branch']}" if existing["branch"] else "")
+            ),
+        )
     # git takes over an existing *empty* directory and refuses a non-empty one;
     # checking here matches that rule and gives a better message than parsing
-    # git's. No mkdir either way — `worktree add` creates the directory itself.
+    # git's.
     if not is_empty_or_missing(worktree_path):
         raise HTTPException(
             status_code=400,
@@ -289,23 +346,71 @@ async def create_session(payload: CreateSessionRequest) -> dict[str, Any]:
     if not await git.check_branch_name(branch):
         raise HTTPException(status_code=400, detail="invalid branch name")
 
+    # Created up front even though `git worktree add` would create it itself,
+    # because that command is not atomic: it writes the new branch ref *before*
+    # creating the leading directories, and a failure there leaves the branch
+    # behind (verified, git 2.47.3). The retry then fails with "a branch named
+    # '…' already exists", which points at the wrong problem entirely. Doing it
+    # here moves the failure ahead of the ref, so there is nothing to unwind —
+    # and `OSError` carries a real errno, so the message says `Permission
+    # denied` rather than git's `could not create leading directories of
+    # '…/.git'`.
+    try:
+        Path(worktree_path).mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not create worktree directory: {exc}",
+        )
+
     error = await git.add_worktree(project_path, worktree_path, branch)
     if error is not None:
         raise HTTPException(status_code=400, detail=error)
 
     try:
-        return db.create_session(
-            name=name,
-            project_id=project["id"],
-            working_dir=worktree_path,
-            agent=payload.agent,
-            owns_worktree=True,
+        worktree = db.create_worktree(
+            project_id=project["id"], path=worktree_path, branch=branch
         )
     except Exception:
-        # The worktree exists but nothing will ever own it, so it has to go
+        # The directory exists but no row will ever claim it, so it has to go
         # back before the failure propagates.
         await git.remove_worktree(project_path, worktree_path)
         raise
+    return with_worktree_existence(worktree)
+
+
+@app.delete("/worktrees/{worktree_id}")
+async def delete_worktree(worktree_id: int) -> dict[str, Any]:
+    """Remove a worktree from disk and forget it.
+
+    A 409 either way when it cannot be removed — with sessions still attached,
+    or with work in it git refuses to discard. Unlike deleting a session, the
+    row does **not** go regardless: the row *is* the worktree, so keeping one
+    whose directory is still there is what stops it becoming an orphan nothing
+    can see.
+    """
+    worktree = db.get_worktree(worktree_id)
+    if worktree is None:
+        raise HTTPException(status_code=404, detail="Worktree not found")
+
+    attached = db.list_sessions_for_worktree(worktree_id)
+    if attached:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{len(attached)} session(s) are still using this worktree: "
+                + ", ".join(session["name"] for session in attached)
+            ),
+        )
+
+    project = db.get_project_by_id(worktree["project_id"])
+    if project is not None:
+        error = await git.remove_worktree(project["path"], worktree["path"])
+        if error is not None:
+            raise HTTPException(status_code=409, detail=error)
+
+    db.delete_worktree(worktree_id)
+    return {"status": "deleted"}
 
 
 @app.patch("/sessions/{session_id}")
@@ -351,20 +456,16 @@ async def stop_session(session_id: int) -> dict[str, str]:
 
 
 @app.delete("/sessions/{session_id}")
-async def delete_session(session_id: int) -> dict[str, Any]:
-    """Delete a session, and its worktree if the server made one.
+async def delete_session(session_id: int) -> dict[str, str]:
+    """Delete a session. Never touches a directory.
 
-    Still a 200 when the worktree could not be removed: the session *is*
-    deleted, and a worktree left in place because it has modified or untracked
-    files is the expected outcome for any session that did some work.
+    A session's worktree outlives it — other sessions may be attached, and even
+    the last one leaving does not imply the user is done with the branch.
+    Removing it is `DELETE /worktrees/{id}`, deliberately a separate decision.
     """
     session = require_session_or_404(session_id)
-    error = await teardown_session(session)
-    return {
-        "status": "deleted",
-        "worktree_removed": bool(session["owns_worktree"]) and error is None,
-        "worktree_error": error,
-    }
+    await teardown_session(session)
+    return {"status": "deleted"}
 
 
 @app.post("/sessions/{session_id}/turn", status_code=202)
@@ -692,24 +793,15 @@ async def broadcast(session_id: int, message: dict[str, Any]) -> None:
         subscribers.pop(session_id, None)
 
 
-async def teardown_session(session: dict[str, Any]) -> str | None:
+async def teardown_session(session: dict[str, Any]) -> None:
     """Stop a session's process, drop its subscribers, and delete its row.
 
-    Shared by deleting one session and deleting a whole project's worth. If the
-    server created this session's worktree it is removed too, without
-    `--force`, so returns git's refusal when there is one — the row is gone
-    either way, and a worktree holding uncommitted work is information rather
-    than a failed request.
+    Shared by deleting one session and deleting a whole project's worth.
+    Nothing on disk is touched: a session owns no directory, so there is
+    nothing here that can fail halfway.
     """
     session_id = session["id"]
     adapter = adapters[session["agent"]]
-    # Resolved up front: `delete_project` deletes the project row after its
-    # teardown sweep, and removing a worktree needs the repo it belongs to.
-    project = (
-        db.get_project_by_id(session["project_id"])
-        if session["owns_worktree"]
-        else None
-    )
 
     await adapter.stop(session)
     task = running_tasks.pop(session_id, None)
@@ -729,9 +821,16 @@ async def teardown_session(session: dict[str, Any]) -> str | None:
 
     db.delete_session(session_id)
 
-    if project is None:
-        return None
-    return await git.remove_worktree(project["path"], session["working_dir"])
+
+def with_worktree_existence(worktree: dict[str, Any]) -> dict[str, Any]:
+    """Annotate a worktree with whether its directory is still there.
+
+    Same one stat per row as `with_existence` does for projects. A worktree
+    removed by hand outside the app still has a row, and this is how the client
+    can tell — `DELETE /worktrees/{id}` then succeeds and tidies up, since git
+    prunes a worktree whose directory is gone without complaint.
+    """
+    return {**worktree, "exists": os.path.isdir(worktree["path"])}
 
 
 def with_existence(project: dict[str, Any]) -> dict[str, Any]:
@@ -776,6 +875,13 @@ def normalize_project_path(raw: str) -> str:
     if not path.startswith("/"):
         raise HTTPException(status_code=400, detail="path must be absolute")
     path = os.path.normpath(path)
+    # `normpath` keeps *exactly* two leading slashes — POSIX leaves `//`
+    # implementation-defined — while collapsing three or more. Nothing here
+    # wants that: it gives one directory two spellings, which would walk past
+    # the UNIQUE on `projects.path` and `worktrees.path`. A client joining a
+    # template naively onto a top-level project (`/` + `/app-fix`) lands here.
+    if path.startswith("//"):
+        path = path[1:]
     if path == "/":
         raise HTTPException(
             status_code=400, detail="path must name a directory, not /"
