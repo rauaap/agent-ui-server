@@ -55,6 +55,13 @@ class DeleteProjectRequest(BaseModel):
     path: str = Field(min_length=1)
 
 
+class UpdateProjectRequest(BaseModel):
+    """Archive or unarchive a project, addressed by path like the delete does."""
+
+    path: str = Field(min_length=1)
+    archived: bool
+
+
 class CreateWorktreeRequest(BaseModel):
     """A worktree under a project: where to put it, what to call its branch.
 
@@ -98,7 +105,7 @@ class CreateSessionRequest(BaseModel):
 
 
 class UpdateSessionRequest(BaseModel):
-    """Partial update of a session: rename and/or flip auto-approve toggles.
+    """Partial update of a session: rename, auto-approve toggles, archive flag.
 
     Every field is optional; only the ones supplied are applied. `name` keeps
     the old rename contract (non-empty, trimmed) when present.
@@ -107,6 +114,7 @@ class UpdateSessionRequest(BaseModel):
     name: str | None = Field(default=None, max_length=120)
     auto_approve_write: bool | None = None
     auto_approve_command: bool | None = None
+    archived: bool | None = None
 
     @field_validator("name")
     @classmethod
@@ -202,6 +210,56 @@ async def create_project(payload: CreateProjectRequest) -> dict[str, Any]:
     return with_existence(db.create_project(path=path, name=name))
 
 
+@app.patch("/projects")
+async def update_project(payload: UpdateProjectRequest) -> dict[str, Any]:
+    """Archive or unarchive a project, taking its sessions with it.
+
+    Archiving cascades: an archived project must not leave sessions showing in
+    the main list, so every live session under it is archived too. A session
+    that is mid-turn or running a command blocks the whole thing with a 409
+    rather than being archived out from under itself — nothing is written when
+    that happens.
+
+    Unarchiving restores exactly the sessions that cascade archived, so the
+    round trip leaves the project as it was found. Sessions archived on their
+    own account before that stay archived.
+    """
+    path = normalize_project_path(payload.path)
+    project = db.get_project(path)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    sessions = db.list_sessions_for_project(project["id"])
+    if payload.archived:
+        busy = [session for session in sessions if session_is_busy(session)]
+        if busy:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Cannot archive a project with busy sessions: "
+                    + ", ".join(session["name"] for session in busy)
+                ),
+            )
+        affected = db.archive_project(project["id"])
+    else:
+        affected = db.unarchive_project(project["id"])
+
+    # The clients holding one of these sessions open are the reason this moved
+    # server-side; tell them rather than making them refetch to find out. Only
+    # the ones somebody is actually watching are worth re-reading.
+    for session in sessions:
+        if session["id"] not in subscribers:
+            continue
+        updated = db.get_session(session["id"])
+        if updated is not None:
+            await broadcast_archived(updated)
+
+    return {
+        **with_existence(db.get_project(path) or project),
+        "sessions_affected": affected,
+    }
+
+
 @app.delete("/projects")
 async def delete_project(payload: DeleteProjectRequest) -> dict[str, Any]:
     """Forget a project and its sessions. Never touches the directory on disk.
@@ -272,6 +330,11 @@ async def create_session(payload: CreateSessionRequest) -> dict[str, Any]:
     project = db.get_project(project_path)
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
+    if project["archived_at"] is not None:
+        # Otherwise the new session lands in a project the UI is not showing.
+        raise HTTPException(
+            status_code=409, detail="Cannot create a session in an archived project"
+        )
 
     if payload.worktree_id is not None:
         worktree = db.get_worktree(payload.worktree_id)
@@ -330,6 +393,14 @@ async def create_worktree(payload: CreateWorktreeRequest) -> dict[str, Any]:
     project = db.get_project(project_path)
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
+    if project["archived_at"] is not None:
+        # Same rule as creating a session in one: archiving is for projects
+        # being put down, and this would cut a branch and a directory for one
+        # the UI is not showing. Removing a worktree stays allowed, like every
+        # other bit of housekeeping on archived things.
+        raise HTTPException(
+            status_code=409, detail="Cannot create a worktree in an archived project"
+        )
 
     worktree_path = normalize_project_path(payload.path)
     branch = payload.branch.strip()
@@ -460,6 +531,9 @@ async def update_session(
             },
         )
 
+    if payload.archived is not None:
+        session = await set_session_archived(session_id, payload.archived)
+
     return session if session is not None else require_session_or_404(session_id)
 
 
@@ -514,6 +588,11 @@ async def session_websocket(websocket: WebSocket, session_id: int) -> None:
     try:
         await replay_scrollback(websocket, session_id)
         await websocket.send_json({"type": "status", "status": session["status"]})
+        # Alongside status for the same reason: a client that was offline when
+        # another device archived this session would otherwise never hear.
+        await websocket.send_json(
+            {"type": "archived", "archived_at": session["archived_at"]}
+        )
 
         while True:
             message = await websocket.receive_json()
@@ -587,6 +666,7 @@ async def session_websocket(websocket: WebSocket, session_id: int) -> None:
 async def begin_turn(session_id: int, prompt: str) -> None:
     async with turn_lock:
         session = require_session_or_404(session_id)
+        require_not_archived(session)
         existing_task = running_tasks.get(session_id)
         if session["status"] != "idle" or (
             existing_task and not existing_task.done()
@@ -696,7 +776,7 @@ async def begin_bash(session_id: int, command: str) -> None:
     bypass the turn state machine — a command can run while the agent is
     mid-turn or blocked on an approval, and neither notices the other.
     """
-    require_session_or_404(session_id)
+    require_not_archived(require_session_or_404(session_id))
     existing = bash_tasks.get(session_id)
     if existing and not existing.done():
         raise HTTPException(
@@ -914,6 +994,60 @@ def require_session_or_404(session_id: int) -> dict[str, Any]:
     session = db.get_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
+    return session
+
+
+async def set_session_archived(session_id: int, archived: bool) -> dict[str, Any]:
+    """Archive or unarchive one session, keeping its project consistent.
+
+    Archiving a session that is mid-turn or running a command is refused: the
+    work would carry on writing scrollback into something the user has filed
+    away. Unarchiving takes the project with it — a live session under an
+    archived project would have nowhere to show — but only that one session
+    comes back, not everything the project's archive swept up.
+    """
+    current = require_session_or_404(session_id)
+    if archived and session_is_busy(current):
+        raise HTTPException(
+            status_code=409, detail="Cannot archive a session while it is busy"
+        )
+
+    session = db.set_session_archived(session_id, archived)
+    if not archived:
+        db.unarchive_project(session["project_id"], restore_sessions=False)
+
+    await broadcast_archived(session)
+    return session
+
+
+def session_is_busy(session: dict[str, Any]) -> bool:
+    """Whether anything is still running for this session.
+
+    `status` covers the agent's turn state machine. Bash mode deliberately sits
+    outside it, so a command running there shows up nowhere in `status` and has
+    to be checked separately.
+    """
+    task = bash_tasks.get(session["id"])
+    return session["status"] != "idle" or bool(task and not task.done())
+
+
+async def broadcast_archived(session: dict[str, Any]) -> None:
+    await broadcast(
+        session["id"],
+        {"type": "archived", "archived_at": session["archived_at"]},
+    )
+
+
+def require_not_archived(session: dict[str, Any]) -> dict[str, Any]:
+    """Refuse to start new work in an archived session.
+
+    Archived is read-only, not hidden: the scrollback still replays over the
+    WebSocket and the session can still be renamed or deleted. Only starting
+    something new is blocked, because that is what would need un-archiving to
+    be visible again.
+    """
+    if session["archived_at"] is not None:
+        raise HTTPException(status_code=409, detail="Session is archived")
     return session
 
 

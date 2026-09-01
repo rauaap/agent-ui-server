@@ -205,13 +205,14 @@ and access is still "you are on the WireGuard network or you are not."
 | `GET`    | `/agents`               | List the agents this server can run, for a client's agent picker |
 | `GET`    | `/projects`             | List projects (working directories) with session aggregates      |
 | `POST`   | `/projects`             | Create a project: `mkdir -p` + row (`path`, `name`) → `201`      |
+| `PATCH`  | `/projects`             | Archive or unarchive a project (`path`, `archived`), cascading to its sessions |
 | `DELETE` | `/projects`             | Forget a project and its sessions (`path`); disk untouched       |
 | `GET`    | `/worktrees`            | List worktrees, optionally `?project_path=`, with session counts |
 | `POST`   | `/worktrees`            | Create a worktree (`project_path`, `path`, `branch`) → `201`     |
 | `DELETE` | `/worktrees/{id}`       | Remove the worktree from disk and forget it                      |
 | `GET`    | `/sessions`             | List all sessions with metadata                                  |
 | `POST`   | `/sessions`             | Create a session (`name`, `project_path`, `agent`, `worktree_id`) → `201` |
-| `PATCH`  | `/sessions/{id}`        | Update a session: rename (`name`) and/or set auto-approve toggles |
+| `PATCH`  | `/sessions/{id}`        | Update a session: rename (`name`), auto-approve toggles, `archived` |
 | `POST`   | `/sessions/{id}/turn`   | Send a prompt and spawn a turn → `202`                           |
 | `POST`   | `/sessions/{id}/bash`   | Run a shell command (`command`), bypassing the agent → `202`     |
 | `POST`   | `/sessions/{id}/stop`   | Stop the running process and any shell command, status → `idle`  |
@@ -233,7 +234,9 @@ supplied ones are applied. `name` (a non-empty 1–120 char label, trimmed)
 renames the session and broadcasts a `renamed` event. `auto_approve_write` and
 `auto_approve_command` are booleans that flip the per-session auto-approval
 toggles (see [Auto-approval](#auto-approval)) and broadcast a `settings` event.
-Both broadcasts reach all WebSocket subscribers so connected clients update live.
+`archived` files the session away or brings it back; see
+[Archiving](#archiving). All three broadcasts reach every WebSocket subscriber,
+so connected clients update live.
 
 #### `GET /agents`
 
@@ -262,20 +265,23 @@ configured projects root: a project exists because it was created through
 ```jsonc
 [
   { "id": 1, "path": "/projects/agent-ui", "name": "agent-ui",
-    "exists": true, "is_git_repo": true,
-    "session_count": 3, "last_active_at": "2026-07-28T09:14:02Z" },
+    "exists": true, "is_git_repo": true, "archived_at": null,
+    "session_count": 3, "archived_session_count": 1,
+    "last_active_at": "2026-07-28T09:14:02Z" },
   { "id": 2, "path": "/projects/scratch",  "name": "scratch",
-    "exists": false, "is_git_repo": false,
-    "session_count": 0, "last_active_at": null }
+    "exists": false, "is_git_repo": false, "archived_at": null,
+    "session_count": 0, "archived_session_count": 0, "last_active_at": null }
 ]
 ```
 
 `session_count` and `last_active_at` are a `LEFT JOIN` onto `sessions` matched on
 `sessions.project_id`, so a project with no sessions yet reports `0` / `null` —
 and a session running in a worktree somewhere else still counts towards the
-project it was cut from. Results are sorted by `last_active_at` descending —
-SQLite sorts `NULL` below everything, so never-used projects land last — then by
-`path` ascending.
+project it was cut from. Both cover *live* sessions only, with
+`archived_session_count` holding the rest, so a project cannot claim five
+sessions while displaying none. Results are sorted by `last_active_at`
+descending — SQLite sorts `NULL` below everything, so never-used projects land
+last — then by `path` ascending.
 
 `id` is the project's identity, and a JSON **number** — not a string. It exists
 so a project's `path` can change later without taking its sessions with it, and
@@ -441,7 +447,7 @@ and exits 0, so the request succeeds and tidies the row away.
 | `/ws/sessions/{id}`   | Bidirectional — replay scrollback, stream output, approvals |
 
 On connect, the backend replays the last 200 scrollback rows, then sends the
-current `status`. The same connection accepts input prompts and approval
+current `status` and `archived` state. The same connection accepts input prompts and approval
 responses, and receives every event broadcast for that session. (Prompts and
 stops can also be issued over REST; everything is broadcast to all subscribers
 either way.)
@@ -475,6 +481,7 @@ either way.)
 { "type": "renamed", "name": "..." }                                  // session label changed
 { "type": "settings", "auto_approve_write": false,                    // auto-approve toggles changed
   "auto_approve_command": true }
+{ "type": "archived", "archived_at": "2026-08-26T11:02:00Z" }         // filed away; null = brought back
 { "type": "done" }                                                    // turn complete
 { "type": "error", "message": "..." }
 
@@ -590,6 +597,61 @@ There is no `read` toggle: read-only tools are auto-allowed by Claude Code's
 filters nothing itself — by the allowlist in the bundled pi extension, so they
 never reach this gate. Tools with no category (e.g. `WebFetch`) always prompt.
 
+### Archiving
+
+Archiving files a session or a project away without deleting it, so old work can
+be kept without cluttering the list. It lives on the server rather than in the
+client precisely so it does not have to be redone on every device.
+
+Both `projects` and `sessions` carry a nullable `archived_at`: `null` is live, a
+timestamp is archived. A timestamp rather than a boolean because the archive view
+wants to sort by when things went in. Re-archiving something already archived
+keeps the original timestamp, so a no-op does not reorder the archive.
+
+**The list endpoints do not filter.** `GET /projects` and `GET /sessions` return
+everything with `archived_at` attached, and the client decides which list a row
+belongs in. Filtering server-side would silently change what existing clients
+see; this way the flag is additive.
+
+**Archiving a project cascades to its sessions.** An archived project must not
+leave sessions showing in the main list, so `PATCH /projects` with
+`{"archived": true}` archives every live session under it and reports how many in
+`sessions_affected`. Unarchiving restores exactly those, so the round trip leaves
+the project as it was found — a `sessions.archived_with_project` flag, which the
+API never exposes, is what tells the two apart. A session archived by hand
+beforehand keeps its own timestamp and stays archived through the whole cycle.
+
+Unarchiving a *session* takes its project with it, since a live session under an
+archived project would have nowhere to show — but only that one session comes
+back, not everything the project's archive swept up.
+
+**Archived is read-only, not sealed.** The scrollback still replays over the
+WebSocket, and the session can still be renamed, have its toggles flipped, and be
+deleted; `DELETE /projects` still sweeps archived sessions along with the rest.
+Only starting *new* work is blocked, because that is what would need unarchiving
+to be visible: `POST /sessions/{id}/turn`, `POST /sessions/{id}/bash`, and
+`POST /sessions` or `POST /worktrees` into an archived project all return `409`.
+
+Worktrees themselves are not archivable. They appear in neither list archiving
+governs — a worktree is reached through its project — so they have no
+`archived_at`, `GET /worktrees` still returns an archived project's worktrees,
+and `DELETE /worktrees/{id}` still removes them. Archiving a project therefore
+leaves its worktrees on disk; they hold real uncommitted work and come off only
+through their own endpoint.
+
+**A busy session cannot be archived.** Archiving something mid-turn would leave
+it writing scrollback into a session the user has filed away, so a session whose
+`status` is not `idle` — or which has a shell command running, which `status`
+does not cover — is a `409`. For a project the check runs across every session
+first, and a single busy one refuses the whole request without writing anything.
+
+Archiving broadcasts an `archived` event to that session's WebSocket
+subscribers, and the state is sent again on connect, so a client that was offline
+when another device archived something finds out either way.
+
+The client half is specified in
+[`docs/archiving_client_handoff.md`](docs/archiving_client_handoff.md).
+
 ## Data model
 
 ### `projects`
@@ -600,6 +662,7 @@ never reach this gate. Tools with no category (e.g. `WebFetch`) always prompt.
 | `path`       | TEXT UQ   | Absolute working directory, normalised; how the HTTP API addresses a project |
 | `name`       | TEXT      | Display label; defaults to the path's last segment but may differ |
 | `created_at` | TEXT      | ISO 8601 (UTC, `Z`)                                          |
+| `archived_at`| TEXT      | ISO 8601, or `NULL` when live — see [Archiving](#archiving)  |
 
 Sessions join to a project on `sessions.project_id = projects.id`, a real
 foreign key (`ON DELETE CASCADE`). Identity is the id rather than the path
@@ -638,6 +701,8 @@ if you need the current branch.
 | `status`            | TEXT    | `idle` \| `running` \| `awaiting_approval`                  |
 | `created_at`        | TEXT    | ISO 8601 (UTC, `Z`)                                         |
 | `last_active_at`    | TEXT    | ISO 8601, bumped on each turn                               |
+| `archived_at`       | TEXT    | ISO 8601, or `NULL` when live — see [Archiving](#archiving) |
+| `archived_with_project` | INTEGER | `0`/`1` — archived by the project's cascade rather than on its own account; internal, never exposed by the API |
 | `auto_approve_write`   | INTEGER | `0`/`1` — auto-approve write/edit tools (default `0`)    |
 | `auto_approve_command` | INTEGER | `0`/`1` — auto-approve shell commands (default `0`)      |
 
@@ -698,6 +763,12 @@ was already running in. Both dropped columns were expressing something the new
 schema says structurally — the cwd is derived from the links, and "we created
 this directory" is a `worktrees` row existing. Session ids are preserved here,
 so unlike v3 this leaves `scrollback` untouched.
+
+The archiving columns are added by plain `ALTER TABLE` on open, for any database
+that does not have them yet. They run *after* every rebuild above rather than
+before: archiving postdates all of them, and each one copies an explicit column
+list into a fresh table, so columns added first would only be dropped again by
+whichever rebuild still had to run.
 
 ### In-memory state
 

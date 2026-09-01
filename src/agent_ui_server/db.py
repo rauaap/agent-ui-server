@@ -35,7 +35,7 @@ _SESSION_QUERY = """
     SELECT s.id, s.name, s.project_id, s.worktree_id,
            COALESCE(w.path, p.path) AS working_dir,
            s.agent, s.agent_session_id, s.status,
-           s.created_at, s.last_active_at,
+           s.created_at, s.last_active_at, s.archived_at,
            s.auto_approve_write, s.auto_approve_command
     FROM sessions s
     JOIN projects p ON p.id = s.project_id
@@ -43,6 +43,23 @@ _SESSION_QUERY = """
     {where}
     ORDER BY s.last_active_at DESC, s.created_at DESC
 """
+
+# Columns added after the table rebuilds, by ALTER rather than in the CREATE, so
+# an older database picks them up on open. `archived_at` is the archive flag on
+# both tables — NULL means live, a timestamp means filed away, and keeping the
+# time rather than a bool lets the archive view sort by when things went in.
+#
+# `archived_with_project` is bookkeeping the API never exposes: archiving a
+# project cascades to its sessions, and this records which sessions went along
+# for the ride so unarchiving the project can restore exactly those and leave
+# the ones archived on their own account alone.
+_ARCHIVE_COLUMNS = {
+    "projects": {"archived_at": "TEXT"},
+    "sessions": {
+        "archived_at": "TEXT",
+        "archived_with_project": "INTEGER NOT NULL DEFAULT 0",
+    },
+}
 
 
 def utc_now() -> str:
@@ -82,7 +99,8 @@ class Database:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     path TEXT NOT NULL UNIQUE,
                     name TEXT NOT NULL,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    archived_at TEXT
                 )
                 """
             )
@@ -117,6 +135,8 @@ class Database:
                     status TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     last_active_at TEXT NOT NULL,
+                    archived_at TEXT,
+                    archived_with_project INTEGER NOT NULL DEFAULT 0,
                     auto_approve_write INTEGER NOT NULL DEFAULT 0,
                     auto_approve_command INTEGER NOT NULL DEFAULT 0
                 )
@@ -182,6 +202,27 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_scrollback_session_id_id "
                 "ON scrollback(session_id, id)"
             )
+            # Archiving postdates every rebuild above, and each of them copies
+            # an explicit column list into a fresh table — so these have to be
+            # added here rather than in the CREATE, or a database going through
+            # a rebuild on this same open would have them dropped again.
+            for table, columns in _ARCHIVE_COLUMNS.items():
+                self._add_missing_columns(table, columns)
+
+    def _add_missing_columns(self, table: str, columns: dict[str, str]) -> None:
+        """ALTER in any of `columns` the table does not already have.
+
+        Caller holds the lock and the transaction. Both column names and
+        declarations are module constants, never user input.
+        """
+        existing = {
+            row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})")
+        }
+        for column, declaration in columns.items():
+            if column not in existing:
+                self._conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+                )
 
     def _migrate_v2(self) -> None:
         """Rebuild `projects` and `sessions` around a real foreign key.
@@ -653,14 +694,24 @@ class Database:
     # A project row plus the aggregates its card shows. The LEFT JOIN keeps
     # projects with no sessions, which report 0 / NULL. SQLite sorts NULL below
     # everything, so DESC already puts never-used projects last.
+    #
+    # The FILTERs keep `session_count` and `last_active_at` about the sessions
+    # the main list actually shows, so a project cannot claim five sessions
+    # while displaying none. `archived_session_count` is what the archive view
+    # shows instead; COUNT over the FK ignores the all-NULL row a project with
+    # no sessions contributes, so both counts are 0 there rather than 1.
     _PROJECT_QUERY = """
-        SELECT p.id, p.path, p.name,
-               COUNT(s.id) AS session_count,
-               MAX(s.last_active_at) AS last_active_at
+        SELECT p.id, p.path, p.name, p.archived_at,
+               COUNT(s.id) FILTER (WHERE s.archived_at IS NULL)
+                   AS session_count,
+               COUNT(s.id) FILTER (WHERE s.archived_at IS NOT NULL)
+                   AS archived_session_count,
+               MAX(s.last_active_at) FILTER (WHERE s.archived_at IS NULL)
+                   AS last_active_at
         FROM projects p
         LEFT JOIN sessions s ON s.project_id = p.id
         {where}
-        GROUP BY p.id, p.path, p.name
+        GROUP BY p.id, p.path, p.name, p.archived_at
         ORDER BY last_active_at DESC, p.path ASC
     """
 
@@ -904,6 +955,106 @@ class Database:
         if cursor.rowcount == 0:
             raise KeyError(f"Unknown session: {session_id}")
         return self.require_session(session_id)
+
+    def set_session_archived(
+        self, session_id: int, archived: bool
+    ) -> dict[str, Any]:
+        """Archive or unarchive one session on its own account.
+
+        Either way `archived_with_project` is cleared: a session archived by
+        hand is not the project's to restore, and one being unarchived has
+        nothing left to restore. Archiving an already-archived session keeps
+        the original timestamp, so re-filing does not reorder the archive.
+        """
+        with self._lock, self._conn:
+            if archived:
+                cursor = self._conn.execute(
+                    """
+                    UPDATE sessions
+                    SET archived_at = COALESCE(archived_at, ?),
+                        archived_with_project = 0
+                    WHERE id = ?
+                    """,
+                    (utc_now(), session_id),
+                )
+            else:
+                cursor = self._conn.execute(
+                    """
+                    UPDATE sessions
+                    SET archived_at = NULL, archived_with_project = 0
+                    WHERE id = ?
+                    """,
+                    (session_id,),
+                )
+        if cursor.rowcount == 0:
+            raise KeyError(f"Unknown session: {session_id}")
+        return self.require_session(session_id)
+
+    def archive_project(self, project_id: int) -> int:
+        """Archive a project and every live session under it.
+
+        The cascade is the point: an archived project must not leave sessions
+        showing in the main list. Sessions already archived keep their own
+        timestamp and are not marked as the project's, so unarchiving the
+        project later does not drag them back out. Returns how many sessions
+        the cascade actually touched.
+        """
+        now = utc_now()
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                "UPDATE projects SET archived_at = COALESCE(archived_at, ?) "
+                "WHERE id = ?",
+                (now, project_id),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Unknown project: {project_id}")
+            cascaded = self._conn.execute(
+                """
+                UPDATE sessions
+                SET archived_at = ?, archived_with_project = 1
+                WHERE project_id = ? AND archived_at IS NULL
+                """,
+                (now, project_id),
+            )
+        return cascaded.rowcount
+
+    def unarchive_project(
+        self, project_id: int, *, restore_sessions: bool = True
+    ) -> int:
+        """Bring a project back, optionally restoring what its archive took.
+
+        With `restore_sessions` the sessions the cascade archived come back
+        too — otherwise unarchiving a project would resurface it looking empty,
+        with its whole history apparently gone. Sessions archived on their own
+        account stay archived either way.
+
+        `restore_sessions=False` is the path for a single session being
+        unarchived: that session alone should reappear, but the project has to
+        come with it or it would have nowhere to show. Every session still
+        loses its `archived_with_project` mark, because this project archive is
+        over and a later one must not claim sessions it never archived.
+
+        Returns how many sessions were restored.
+        """
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                "UPDATE projects SET archived_at = NULL WHERE id = ?",
+                (project_id,),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Unknown project: {project_id}")
+            # Both branches clear the mark; only one clears `archived_at`.
+            assignment = (
+                "archived_at = NULL, archived_with_project = 0"
+                if restore_sessions
+                else "archived_with_project = 0"
+            )
+            marked = self._conn.execute(
+                f"UPDATE sessions SET {assignment} "
+                f"WHERE project_id = ? AND archived_with_project = 1",
+                (project_id,),
+            ).rowcount
+        return marked if restore_sessions else 0
 
     def touch_session(self, session_id: int) -> None:
         with self._lock, self._conn:

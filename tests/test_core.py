@@ -282,6 +282,183 @@ class ProjectTableTests(unittest.TestCase):
             database.close()
 
 
+class ArchiveTableTests(unittest.TestCase):
+    """Archiving at the storage layer: the flag, the cascade, and the counts."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.database = Database(Path(self._tmp.name) / "sessions.db")
+        self.project = self.database.create_project("/p/demo", "demo")
+
+    def tearDown(self) -> None:
+        self.database.close()
+        self._tmp.cleanup()
+
+    def add_session(self, name: str) -> dict[str, Any]:
+        return self.database.create_session(
+            name=name,
+            project_id=self.project["id"],
+            agent="claude-code",
+        )
+
+    def archived_at(self, session_id: int) -> str | None:
+        return self.database.require_session(session_id)["archived_at"]
+
+    def test_new_rows_are_live(self) -> None:
+        session = self.add_session("one")
+        self.assertIsNone(session["archived_at"])
+        self.assertIsNone(self.database.get_project("/p/demo")["archived_at"])
+
+    def test_archiving_a_session_is_reversible(self) -> None:
+        session = self.add_session("one")
+
+        archived = self.database.set_session_archived(session["id"], True)
+        self.assertIsNotNone(archived["archived_at"])
+
+        live = self.database.set_session_archived(session["id"], False)
+        self.assertIsNone(live["archived_at"])
+
+    def test_rearchiving_keeps_the_original_timestamp(self) -> None:
+        # Otherwise a no-op re-archive would jump the session to the top of an
+        # archive sorted by when things went in.
+        session = self.add_session("one")
+        first = self.database.set_session_archived(session["id"], True)
+        second = self.database.set_session_archived(session["id"], True)
+        self.assertEqual(second["archived_at"], first["archived_at"])
+
+    def test_unknown_ids_raise(self) -> None:
+        with self.assertRaises(KeyError):
+            self.database.set_session_archived(9999, True)
+        with self.assertRaises(KeyError):
+            self.database.archive_project(9999)
+        with self.assertRaises(KeyError):
+            self.database.unarchive_project(9999)
+
+    def test_archiving_a_project_cascades_to_its_sessions(self) -> None:
+        one, two = self.add_session("one"), self.add_session("two")
+
+        cascaded = self.database.archive_project(self.project["id"])
+
+        self.assertEqual(cascaded, 2)
+        project = self.database.get_project("/p/demo")
+        self.assertIsNotNone(project["archived_at"])
+        self.assertIsNotNone(self.archived_at(one["id"]))
+        self.assertIsNotNone(self.archived_at(two["id"]))
+
+    def test_unarchiving_a_project_restores_what_it_swept_up(self) -> None:
+        one, two = self.add_session("one"), self.add_session("two")
+        self.database.archive_project(self.project["id"])
+
+        restored = self.database.unarchive_project(self.project["id"])
+
+        self.assertEqual(restored, 2)
+        self.assertIsNone(self.database.get_project("/p/demo")["archived_at"])
+        self.assertIsNone(self.archived_at(one["id"]))
+        self.assertIsNone(self.archived_at(two["id"]))
+
+    def test_individually_archived_sessions_survive_the_round_trip(self) -> None:
+        # The whole reason the cascade is tracked: a session the user filed away
+        # on its own must not come back just because the project did.
+        one, two = self.add_session("one"), self.add_session("two")
+        filed = self.database.set_session_archived(one["id"], True)["archived_at"]
+
+        self.assertEqual(self.database.archive_project(self.project["id"]), 1)
+        self.assertEqual(self.archived_at(one["id"]), filed)
+
+        self.assertEqual(self.database.unarchive_project(self.project["id"]), 1)
+        self.assertEqual(self.archived_at(one["id"]), filed)
+        self.assertIsNone(self.archived_at(two["id"]))
+
+    def test_restore_can_be_declined_and_still_drops_the_mark(self) -> None:
+        # The path a single session's unarchive takes: the project comes back so
+        # that session has somewhere to show, but nothing else does — and a
+        # later project archive must not claim to have archived the leftovers.
+        one, two = self.add_session("one"), self.add_session("two")
+        self.database.archive_project(self.project["id"])
+        self.database.set_session_archived(one["id"], False)
+
+        self.assertEqual(
+            self.database.unarchive_project(
+                self.project["id"], restore_sessions=False
+            ),
+            0,
+        )
+        self.assertIsNone(self.archived_at(one["id"]))
+        self.assertIsNotNone(self.archived_at(two["id"]))
+
+        # Re-archiving and unarchiving now leaves `two` where the user left it.
+        self.assertEqual(self.database.archive_project(self.project["id"]), 1)
+        self.assertEqual(self.database.unarchive_project(self.project["id"]), 1)
+        self.assertIsNone(self.archived_at(one["id"]))
+        self.assertIsNotNone(self.archived_at(two["id"]))
+
+    def test_counts_split_live_from_archived(self) -> None:
+        one = self.add_session("one")
+        self.add_session("two")
+        empty = self.database.create_project("/p/empty", "empty")
+
+        self.database.set_session_archived(one["id"], True)
+
+        project = self.database.get_project("/p/demo")
+        self.assertEqual(project["session_count"], 1)
+        self.assertEqual(project["archived_session_count"], 1)
+
+        # A project with no sessions at all must report zero on both, not the
+        # single all-NULL row the LEFT JOIN gives it.
+        blank = self.database.get_project_by_id(empty["id"])
+        self.assertEqual(blank["session_count"], 0)
+        self.assertEqual(blank["archived_session_count"], 0)
+
+    def test_last_active_at_ignores_archived_sessions(self) -> None:
+        stamps = iter(["2026-07-27T10:00:00Z", "2026-07-28T10:00:00Z"])
+        original = db_module.utc_now
+        db_module.utc_now = lambda: next(stamps)
+        try:
+            self.add_session("old")
+            recent = self.add_session("recent")
+        finally:
+            db_module.utc_now = original
+
+        self.assertEqual(
+            self.database.get_project("/p/demo")["last_active_at"],
+            "2026-07-28T10:00:00Z",
+        )
+
+        self.database.set_session_archived(recent["id"], True)
+        self.assertEqual(
+            self.database.get_project("/p/demo")["last_active_at"],
+            "2026-07-27T10:00:00Z",
+        )
+
+    def test_archived_sessions_still_list(self) -> None:
+        # Storage hands back everything; deciding what to show is the client's.
+        session = self.add_session("one")
+        self.database.set_session_archived(session["id"], True)
+
+        self.assertEqual([s["id"] for s in self.database.list_sessions()],
+                         [session["id"]])
+        self.assertEqual(
+            [s["id"] for s in
+             self.database.list_sessions_for_project(self.project["id"])],
+            [session["id"]],
+        )
+        self.assertEqual(
+            [p["path"] for p in self.database.list_projects()], ["/p/demo"]
+        )
+
+    def test_archive_state_survives_reopening(self) -> None:
+        session = self.add_session("one")
+        self.database.archive_project(self.project["id"])
+        path = self.database.path
+        self.database.close()
+
+        self.database = Database(path)
+        self.assertIsNotNone(self.database.get_project("/p/demo")["archived_at"])
+        self.assertIsNotNone(self.archived_at(session["id"]))
+        # And the cascade mark survived too, so the round trip still works.
+        self.assertEqual(self.database.unarchive_project(self.project["id"]), 1)
+
+
 class MigrationTests(unittest.TestCase):
     """Opening a pre-worktree database rebuilds it around a real foreign key."""
 
@@ -792,6 +969,63 @@ class MigrationTests(unittest.TestCase):
             # AUTOINCREMENT, not a bare rowid: a client holding the deleted
             # session's URL must not land on its replacement.
             self.assertNotEqual(second["id"], first["id"])
+    def test_legacy_database_gains_the_archive_columns(self) -> None:
+        # Every rebuild recreates its tables in the pre-archive shape, so the
+        # archive columns have to be added after them rather than before.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sessions.db"
+            self.build_legacy(
+                path,
+                projects=[("/p/demo", "demo")],
+                sessions=[("s1", "one", "/p/demo")],
+            )
+
+            database = Database(path)
+
+            migrated = self.sessions_by_name(database)["one"]
+            self.assertIsNone(migrated["archived_at"])
+            project = database.get_project("/p/demo")
+            self.assertIsNone(project["archived_at"])
+            self.assertEqual(project["session_count"], 1)
+            self.assertEqual(project["archived_session_count"], 0)
+
+            # And the migrated rows are fully usable, cascade mark included.
+            self.assertEqual(database.archive_project(project["id"]), 1)
+            self.assertEqual(database.unarchive_project(project["id"]), 1)
+            self.assertIsNone(database.get_session(migrated["id"])["archived_at"])
+            database.close()
+
+    def test_pre_archive_database_is_upgraded_in_place(self) -> None:
+        # Already through every rebuild, so nothing but the new columns is
+        # missing: the ALTERs must run without triggering another rebuild.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sessions.db"
+            database = Database(path)
+            project = database.create_project("/p/demo", "demo")
+            session = database.create_session(
+                name="one",
+                project_id=project["id"],
+                agent="claude-code",
+            )
+            database.close()
+
+            conn = sqlite3.connect(path)
+            with conn:
+                for table, column in (
+                    ("projects", "archived_at"),
+                    ("sessions", "archived_at"),
+                    ("sessions", "archived_with_project"),
+                ):
+                    conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+            conn.close()
+
+            database = Database(path)
+
+            self.assertIsNone(database.get_session(session["id"])["archived_at"])
+            self.assertEqual(
+                database.get_project("/p/demo")["archived_session_count"], 0
+            )
+            self.assertEqual(database.archive_project(project["id"]), 1)
             database.close()
 
 
@@ -1558,6 +1792,224 @@ class TeardownWorktreeTests(SessionEndpointTestCase):
             self.assertIsNone(self.database.get_session(session["id"]))
 
 
+class ArchiveEndpointTests(SessionEndpointTestCase):
+    """The HTTP contract: what archiving refuses, cascades, and announces."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.events: list[dict[str, Any]] = []
+        self._original_broadcast = self.main.broadcast
+
+        async def fake_broadcast(session_id: int, message: dict[str, Any]) -> None:
+            self.events.append({"session_id": session_id, **message})
+
+        self.main.broadcast = fake_broadcast
+
+    def tearDown(self) -> None:
+        self.main.broadcast = self._original_broadcast
+        self.main.bash_tasks.clear()
+        super().tearDown()
+
+    async def set_archived(self, session_id: int, archived: bool) -> dict[str, Any]:
+        return await self.main.update_session(
+            session_id, self.main.UpdateSessionRequest(archived=archived)
+        )
+
+    async def set_project_archived(
+        self, path: str, archived: bool
+    ) -> dict[str, Any]:
+        return await self.main.update_project(
+            self.main.UpdateProjectRequest(path=path, archived=archived)
+        )
+
+    async def test_archiving_a_session_flags_it_and_tells_its_clients(self) -> None:
+        project = self.make_project(repo=False)
+        session = await self.create(name="one", project_path=project["path"])
+
+        archived = await self.set_archived(session["id"], True)
+
+        self.assertIsNotNone(archived["archived_at"])
+        self.assertEqual(
+            self.events,
+            [
+                {
+                    "session_id": session["id"],
+                    "type": "archived",
+                    "archived_at": archived["archived_at"],
+                }
+            ],
+        )
+
+    async def test_archiving_a_running_session_is_refused(self) -> None:
+        project = self.make_project(repo=False)
+        session = await self.create(name="one", project_path=project["path"])
+        self.database.update_status(session["id"], "running")
+
+        with self.assertRaises(HTTPException) as caught:
+            await self.set_archived(session["id"], True)
+
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertIsNone(
+            self.database.require_session(session["id"])["archived_at"]
+        )
+
+    async def test_archiving_a_session_running_a_command_is_refused(self) -> None:
+        # Bash mode sits outside the turn state machine, so `status` alone would
+        # call this session idle while a command is still running in it.
+        project = self.make_project(repo=False)
+        session = await self.create(name="one", project_path=project["path"])
+
+        async def never() -> None:
+            await asyncio.Event().wait()
+
+        task = asyncio.create_task(never())
+        self.main.bash_tasks[session["id"]] = task
+        try:
+            with self.assertRaises(HTTPException) as caught:
+                await self.set_archived(session["id"], True)
+            self.assertEqual(caught.exception.status_code, 409)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_unarchiving_a_session_brings_its_project_back_alone(self) -> None:
+        project = self.make_project(repo=False)
+        one = await self.create(name="one", project_path=project["path"])
+        two = await self.create(name="two", project_path=project["path"])
+        await self.set_project_archived(project["path"], True)
+
+        await self.set_archived(one["id"], False)
+
+        self.assertIsNone(self.database.get_project(project["path"])["archived_at"])
+        self.assertIsNone(self.database.require_session(one["id"])["archived_at"])
+        # Only the session the user asked for comes back.
+        self.assertIsNotNone(
+            self.database.require_session(two["id"])["archived_at"]
+        )
+
+    async def test_archiving_a_project_cascades_and_reports(self) -> None:
+        project = self.make_project(repo=False)
+        one = await self.create(name="one", project_path=project["path"])
+        two = await self.create(name="two", project_path=project["path"])
+
+        result = await self.set_project_archived(project["path"], True)
+
+        self.assertEqual(result["sessions_affected"], 2)
+        self.assertIsNotNone(result["archived_at"])
+        self.assertEqual(result["session_count"], 0)
+        self.assertEqual(result["archived_session_count"], 2)
+        for session in (one, two):
+            self.assertIsNotNone(
+                self.database.require_session(session["id"])["archived_at"]
+            )
+
+    async def test_archiving_a_project_with_a_busy_session_writes_nothing(self) -> None:
+        project = self.make_project(repo=False)
+        one = await self.create(name="one", project_path=project["path"])
+        busy = await self.create(name="busy", project_path=project["path"])
+        self.database.update_status(busy["id"], "awaiting_approval")
+
+        with self.assertRaises(HTTPException) as caught:
+            await self.set_project_archived(project["path"], True)
+
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertIn("busy", caught.exception.detail)
+        # Refused wholesale: the idle session must not be archived either.
+        self.assertIsNone(self.database.get_project(project["path"])["archived_at"])
+        self.assertIsNone(self.database.require_session(one["id"])["archived_at"])
+
+    async def test_unarchiving_a_project_restores_the_round_trip(self) -> None:
+        project = self.make_project(repo=False)
+        one = await self.create(name="one", project_path=project["path"])
+        two = await self.create(name="two", project_path=project["path"])
+        filed = (await self.set_archived(two["id"], True))["archived_at"]
+        await self.set_project_archived(project["path"], True)
+
+        result = await self.set_project_archived(project["path"], False)
+
+        self.assertEqual(result["sessions_affected"], 1)
+        self.assertIsNone(result["archived_at"])
+        self.assertIsNone(self.database.require_session(one["id"])["archived_at"])
+        # The one archived by hand beforehand stays exactly where it was.
+        self.assertEqual(
+            self.database.require_session(two["id"])["archived_at"], filed
+        )
+
+    async def test_unknown_project_is_404(self) -> None:
+        with self.assertRaises(HTTPException) as caught:
+            await self.set_project_archived(str(self.tmpdir / "nope"), True)
+        self.assertEqual(caught.exception.status_code, 404)
+
+    async def test_no_new_work_in_an_archived_project_or_session(self) -> None:
+        project = self.make_project(repo=False)
+        session = await self.create(name="one", project_path=project["path"])
+        await self.set_project_archived(project["path"], True)
+
+        for coroutine in (
+            self.create(name="two", project_path=project["path"]),
+            self.main.begin_turn(session["id"], "hello"),
+            self.main.begin_bash(session["id"], "echo hi"),
+        ):
+            with self.assertRaises(HTTPException) as caught:
+                await coroutine
+            self.assertEqual(caught.exception.status_code, 409)
+
+        self.assertEqual(len(self.database.list_sessions()), 1)
+        self.assertEqual(self.database.recent_scrollback(session["id"]), [])
+
+    async def test_no_new_worktree_in_an_archived_project(self) -> None:
+        # Worktrees are created through their own endpoint, so the guard on
+        # session creation does not cover them; without this one, an archived
+        # project could still have a branch and a directory cut for it.
+        project = self.make_project()
+        await self.set_project_archived(project["path"], True)
+
+        with self.assertRaises(HTTPException) as caught:
+            await self.create_worktree(
+                project_path=project["path"],
+                path=str(self.tmpdir / "wt"),
+                branch="fix",
+            )
+
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertEqual(self.database.list_worktrees(), [])
+        self.assertFalse((self.tmpdir / "wt").exists())
+
+    async def test_archived_sessions_can_still_be_read_renamed_and_deleted(self) -> None:
+        # Archived is read-only, not sealed: the point is keeping old sessions
+        # around, so their scrollback and their housekeeping must still work.
+        project = self.make_project(repo=False)
+        session = await self.create(name="one", project_path=project["path"])
+        self.database.append_scrollback(session["id"], "input", {"text": "hello"})
+        await self.set_archived(session["id"], True)
+
+        renamed = await self.main.update_session(
+            session["id"], self.main.UpdateSessionRequest(name="filed away")
+        )
+        self.assertEqual(renamed["name"], "filed away")
+        self.assertIsNotNone(renamed["archived_at"])
+        self.assertEqual(
+            [row["payload"] for row in
+             self.database.recent_scrollback(session["id"])],
+            [{"text": "hello"}],
+        )
+
+        result = await self.main.delete_session(session["id"])
+        self.assertEqual(result["status"], "deleted")
+        self.assertIsNone(self.database.get_session(session["id"]))
+
+    async def test_deleting_a_project_still_takes_archived_sessions(self) -> None:
+        project = self.make_project(repo=False)
+        await self.create(name="one", project_path=project["path"])
+        await self.set_project_archived(project["path"], True)
+
+        result = await self.main.delete_project(
+            self.main.DeleteProjectRequest(path=project["path"])
+        )
+
+        self.assertEqual(result["sessions_deleted"], 1)
+        self.assertEqual(self.database.list_sessions(), [])
+        self.assertEqual(self.database.list_projects(), [])
 
 
 class DeleteProjectTests(unittest.IsolatedAsyncioTestCase):
