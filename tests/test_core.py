@@ -1812,6 +1812,20 @@ class OpenCodeAdapterParsingTests(unittest.TestCase):
     def setUp(self) -> None:
         self.adapter = OpenCodeAdapter(executable="opencode")
 
+    def test_bundled_permission_config_does_not_override_model(self) -> None:
+        config = json.loads(Path(OpenCodeAdapter.DEFAULT_CONFIG).read_text())
+
+        self.assertNotIn("model", config)
+        self.assertEqual(
+            config["permission"],
+            {
+                "bash": "ask",
+                "edit": "ask",
+                "write": "ask",
+                "webfetch": "ask",
+            },
+        )
+
     def test_message_chunk_classified_as_text(self) -> None:
         self.assertEqual(
             self.adapter._classify_update(
