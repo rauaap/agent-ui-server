@@ -1640,6 +1640,43 @@ class DeleteProjectTests(unittest.IsolatedAsyncioTestCase):
             database.close()
 
 
+class ListAgentsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_lists_every_registered_adapter(self) -> None:
+        from agent_ui_server import main
+
+        agents = await main.list_agents()
+
+        # The point of the endpoint: what it advertises is exactly what
+        # POST /sessions accepts, so adding an adapter cannot leave the two
+        # out of step.
+        self.assertEqual(
+            [agent["id"] for agent in agents], list(main.adapters.keys())
+        )
+
+    async def test_marks_exactly_the_creation_default(self) -> None:
+        from agent_ui_server import main
+
+        agents = await main.list_agents()
+        defaults = [agent["id"] for agent in agents if agent["default"]]
+
+        self.assertEqual(
+            defaults, [main.CreateSessionRequest.model_fields["agent"].default]
+        )
+
+    async def test_every_adapter_carries_a_label(self) -> None:
+        from agent_ui_server import main
+
+        agents = await main.list_agents()
+
+        for agent in agents:
+            with self.subTest(agent=agent["id"]):
+                self.assertTrue(
+                    type(main.adapters[agent["id"]]).LABEL,
+                    "adapter is missing a LABEL, so the picker would show its id",
+                )
+                self.assertEqual(agent["name"], type(main.adapters[agent["id"]]).LABEL)
+
+
 class ClaudeCodeAdapterParsingTests(unittest.TestCase):
     def setUp(self) -> None:
         self.adapter = ClaudeCodeAdapter(executable="claude")

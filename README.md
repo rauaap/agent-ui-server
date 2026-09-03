@@ -202,6 +202,7 @@ and access is still "you are on the WireGuard network or you are not."
 
 | Method   | Path                    | Description                                                       |
 |----------|-------------------------|------------------------------------------------------------------|
+| `GET`    | `/agents`               | List the agents this server can run, for a client's agent picker |
 | `GET`    | `/projects`             | List projects (working directories) with session aggregates      |
 | `POST`   | `/projects`             | Create a project: `mkdir -p` + row (`path`, `name`) → `201`      |
 | `DELETE` | `/projects`             | Forget a project and its sessions (`path`); disk untouched       |
@@ -221,8 +222,8 @@ already exists — a session belongs to a project by foreign key, so an
 unregistered path is a `404`; create the project first. (`working_dir` is still
 accepted as a deprecated alias for `project_path`, for clients written before
 the rename.) The directory is created (`mkdir -p`) if missing. `agent` is one of
-the registered adapters — `"claude-code"` (the default), `"opencode"`, or
-`"pi"`. The
+the registered adapters, which `GET /agents` lists — `"claude-code"` (the
+default), `"opencode"`, or `"pi"`. The
 optional `worktree_id` attaches the session to one of the project's worktrees,
 which it runs in instead; see [Worktrees](#worktrees). Starting a turn on a
 session that is not `idle` returns `409`.
@@ -233,6 +234,23 @@ renames the session and broadcasts a `renamed` event. `auto_approve_write` and
 `auto_approve_command` are booleans that flip the per-session auto-approval
 toggles (see [Auto-approval](#auto-approval)) and broadcast a `settings` event.
 Both broadcasts reach all WebSocket subscribers so connected clients update live.
+
+#### `GET /agents`
+
+```json
+[
+  { "id": "claude-code", "name": "Claude Code", "default": true },
+  { "id": "opencode",    "name": "OpenCode",    "default": false },
+  { "id": "pi",          "name": "pi",          "default": false }
+]
+```
+
+Everything a client needs to render an agent picker: the `id` to send back as
+`agent`, a `name` to show, and which one to preselect. Both fields are derived
+rather than restated — the label from the adapter class, the default from the
+same model that validates `POST /sessions` — so the list cannot advertise an
+agent the server would reject, or miss one it would accept. The order is the
+order adapters are registered in.
 
 #### Projects
 

@@ -165,6 +165,11 @@ STREAM_LIMIT = 64 * 1024 * 1024  # 64 MiB
 
 
 class AgentAdapter(abc.ABC):
+    # Human-readable name for an agent picker, surfaced by `GET /agents`. It
+    # lives on the adapter so the id, the label and the implementation cannot
+    # drift apart; the endpoint falls back to the id if a subclass omits it.
+    LABEL = ""
+
     @abc.abstractmethod
     async def start_turn(
         self,
@@ -206,6 +211,8 @@ class AgentAdapter(abc.ABC):
 
 
 class ClaudeCodeAdapter(AgentAdapter):
+    LABEL = "Claude Code"
+
     # Claude Code's stdio permission protocol does not advertise a list of
     # choices: its decision is allow (with updatedInput) or deny (with a
     # message). We surface the two it supports as multiple-choice options so the
@@ -723,6 +730,8 @@ class OpenCodeAdapter(AgentAdapter):
     default that gates the mutating/external tools), unless the operator has
     already set `OPENCODE_CONFIG` themselves.
     """
+
+    LABEL = "OpenCode"
 
     PROTOCOL_VERSION = 1
     # Tools that should prompt for approval; everything else stays "allow".
@@ -1246,6 +1255,8 @@ class PiAdapter(AgentAdapter):
     Neither call has a field for structured data, so the extension JSON-encodes
     what we need into `title`; `_envelope` unpacks it.
     """
+
+    LABEL = "pi"
 
     # Envelope contract with pi_extension.ts. Bump both in step.
     MARKER = "agent-ui"
