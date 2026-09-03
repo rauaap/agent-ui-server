@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
 import tempfile
@@ -18,7 +19,9 @@ from agent_ui_server.agent import (
     ApprovalDecision,
     ClaudeCodeAdapter,
     OpenCodeAdapter,
+    PiAdapter,
     _event_options,
+    _normalize_questions,
     _option_behavior,
     _resolve_decision,
 )
@@ -1744,19 +1747,17 @@ class ClaudeCodeAdapterParsingTests(unittest.TestCase):
         self.assertEqual(session_id, "abc123")
 
     def test_normalize_questions_extracts_fields_with_defaults(self) -> None:
-        questions = self.adapter._normalize_questions(
-            {
-                "questions": [
-                    {
-                        "question": "Which emoji do you want?",
-                        "header": "Emoji",
-                        "options": [
-                            {"label": "Cat", "description": "The cat emoji"},
-                            {"label": "Rocket"},
-                        ],
-                    }
-                ]
-            }
+        questions = _normalize_questions(
+            [
+                {
+                    "question": "Which emoji do you want?",
+                    "header": "Emoji",
+                    "options": [
+                        {"label": "Cat", "description": "The cat emoji"},
+                        {"label": "Rocket"},
+                    ],
+                }
+            ]
         )
 
         self.assertEqual(
@@ -1775,7 +1776,7 @@ class ClaudeCodeAdapterParsingTests(unittest.TestCase):
         )
 
     def test_normalize_questions_defaults_to_empty(self) -> None:
-        self.assertEqual(self.adapter._normalize_questions({}), [])
+        self.assertEqual(_normalize_questions(None), [])
 
     def test_assistant_events_omit_askuserquestion_tool_use(self) -> None:
         events = self.adapter._assistant_events(
@@ -1906,6 +1907,228 @@ class OpenCodeAdapterParsingTests(unittest.TestCase):
         self.assertEqual(
             prompt, "I denied your request to run the bash tool. No shell please."
         )
+
+
+class PiAdapterParsingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.adapter = PiAdapter(executable="pi")
+
+    def test_bundled_extension_ships_with_the_package(self) -> None:
+        path = Path(PiAdapter.DEFAULT_EXTENSION)
+        self.assertTrue(path.exists(), f"{path} is missing")
+        source = path.read_text()
+        # The two features the adapter's whole protocol depends on.
+        self.assertIn('pi.on("tool_call"', source)
+        self.assertIn("registerTool", source)
+
+    def test_envelope_accepts_our_marker(self) -> None:
+        title = json.dumps(
+            {"agent-ui": 1, "kind": "approval", "toolCallId": "c1", "toolName": "bash"}
+        )
+        self.assertEqual(
+            self.adapter._envelope(title),
+            {"agent-ui": 1, "kind": "approval", "toolCallId": "c1", "toolName": "bash"},
+        )
+
+    def test_envelope_rejects_foreign_dialogs(self) -> None:
+        # A human-readable title from some other extension, a wrong protocol
+        # version, and malformed JSON must all read as "not ours".
+        self.assertIsNone(self.adapter._envelope("Allow dangerous command?"))
+        self.assertIsNone(self.adapter._envelope(json.dumps({"agent-ui": 99})))
+        self.assertIsNone(self.adapter._envelope('{"agent-ui":'))
+        self.assertIsNone(self.adapter._envelope(None))
+
+    def test_only_mutating_tools_map_to_a_category(self) -> None:
+        self.assertEqual(PiAdapter.TOOL_CATEGORIES["bash"], "command")
+        self.assertEqual(PiAdapter.TOOL_CATEGORIES["write"], "write")
+        self.assertNotIn("read", PiAdapter.TOOL_CATEGORIES)
+
+    def test_bundled_node_dir_prefers_a_node_beside_pi(self) -> None:
+        # pi's launcher is `#!/usr/bin/env node`, so PATH decides which Node it
+        # runs under; the adapter promotes the one shipped alongside it.
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = Path(tmp)
+            (bindir / "pi").write_text("#!/bin/sh\n")
+            (bindir / "pi").chmod(0o755)
+            adapter = PiAdapter(executable=str(bindir / "pi"))
+            self.assertIsNone(adapter._bundled_node_dir())
+
+            (bindir / "node").write_text("#!/bin/sh\n")
+            (bindir / "node").chmod(0o755)
+            self.assertEqual(adapter._bundled_node_dir(), str(bindir))
+            self.assertTrue(
+                adapter._build_env()["PATH"].startswith(str(bindir) + os.pathsep)
+            )
+
+
+class PiAdapterTurnTests(unittest.IsolatedAsyncioTestCase):
+    """Drive start_turn against a stub that speaks pi's RPC protocol."""
+
+    STUB = '''#!/usr/bin/env python3
+import json, sys
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\\n")
+    sys.stdout.flush()
+
+SCRIPT = json.loads(sys.argv[1])
+if SCRIPT.get("ready", True):
+    emit({"type": "extension_ui_request", "id": "d0", "method": "notify",
+          "notifyType": "info",
+          "message": json.dumps({"agent-ui": 1, "kind": "ready"})})
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    if msg.get("type") == "get_state":
+        emit({"id": msg.get("id"), "type": "response", "command": "get_state",
+              "success": True, "data": {"sessionId": "sess-abc"}})
+    elif msg.get("type") == "prompt":
+        for step in SCRIPT["steps"]:
+            emit(step)
+    elif msg.get("type") == "extension_ui_response":
+        for step in SCRIPT.get("on_response", {}).get(msg["id"], []):
+            emit(step)
+        SCRIPT.setdefault("answers", []).append(msg)
+        if len(SCRIPT["answers"]) >= SCRIPT.get("expect_answers", 1):
+            for step in SCRIPT.get("after_answers", []):
+                emit(step)
+'''
+
+    def _adapter(self, script: dict) -> PiAdapter:
+        stub = Path(self.tmp.name) / "pi"
+        stub.write_text(self.STUB)
+        stub.chmod(0o755)
+        adapter = PiAdapter(executable=str(stub))
+        adapter._script = json.dumps(script)  # type: ignore[attr-defined]
+
+        original = asyncio.create_subprocess_exec
+
+        async def spawn(*args, **kwargs):
+            # Replace pi's real flags with the stub's single argv slot.
+            return await original(args[0], adapter._script, **kwargs)
+
+        self.spawn = spawn
+        return adapter
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.session = {"id": 7, "working_dir": self.tmp.name, "agent_session_id": None}
+
+    async def _collect(self, adapter, answerer=None) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        import unittest.mock
+
+        with unittest.mock.patch(
+            "agent_ui_server.agent.asyncio.create_subprocess_exec", self.spawn
+        ):
+            async for event in adapter.start_turn(self.session, "go"):
+                events.append(event)
+                if answerer:
+                    task = answerer(adapter, event)
+                    if task:
+                        asyncio.create_task(task)
+        return events
+
+    async def test_approval_carries_input_captured_from_tool_execution_start(self):
+        adapter = self._adapter(
+            {
+                "steps": [
+                    {"type": "tool_execution_start", "toolCallId": "c1",
+                     "toolName": "bash", "args": {"command": "echo hi"}},
+                    {"type": "extension_ui_request", "id": "d1", "method": "select",
+                     "options": ["Allow", "Deny"],
+                     "title": json.dumps({"agent-ui": 1, "kind": "approval",
+                                          "toolCallId": "c1", "toolName": "bash"})},
+                ],
+                "after_answers": [
+                    {"type": "message_update",
+                     "assistantMessageEvent": {"type": "text_end", "content": "done!"}},
+                    {"type": "agent_settled"},
+                ],
+            }
+        )
+
+        def answerer(ad, event):
+            if event["type"] == "approval_request":
+                return ad.send_approval(self.session, event["request_id"], "allow")
+            return None
+
+        events = await self._collect(adapter, answerer)
+        by_type = {e["type"]: e for e in events}
+
+        self.assertEqual(
+            by_type["tool_use"], {"type": "tool_use", "tool": "bash",
+                                  "input": {"command": "echo hi"}}
+        )
+        approval = by_type["approval_request"]
+        # The dialog carries only an id; the arguments come from the
+        # tool_execution_start that precedes it.
+        self.assertEqual(approval["input"], {"command": "echo hi"})
+        self.assertEqual(approval["category"], "command")
+        self.assertEqual(by_type["output"]["text"], "done!")
+        self.assertEqual(by_type["done"]["session_id"], "sess-abc")
+
+    async def test_question_batch_becomes_one_event(self):
+        def dialog(index, header, label):
+            return {
+                "type": "extension_ui_request", "id": f"q{index}", "method": "select",
+                "options": [label, "Other"],
+                "title": json.dumps({
+                    "agent-ui": 1, "kind": "question", "toolCallId": "c9",
+                    "index": index, "count": 2,
+                    "question": {"question": f"Pick {header}?", "header": header,
+                                 "multiSelect": False,
+                                 "options": [{"label": label, "description": "d"},
+                                             {"label": "Other", "description": "d"}]},
+                }),
+            }
+
+        adapter = self._adapter(
+            {
+                "steps": [
+                    # The question tool must not also render a tool bubble.
+                    {"type": "tool_execution_start", "toolCallId": "c9",
+                     "toolName": "AskUserQuestion", "args": {"questions": []}},
+                    dialog(0, "Database", "Postgres"),
+                    dialog(1, "Client", "Fetch"),
+                ],
+                "expect_answers": 2,
+                "after_answers": [{"type": "agent_settled"}],
+            }
+        )
+
+        def answerer(ad, event):
+            if event["type"] == "question":
+                answers = {q["question"]: q["options"][0]["label"]
+                           for q in event["questions"]}
+                return ad.send_answer(self.session, event["request_id"], answers)
+            return None
+
+        events = await self._collect(adapter, answerer)
+        questions = [e for e in events if e["type"] == "question"]
+
+        self.assertEqual(len(questions), 1, "batch should surface as one event")
+        self.assertEqual(len(questions[0]["questions"]), 2)
+        self.assertEqual(
+            [q["header"] for q in questions[0]["questions"]], ["Database", "Client"]
+        )
+        self.assertFalse(
+            [e for e in events if e["type"] == "tool_use"],
+            "AskUserQuestion should not emit a tool_use bubble",
+        )
+
+    async def test_turn_refuses_to_run_without_the_extension_handshake(self):
+        adapter = self._adapter({"ready": False, "steps": [{"type": "agent_settled"}]})
+        adapter.HANDSHAKE_TIMEOUT = 1.0
+
+        events = await self._collect(adapter)
+
+        self.assertEqual([e["type"] for e in events], ["error"])
+        self.assertIn("without the agent-ui extension", events[0]["message"])
 
 
 class ApprovalDecisionHelperTests(unittest.TestCase):

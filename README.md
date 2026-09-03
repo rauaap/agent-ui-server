@@ -64,8 +64,9 @@ with the `session_id` captured from the previous turn's `result` event.
 agent-ui-server/
 ├── src/agent_ui_server/
 │   ├── main.py      # FastAPI app — REST routes, WebSocket endpoint, turn orchestration
-│   ├── agent.py     # AgentAdapter base + ClaudeCodeAdapter (stream-json) + OpenCodeAdapter (ACP)
+│   ├── agent.py     # AgentAdapter base + ClaudeCodeAdapter (stream-json) + OpenCodeAdapter (ACP) + PiAdapter (RPC)
 │   ├── opencode_permissions.json  # Default OpenCode permission config (gates tools to "ask")
+│   ├── pi_extension.ts            # Bundled pi extension — approval gate + AskUserQuestion
 │   ├── shell.py     # Bash mode — one-shot `bash -lc`, timeout + output caps
 │   ├── git.py       # Worktrees — `git` via argv, never through a shell
 │   └── db.py        # SQLite — session metadata + append-only scrollback
@@ -136,6 +137,7 @@ intend to use needs its own login:
 ```sh
 docker compose exec agent-ui-server claude login          # Claude Code
 docker compose exec agent-ui-server opencode auth login   # OpenCode
+docker compose exec agent-ui-server pi                     # pi (authenticate, then quit)
 ```
 
 Credentials are persisted on the `claude-auth` named volume (mounted at
@@ -147,7 +149,7 @@ docker volume rm <project>_claude-auth
 ```
 
 The container image is Fedora-based and ships `uv`, the Claude Code CLI, the
-OpenCode CLI, `git`, and a nested **Podman** stack (`privileged: true` + `/dev/fuse` +
+OpenCode CLI, the pi CLI, `git`, and a nested **Podman** stack (`privileged: true` + `/dev/fuse` +
 `fuse-overlayfs`) so agents can run containers inside their working directory.
 Host networking is used so the container sees the WireGuard interface directly.
 Project directories are bind-mounted at `/projects`; create projects with
@@ -169,6 +171,8 @@ host/port behavior is identical whether you use uv or Compose.
 | `CLAUDE_BIN`   | `claude`      | Path/name of the Claude Code executable          |
 | `OPENCODE_BIN` | `opencode`    | Path/name of the OpenCode executable             |
 | `OPENCODE_CONFIG` | bundled `opencode_permissions.json` | OpenCode config passed to the agent; sets which tools require approval |
+| `PI_BIN`       | `pi`          | Path/name of the pi executable                   |
+| `PI_EXTENSION` | bundled `pi_extension.ts` | pi extension supplying the approval gate and AskUserQuestion |
 | `WEB_ROOT`     | unset         | Directory of static files to serve at `/`; unset serves no UI |
 | `BASH_TIMEOUT_SECONDS` | `120` | Bash mode: how long a command may run before it is killed |
 | `BASH_OUTPUT_LIMIT`    | `102400` | Bash mode: bytes kept per stream before output is truncated |
@@ -217,7 +221,8 @@ already exists — a session belongs to a project by foreign key, so an
 unregistered path is a `404`; create the project first. (`working_dir` is still
 accepted as a deprecated alias for `project_path`, for clients written before
 the rename.) The directory is created (`mkdir -p`) if missing. `agent` is one of
-the registered adapters — `"claude-code"` (the default) or `"opencode"`. The
+the registered adapters — `"claude-code"` (the default), `"opencode"`, or
+`"pi"`. The
 optional `worktree_id` attaches the session to one of the project's worktrees,
 which it runs in instead; see [Worktrees](#worktrees). Starting a turn on a
 session that is not `idle` returns `409`.
@@ -469,7 +474,11 @@ either way.)
 `question` / `question_response` cover Claude Code's built-in **AskUserQuestion**
 tool — the agent asking the user to *pick content*, distinct from a tool
 allow/deny. A pending question reuses the `awaiting_approval` status; the client
-tells them apart by event type. OpenCode has no equivalent.
+tells them apart by event type.
+
+Support is per agent. **Claude Code** has the tool built in. **pi** has no such
+tool, so the bundled extension registers one — see [pi](#pi). **OpenCode** ships
+a `question` tool but does not expose it over ACP, so the adapter has none.
 
 ### Bash mode
 
@@ -532,7 +541,9 @@ OpenCode adapter ends the turn at the denial and emits an internal `followup`
 event; `run_turn` then auto-starts a new turn whose prompt restates the denied
 tool + input + reason. `session/load` resumes the conversation, and because the
 follow-up prompt is self-contained it does not depend on OpenCode having
-persisted the interrupted call.
+persisted the interrupted call. **pi** delivers it inline like Claude Code: the
+extension's `tool_call` hook returns `{block: true, reason}`, and pi hands the
+reason to the model as the tool's (error) result.
 
 If the session is stopped or the process exits while an approval is pending, the
 Future is failed and the prompt is cleared.
@@ -548,7 +559,8 @@ human or answers `allow` itself.
 Every `approval_request` carries a `category` the adapter derives from the tool —
 Claude Code by tool name (`Bash` → `command`; `Write`/`Edit`/`MultiEdit`/
 `NotebookEdit` → `write`), OpenCode from ACP's `toolCall.kind` (`execute` →
-`command`; `edit`/`delete`/`move` → `write`). When the matching session toggle is
+`command`; `edit`/`delete`/`move` → `write`), pi by tool name (`bash`/
+`powershell` → `command`; `edit`/`write` → `write`). When the matching session toggle is
 on, `run_turn` marks the request `auto_approved`, broadcasts it without entering
 `awaiting_approval`, and immediately answers `allow` on the user's behalf (the
 resulting `approval_response` carries `auto: true`). The toggle is re-read from
@@ -556,8 +568,9 @@ the database on each approval, so flipping it mid-turn takes effect on the next
 tool call.
 
 There is no `read` toggle: read-only tools are auto-allowed by Claude Code's
-`--permission-mode default` and by OpenCode's permission config, so they never
-reach this gate. Tools with no category (e.g. `WebFetch`) always prompt.
+`--permission-mode default`, by OpenCode's permission config, and — since pi
+filters nothing itself — by the allowlist in the bundled pi extension, so they
+never reach this gate. Tools with no category (e.g. `WebFetch`) always prompt.
 
 ## Data model
 
@@ -602,7 +615,7 @@ if you need the current branch.
 | `name`              | TEXT    | Human-readable label                                        |
 | `project_id`        | INTEGER FK | References `projects.id` (`ON DELETE CASCADE`), `NOT NULL` |
 | `worktree_id`       | INTEGER FK | References `worktrees.id` (`ON DELETE RESTRICT`); `NULL` means "runs in the project directory" |
-| `agent`             | TEXT    | Which adapter to use, e.g. `claude-code` or `opencode`      |
+| `agent`             | TEXT    | Which adapter to use, e.g. `claude-code`, `opencode`, or `pi` |
 | `agent_session_id`  | TEXT    | The agent's own resume id; `NULL` until the first turn completes |
 | `status`            | TEXT    | `idle` \| `running` \| `awaiting_approval`                  |
 | `created_at`        | TEXT    | ISO 8601 (UTC, `Z`)                                         |
@@ -696,10 +709,11 @@ class AgentAdapter:
 |-----------------|-------------------------------------------|-------------------------|------------------------------------------------|
 | **Claude Code** | `claude -p --output-format stream-json`   | `--resume <id>`         | `--permission-prompt-tool stdio` via stdin     |
 | **OpenCode**    | `opencode acp` (JSON-RPC over stdio)      | `session/load <id>`     | `session/request_permission` callback over stdio |
+| **pi**          | `pi --mode rpc` (JSONL over stdio)        | `--session <id>`        | bundled extension's `tool_call` hook, over pi's dialog protocol |
 | **Codex**       | `codex exec --json`                       | `codex exec resume`     | not in `exec` — needs persistent `app-server`  |
 
-Both shipping adapters are **one short-lived subprocess per turn** and surface
-real multiple-choice approvals; they only differ in wire protocol.
+All three shipping adapters are **one short-lived subprocess per turn** and
+surface real multiple-choice approvals; they only differ in wire protocol.
 
 **Claude Code** speaks Anthropic's `stream-json` over stdio: we write the user
 message to stdin, stream JSON events from stdout, and answer
@@ -725,6 +739,46 @@ prompting. The adapter therefore points the child at a permission config via the
 `OPENCODE_CONFIG` env var; a bundled default (`opencode_permissions.json`) gates
 `bash`, `edit`, `write`, and `webfetch`. Set `OPENCODE_CONFIG` yourself to
 override which tools prompt.
+
+**pi** speaks its **RPC mode** — newline-delimited JSON on stdio. Each turn the
+adapter spawns `pi --mode rpc -e <extension> --no-extensions` (plus `--session
+<id>` on resume), waits for the extension's handshake, sends `get_state` to
+learn the session id, then `prompt`, and maps the event stream (`message_update`
+→ `output`, `tool_execution_start` → `tool_use`, `agent_settled` → `done`).
+
+Unlike the other two, pi ships **no permission system at all** — its own docs
+say built-in tools "run shell commands with the permissions of the pi process"
+and recommend containerization instead — and no tool for asking the user a
+question. Both are supplied by the bundled `pi_extension.ts`, which the adapter
+passes with `-e`:
+
+- A `tool_call` hook gates every mutating tool and returns `{block: true,
+  reason}` on denial. Read-only tools (`read`, `grep`, `find`, `ls`) are allowed
+  without a prompt; anything unrecognized prompts.
+- A registered `AskUserQuestion` tool takes a batch of 1-4 questions, matching
+  Claude Code's shape.
+
+The extension reaches the adapter over pi's extension dialog protocol: it calls
+`ctx.ui.select` / `ctx.ui.input`, which pi serializes as `extension_ui_request`
+lines answered with `extension_ui_response`. Neither call carries structured
+data, so the extension JSON-encodes what the adapter needs into the dialog
+`title`; tool *arguments* are not sent that way but recovered from the
+`tool_execution_start` pi emits just before. A question batch becomes N
+concurrent dialogs sharing one `toolCallId`, which the adapter reassembles into
+a single `question` event.
+
+Because the gate lives in an extension rather than in pi, a failure to load it
+would leave the agent running unrestricted and silent. The extension therefore
+announces itself on `session_start`, and the adapter **refuses to send the
+prompt** until it does. `--no-extensions` is passed alongside `-e` so a
+project's own `.pi/extensions` cannot join the session and mutate tool input
+after the user has approved it.
+
+One deployment note: pi's launcher is `#!/usr/bin/env node`, so it runs under
+whatever `node` is first on `PATH`. Under too old a Node it fails deep inside
+its own bundle with an unrelated-looking `SyntaxError`, so the adapter promotes
+the Node shipped beside the `pi` binary, when there is one, to the front of the
+child's `PATH`.
 
 Codex remains future work — its approval handling needs a persistent
 `app-server` speaking JSON-RPC, so it does not fit the one-shot shape.

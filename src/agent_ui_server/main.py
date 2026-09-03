@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from . import git, shell
-from .agent import AgentAdapter, ClaudeCodeAdapter, OpenCodeAdapter
+from .agent import AgentAdapter, ClaudeCodeAdapter, OpenCodeAdapter, PiAdapter
 from .db import Database
 
 
@@ -22,6 +22,7 @@ db = Database(os.environ.get("SESSION_DB", "sessions.db"))
 adapters: dict[str, AgentAdapter] = {
     "claude-code": ClaudeCodeAdapter(),
     "opencode": OpenCodeAdapter(),
+    "pi": PiAdapter(),
 }
 subscribers: dict[int, set[WebSocket]] = defaultdict(set)
 running_tasks: dict[int, asyncio.Task[None]] = {}

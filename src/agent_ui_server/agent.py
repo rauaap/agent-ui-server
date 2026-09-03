@@ -4,6 +4,7 @@ import abc
 import asyncio
 import json
 import os
+import shutil
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -75,6 +76,86 @@ def _resolve_decision(
     if behavior not in {"allow", "deny"}:
         raise ValueError("Approval behavior must be 'allow' or 'deny'")
     return ApprovalDecision(behavior=behavior, option_id=option_id, message=message)
+
+
+def _normalize_questions(raw_questions: Any) -> list[dict[str, Any]]:
+    """Project an agent's question spec into the wire `questions` shape.
+
+    Every field is guarded with a default — the spec originates in model
+    output, so it is an untrusted passthrough however it reached us.
+
+    Shared by every adapter that supports questions: the wire shape is the
+    client's contract, not any one agent's.
+    """
+    if not isinstance(raw_questions, list):
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    for raw in raw_questions:
+        if not isinstance(raw, dict):
+            continue
+        options: list[dict[str, Any]] = []
+        raw_options = raw.get("options")
+        if isinstance(raw_options, list):
+            for opt in raw_options:
+                if not isinstance(opt, dict):
+                    continue
+                options.append(
+                    {
+                        "label": str(opt.get("label", "")),
+                        "description": str(opt.get("description", "")),
+                    }
+                )
+        normalized.append(
+            {
+                "question": str(raw.get("question", "")),
+                "header": str(raw.get("header", "")),
+                "multiSelect": bool(raw.get("multiSelect", False)),
+                "options": options,
+            }
+        )
+    return normalized
+
+
+def _validate_answers(
+    questions: list[dict[str, Any]],
+    answers: Any,
+) -> dict[str, Any]:
+    """Check answers against the stored spec, keyed by question text.
+
+    Each key must name a known question and each value a known option label
+    (a list of labels for multiSelect). Raises ValueError on any mismatch so
+    the request stays pending and the client can retry.
+    """
+    if not isinstance(answers, dict):
+        raise ValueError("answers must be an object keyed by question text")
+
+    by_text = {question["question"]: question for question in questions}
+    validated: dict[str, Any] = {}
+    for question_text, value in answers.items():
+        question = by_text.get(question_text)
+        if question is None:
+            raise ValueError(f"Unknown question: {question_text!r}")
+        labels = {opt["label"] for opt in question["options"]}
+        if question["multiSelect"]:
+            if not isinstance(value, list):
+                raise ValueError(
+                    f"multiSelect question {question_text!r} expects a list of labels"
+                )
+            for label in value:
+                if label not in labels:
+                    raise ValueError(
+                        f"Unknown option {label!r} for question {question_text!r}"
+                    )
+            validated[question_text] = list(value)
+        else:
+            if not isinstance(value, str) or value not in labels:
+                raise ValueError(
+                    f"Unknown option {value!r} for question {question_text!r}"
+                )
+            validated[question_text] = value
+    return validated
+
 
 # asyncio's StreamReader defaults to a 64 KiB line buffer. Agent stdout is
 # newline-delimited JSON whose single lines (large tool results, file reads,
@@ -285,7 +366,7 @@ class ClaudeCodeAdapter(AgentAdapter):
             raise KeyError(f"Unknown question request: {request_id}")
 
         questions = self.pending_question_specs.get(request_id, [])
-        validated = self._validate_answers(questions, answers)
+        validated = _validate_answers(questions, answers)
         if not future.done():
             future.set_result(validated)
         return validated
@@ -337,7 +418,7 @@ class ClaudeCodeAdapter(AgentAdapter):
             # surface it as a `question` event and answer it by writing the
             # user's pick into updatedInput.answers.
             if request["tool"] == self.QUESTION_TOOL:
-                questions = self._normalize_questions(tool_input)
+                questions = _normalize_questions(tool_input.get("questions"))
                 loop = asyncio.get_running_loop()
                 answer_future: asyncio.Future[dict[str, Any]] = loop.create_future()
                 self.pending_questions[request_id] = answer_future
@@ -554,82 +635,6 @@ class ClaudeCodeAdapter(AgentAdapter):
         }
         process.stdin.write((json.dumps(payload) + "\n").encode("utf-8"))
         await process.stdin.drain()
-
-    def _normalize_questions(self, tool_input: dict[str, Any]) -> list[dict[str, Any]]:
-        """Project AskUserQuestion's opaque input into the wire `questions` shape.
-
-        Every field is guarded with a default — the input is an untrusted
-        passthrough, same convention as `_tool_use_event`.
-        """
-        raw_questions = tool_input.get("questions")
-        if not isinstance(raw_questions, list):
-            return []
-
-        normalized: list[dict[str, Any]] = []
-        for raw in raw_questions:
-            if not isinstance(raw, dict):
-                continue
-            options: list[dict[str, Any]] = []
-            raw_options = raw.get("options")
-            if isinstance(raw_options, list):
-                for opt in raw_options:
-                    if not isinstance(opt, dict):
-                        continue
-                    options.append(
-                        {
-                            "label": str(opt.get("label", "")),
-                            "description": str(opt.get("description", "")),
-                        }
-                    )
-            normalized.append(
-                {
-                    "question": str(raw.get("question", "")),
-                    "header": str(raw.get("header", "")),
-                    "multiSelect": bool(raw.get("multiSelect", False)),
-                    "options": options,
-                }
-            )
-        return normalized
-
-    def _validate_answers(
-        self,
-        questions: list[dict[str, Any]],
-        answers: Any,
-    ) -> dict[str, Any]:
-        """Check answers against the stored spec, keyed by question text.
-
-        Each key must name a known question and each value a known option label
-        (a list of labels for multiSelect). Raises ValueError on any mismatch so
-        the request stays pending and the client can retry.
-        """
-        if not isinstance(answers, dict):
-            raise ValueError("answers must be an object keyed by question text")
-
-        by_text = {question["question"]: question for question in questions}
-        validated: dict[str, Any] = {}
-        for question_text, value in answers.items():
-            question = by_text.get(question_text)
-            if question is None:
-                raise ValueError(f"Unknown question: {question_text!r}")
-            labels = {opt["label"] for opt in question["options"]}
-            if question["multiSelect"]:
-                if not isinstance(value, list):
-                    raise ValueError(
-                        f"multiSelect question {question_text!r} expects a list of labels"
-                    )
-                for label in value:
-                    if label not in labels:
-                        raise ValueError(
-                            f"Unknown option {label!r} for question {question_text!r}"
-                        )
-                validated[question_text] = list(value)
-            else:
-                if not isinstance(value, str) or value not in labels:
-                    raise ValueError(
-                        f"Unknown option {value!r} for question {question_text!r}"
-                    )
-                validated[question_text] = value
-        return validated
 
     async def _write_question_response(
         self,
@@ -1208,6 +1213,636 @@ class OpenCodeAdapter(AgentAdapter):
         if self.config_path:
             env["OPENCODE_CONFIG"] = self.config_path
         return env
+
+    async def _collect_stderr(
+        self,
+        stream: asyncio.StreamReader | None,
+    ) -> str:
+        if stream is None:
+            return ""
+        chunks: list[str] = []
+        while True:
+            raw_line = await stream.readline()
+            if not raw_line:
+                break
+            chunks.append(raw_line.decode("utf-8", errors="replace"))
+        return "".join(chunks)
+
+
+class PiAdapter(AgentAdapter):
+    """Adapter for pi over its RPC mode (`pi --mode rpc`).
+
+    RPC mode is newline-delimited JSON on stdio: we write commands to stdin
+    (`prompt`, `get_state`) and read a stream of events and responses from
+    stdout. Like the other two adapters, each turn is one short-lived process —
+    spawn, prompt, stream until `agent_settled`, exit — with continuity coming
+    from pi's own session store via `--session <id>`.
+
+    Pi ships no permission system and no way to ask the user a question, so
+    both are supplied by the bundled `pi_extension.ts`, passed with `-e`. That
+    extension reaches us through pi's extension dialog protocol: it calls
+    `ctx.ui.select` / `ctx.ui.input`, which pi serializes as
+    `extension_ui_request` lines that we answer with `extension_ui_response`.
+    Neither call has a field for structured data, so the extension JSON-encodes
+    what we need into `title`; `_envelope` unpacks it.
+    """
+
+    # Envelope contract with pi_extension.ts. Bump both in step.
+    MARKER = "agent-ui"
+    PROTOCOL_VERSION = 1
+
+    DEFAULT_EXTENSION = str(Path(__file__).resolve().parent / "pi_extension.ts")
+
+    QUESTION_TOOL = "AskUserQuestion"
+
+    # How long to wait for the extension's `ready` notification. Generous
+    # because the first load compiles the TypeScript; a miss is fatal rather
+    # than slow, so erring long costs nothing.
+    HANDSHAKE_TIMEOUT = 60.0
+
+    # Pi's dialogs carry no allow/deny vocabulary of their own — the extension
+    # offers these two labels and we answer with one of them verbatim.
+    DIALOG_ALLOW = "Allow"
+    DIALOG_DENY = "Deny"
+
+    OPTIONS = [
+        {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+        {"optionId": "deny", "name": "Deny", "kind": "reject_once"},
+    ]
+
+    # Maps a pi tool name to an auto-approve category. The extension lets the
+    # read-only tools through without a dialog, so only mutating ones appear
+    # here; anything unmapped prompts and cannot be auto-approved.
+    TOOL_CATEGORIES = {
+        "bash": "command",
+        "powershell": "command",
+        "edit": "write",
+        "write": "write",
+    }
+
+    # Dialog methods that block the extension until answered. The fire-and-
+    # forget ones (notify, setStatus, setWidget, ...) must NOT be answered.
+    BLOCKING_METHODS = {"select", "confirm", "input", "editor"}
+
+    def __init__(
+        self,
+        executable: str | None = None,
+        extension_path: str | None = None,
+    ) -> None:
+        self.executable = executable or os.environ.get("PI_BIN", "pi")
+        self.extension_path = (
+            extension_path
+            or os.environ.get("PI_EXTENSION")
+            or self.DEFAULT_EXTENSION
+        )
+        self.processes: dict[int, asyncio.subprocess.Process] = {}
+        self.pending_approvals: dict[str, asyncio.Future[ApprovalDecision]] = {}
+        self.pending_sessions: dict[str, int] = {}
+        self.pending_options: dict[str, list[dict[str, Any]]] = {}
+        self.pending_questions: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self.pending_question_specs: dict[str, list[dict[str, Any]]] = {}
+
+    async def start_turn(
+        self,
+        session: dict[str, Any],
+        prompt: str,
+    ) -> AsyncIterator[AgentEvent]:
+        session_id = session["id"]
+        existing = self.processes.get(session_id)
+        if existing and existing.returncode is None:
+            raise RuntimeError("Session already has a running process")
+
+        command = [
+            self.executable,
+            "--mode",
+            "rpc",
+            "-e",
+            self.extension_path,
+            # Discovery off, explicit -e on (verified: --no-extensions drops
+            # discovered extensions but honours -e). A project's own
+            # .pi/extensions must not join the session: tool_call handlers can
+            # mutate tool input, and one running after ours could change the
+            # arguments the user just approved.
+            "--no-extensions",
+        ]
+        if session.get("agent_session_id"):
+            command.extend(["--session", session["agent_session_id"]])
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                cwd=session["working_dir"],
+                env=self._build_env(),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                limit=STREAM_LIMIT,
+            )
+        except FileNotFoundError as exc:
+            yield {"type": "error", "message": f"Unable to start pi: {exc}"}
+            return
+        except NotADirectoryError as exc:
+            yield {"type": "error", "message": f"Invalid working directory: {exc}"}
+            return
+
+        self.processes[session_id] = process
+        stderr_task = asyncio.create_task(self._collect_stderr(process.stderr))
+
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[AgentEvent | None] = asyncio.Queue()
+        ready: asyncio.Future[None] = loop.create_future()
+        resolvers: set[asyncio.Task[None]] = set()
+
+        # Per-turn correlation state.
+        #  tool_args   toolCallId -> arguments, captured from
+        #              tool_execution_start, which pi emits before the approval
+        #              dialog. That ordering is why the dialog envelope only
+        #              needs to carry an id.
+        #  deny_reasons toolCallId -> the reason the client sent with a denial,
+        #              held until the extension's follow-up `input` dialog asks
+        #              for it.
+        #  batches     toolCallId -> the question dialogs seen so far, held
+        #              until all `count` have arrived so the whole set reaches
+        #              the client as one `question` event.
+        tool_args: dict[str, dict[str, Any]] = {}
+        deny_reasons: dict[str, str] = {}
+        batches: dict[str, dict[str, Any]] = {}
+        text_buf: list[str] = []
+        current_sid: str | None = session.get("agent_session_id")
+
+        assert process.stdin is not None
+        assert process.stdout is not None
+
+        async def write_msg(obj: dict[str, Any]) -> None:
+            if process.stdin is None or process.stdin.is_closing():
+                return
+            process.stdin.write((json.dumps(obj) + "\n").encode("utf-8"))
+            await process.stdin.drain()
+
+        async def answer_dialog(dialog_id: Any, value: str | None) -> None:
+            """Resolve one extension dialog; `None` cancels it.
+
+            A cancelled dialog resolves to `undefined` inside the extension,
+            which every call site there treats as a refusal — so failing to
+            answer is always the safe direction.
+            """
+            if not dialog_id:
+                return
+            payload: dict[str, Any] = {
+                "type": "extension_ui_response",
+                "id": dialog_id,
+            }
+            if value is None:
+                payload["cancelled"] = True
+            else:
+                payload["value"] = value
+            try:
+                await write_msg(payload)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def spawn(coro: Any) -> None:
+            task = asyncio.create_task(coro)
+            resolvers.add(task)
+            task.add_done_callback(resolvers.discard)
+
+        async def flush_text() -> None:
+            if not text_buf:
+                return
+            text = "".join(text_buf)
+            text_buf.clear()
+            if text.strip():
+                await queue.put({"type": "output", "text": text})
+
+        async def resolve_approval(
+            request_id: str,
+            dialog_id: Any,
+            tool_call_id: str,
+            future: asyncio.Future[ApprovalDecision],
+        ) -> None:
+            try:
+                decision = await future
+                if decision.behavior == "deny" and decision.message:
+                    # Stashed for the follow-up `input` dialog the extension
+                    # raises immediately after a denial.
+                    deny_reasons[tool_call_id] = decision.message
+                await answer_dialog(
+                    dialog_id,
+                    self.DIALOG_ALLOW
+                    if decision.behavior == "allow"
+                    else self.DIALOG_DENY,
+                )
+            except Exception:
+                await answer_dialog(dialog_id, None)
+            finally:
+                self.pending_approvals.pop(request_id, None)
+                self.pending_sessions.pop(request_id, None)
+                self.pending_options.pop(request_id, None)
+
+        async def resolve_question(
+            request_id: str,
+            dialogs: list[tuple[Any, dict[str, Any]]],
+            questions: list[dict[str, Any]],
+            future: asyncio.Future[dict[str, Any]],
+        ) -> None:
+            try:
+                answers = await future
+                for (dialog_id, _), question in zip(dialogs, questions):
+                    value = answers.get(question["question"])
+                    # An unanswered question is cancelled rather than guessed;
+                    # the tool reports the gap to the model itself.
+                    await answer_dialog(
+                        dialog_id, value if isinstance(value, str) and value else None
+                    )
+            except Exception:
+                for dialog_id, _ in dialogs:
+                    await answer_dialog(dialog_id, None)
+            finally:
+                self.pending_questions.pop(request_id, None)
+                self.pending_question_specs.pop(request_id, None)
+                self.pending_sessions.pop(request_id, None)
+
+        async def collect_question(
+            envelope: dict[str, Any],
+            dialog_id: Any,
+        ) -> None:
+            tool_call_id = str(envelope.get("toolCallId") or "")
+            index = envelope.get("index")
+            count = envelope.get("count")
+            question = envelope.get("question")
+            if (
+                not tool_call_id
+                or not isinstance(index, int)
+                or not isinstance(count, int)
+                or count < 1
+                or not isinstance(question, dict)
+            ):
+                await answer_dialog(dialog_id, None)
+                return
+
+            batch = batches.setdefault(tool_call_id, {"count": count, "dialogs": {}})
+            batch["dialogs"][index] = (dialog_id, question)
+            if len(batch["dialogs"]) < batch["count"]:
+                return
+
+            batches.pop(tool_call_id, None)
+            ordered = [batch["dialogs"][key] for key in sorted(batch["dialogs"])]
+            questions = _normalize_questions([spec for _, spec in ordered])
+            if len(questions) != len(ordered):
+                for held_id, _ in ordered:
+                    await answer_dialog(held_id, None)
+                return
+
+            future: asyncio.Future[dict[str, Any]] = loop.create_future()
+            self.pending_questions[tool_call_id] = future
+            self.pending_question_specs[tool_call_id] = questions
+            self.pending_sessions[tool_call_id] = session_id
+
+            await flush_text()
+            await queue.put(
+                {
+                    "type": "question",
+                    "request_id": tool_call_id,
+                    "questions": questions,
+                }
+            )
+            spawn(resolve_question(tool_call_id, ordered, questions, future))
+
+        async def handle_dialog(message: dict[str, Any]) -> None:
+            method = message.get("method")
+            dialog_id = message.get("id")
+            # notify carries its payload in `message`; the blocking dialogs
+            # carry theirs in `title`.
+            carrier = message.get("message") if method == "notify" else message.get("title")
+            envelope = self._envelope(carrier)
+
+            if envelope is None:
+                # Not ours. Nothing should reach here with --no-extensions, but
+                # a blocking dialog left unanswered would wedge the turn, so
+                # refuse it rather than ignore it.
+                if method in self.BLOCKING_METHODS:
+                    await answer_dialog(dialog_id, None)
+                return
+
+            kind = envelope.get("kind")
+
+            if kind == "ready":
+                if not ready.done():
+                    ready.set_result(None)
+                return
+
+            if kind == "approval":
+                tool_call_id = str(envelope.get("toolCallId") or "")
+                tool = str(envelope.get("toolName") or "tool")
+                request_id = f"perm_{uuid.uuid4().hex}"
+                future: asyncio.Future[ApprovalDecision] = loop.create_future()
+                self.pending_approvals[request_id] = future
+                self.pending_sessions[request_id] = session_id
+                self.pending_options[request_id] = self.OPTIONS
+
+                await flush_text()
+                await queue.put(
+                    {
+                        "type": "approval_request",
+                        "request_id": request_id,
+                        "tool": tool,
+                        "input": tool_args.get(tool_call_id, {}),
+                        "options": _event_options(self.OPTIONS),
+                        "category": self.TOOL_CATEGORIES.get(tool),
+                    }
+                )
+                # Resolved off the reader so a batch of parallel tool calls
+                # surfaces every approval at once instead of one at a time.
+                spawn(resolve_approval(request_id, dialog_id, tool_call_id, future))
+                return
+
+            if kind == "deny_reason":
+                # Protocol-only round trip: the client sent its reason together
+                # with the denial, so this is answered from what we already
+                # hold and the user is never prompted twice.
+                tool_call_id = str(envelope.get("toolCallId") or "")
+                await answer_dialog(dialog_id, deny_reasons.pop(tool_call_id, ""))
+                return
+
+            if kind == "question":
+                await collect_question(envelope, dialog_id)
+
+        async def handle_message(message: dict[str, Any]) -> None:
+            nonlocal current_sid
+            kind = message.get("type")
+
+            if kind == "message_update":
+                event = message.get("assistantMessageEvent") or {}
+                event_type = event.get("type")
+                if event_type == "text_delta":
+                    text_buf.append(str(event.get("delta") or ""))
+                elif event_type == "text_end":
+                    # text_end carries the whole block; the accumulated deltas
+                    # are the fallback if it ever arrives without one.
+                    content = event.get("content")
+                    text = content if isinstance(content, str) else "".join(text_buf)
+                    text_buf.clear()
+                    if text.strip():
+                        await queue.put({"type": "output", "text": text})
+                # thinking_* and toolcall_* deltas carry nothing the UI needs.
+                return
+
+            if kind == "tool_execution_start":
+                tool = str(message.get("toolName") or "tool")
+                args = message.get("args")
+                args = args if isinstance(args, dict) else {}
+                tool_call_id = str(message.get("toolCallId") or "")
+                if tool_call_id:
+                    tool_args[tool_call_id] = args
+                # The question tool is surfaced as a `question` event, so don't
+                # also emit a tool_use bubble for it.
+                if tool == self.QUESTION_TOOL:
+                    return
+                await flush_text()
+                await queue.put({"type": "tool_use", "tool": tool, "input": args})
+                return
+
+            if kind == "extension_ui_request":
+                await handle_dialog(message)
+                return
+
+            if kind == "agent_settled":
+                # Terminal: agent_end can still be followed by a retry, settled
+                # cannot.
+                await flush_text()
+                await queue.put({"type": "done", "session_id": current_sid})
+                await queue.put(None)
+                return
+
+            if kind == "response":
+                if message.get("command") == "get_state" and message.get("success"):
+                    data = message.get("data")
+                    if isinstance(data, dict) and data.get("sessionId"):
+                        current_sid = str(data["sessionId"])
+                    return
+                if not message.get("success"):
+                    await flush_text()
+                    await queue.put(
+                        {
+                            "type": "error",
+                            "message": f"pi {message.get('command')} failed: "
+                            f"{message.get('error')}",
+                        }
+                    )
+                return
+
+            if kind == "extension_error":
+                # The gate lives in that extension, so a failure there is not a
+                # detail the user can be left to discover.
+                await queue.put(
+                    {
+                        "type": "error",
+                        "message": f"pi extension error: {message.get('error')}",
+                    }
+                )
+
+        async def reader() -> None:
+            try:
+                while True:
+                    raw_line = await process.stdout.readline()
+                    if not raw_line:
+                        break
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    try:
+                        message = json.loads(line)
+                    except json.JSONDecodeError:
+                        await queue.put({"type": "output", "text": line})
+                        continue
+                    if isinstance(message, dict):
+                        await handle_message(message)
+            finally:
+                # Fail the handshake rather than let it wait out the timeout
+                # when the process dies early.
+                if not ready.done():
+                    ready.set_exception(
+                        RuntimeError("pi exited before the extension loaded")
+                    )
+                await queue.put(None)
+
+        reader_task = asyncio.create_task(reader())
+        done_emitted = False
+
+        try:
+            try:
+                await asyncio.wait_for(ready, timeout=self.HANDSHAKE_TIMEOUT)
+            except (asyncio.TimeoutError, RuntimeError) as exc:
+                # Terminate first: stderr only reaches EOF once the child is
+                # gone, and its contents are the whole diagnosis here (a
+                # TypeScript compile error, a bad -e path).
+                await self._terminate(process)
+                stderr = await self._drain(stderr_task)
+                detail = stderr.strip() or str(exc)
+                yield {
+                    "type": "error",
+                    "message": "pi started without the agent-ui extension, so no "
+                    f"tool would be gated. Refusing to run the turn. {detail}",
+                }
+                return
+
+            # Asked before the prompt so the id is in hand even if the turn
+            # fails: on a new session this is the only place we learn it.
+            await write_msg({"id": "state", "type": "get_state"})
+            await write_msg({"id": "prompt", "type": "prompt", "message": prompt})
+
+            while True:
+                event = await queue.get()
+                if event is None:
+                    break
+                if event.get("type") in {"done", "error"}:
+                    done_emitted = True
+                yield event
+
+            returncode = await self._terminate(process)
+            stderr = await self._drain(stderr_task)
+            if not done_emitted:
+                detail = stderr.strip() or f"pi exited with {returncode}"
+                yield {"type": "error", "message": detail}
+        except Exception as exc:
+            yield {"type": "error", "message": f"pi RPC error: {exc}"}
+        finally:
+            self.processes.pop(session_id, None)
+            await self._clear_session_approvals(session_id, "Session ended")
+            await self._terminate(process)
+            for task in list(resolvers):
+                task.cancel()
+            if not reader_task.done():
+                reader_task.cancel()
+            if not stderr_task.done():
+                stderr_task.cancel()
+
+    async def send_approval(
+        self,
+        session: dict[str, Any],
+        request_id: str,
+        behavior: str,
+        *,
+        option_id: str | None = None,
+        message: str | None = None,
+    ) -> str:
+        future = self.pending_approvals.get(request_id)
+        if future is None or self.pending_sessions.get(request_id) != session["id"]:
+            raise KeyError(f"Unknown approval request: {request_id}")
+
+        options = self.pending_options.get(request_id, self.OPTIONS)
+        decision = _resolve_decision(options, behavior, option_id, message)
+        if not future.done():
+            future.set_result(decision)
+        return decision.behavior
+
+    async def send_answer(
+        self,
+        session: dict[str, Any],
+        request_id: str,
+        answers: dict[str, Any],
+    ) -> dict[str, Any]:
+        future = self.pending_questions.get(request_id)
+        if future is None or self.pending_sessions.get(request_id) != session["id"]:
+            raise KeyError(f"Unknown question request: {request_id}")
+
+        questions = self.pending_question_specs.get(request_id, [])
+        validated = _validate_answers(questions, answers)
+        if not future.done():
+            future.set_result(validated)
+        return validated
+
+    async def stop(self, session: dict[str, Any]) -> None:
+        session_id = session["id"]
+        await self._clear_session_approvals(session_id, "Session stopped")
+        process = self.processes.get(session_id)
+        if process is not None:
+            await self._terminate(process)
+        self.processes.pop(session_id, None)
+
+    @classmethod
+    def _envelope(cls, carrier: Any) -> dict[str, Any] | None:
+        """Unpack the JSON envelope pi_extension.ts hides in a dialog's title.
+
+        Returns None for anything that is not one of ours, including a plain
+        human-readable title from some other extension.
+        """
+        if not isinstance(carrier, str) or not carrier.startswith("{"):
+            return None
+        try:
+            parsed = json.loads(carrier)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        if parsed.get(cls.MARKER) != cls.PROTOCOL_VERSION:
+            return None
+        return parsed
+
+    def _build_env(self) -> dict[str, str]:
+        env = dict(os.environ)
+        env.setdefault("SHELL", "/bin/bash")
+        node_dir = self._bundled_node_dir()
+        if node_dir:
+            env["PATH"] = node_dir + os.pathsep + env.get("PATH", "")
+        return env
+
+    def _bundled_node_dir(self) -> str | None:
+        """Directory of the Node that ships beside pi, if there is one.
+
+        pi's launcher is `#!/usr/bin/env node`, so it runs under whatever Node
+        is first on PATH. Installed via its own installer it sits next to a
+        pinned Node, and running it under an older system Node fails deep
+        inside pi's bundle with an unrelated-looking SyntaxError. Putting the
+        neighbouring Node first turns that into a non-issue.
+        """
+        resolved = shutil.which(self.executable)
+        if not resolved:
+            return None
+        # Not resolve(): the launcher is typically a symlink into node_modules,
+        # and it is the bin directory we want, not the link's target.
+        directory = Path(resolved).parent
+        return str(directory) if (directory / "node").exists() else None
+
+    async def _terminate(self, process: asyncio.subprocess.Process) -> int | None:
+        if process.returncode is None:
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                return process.returncode
+            try:
+                await asyncio.wait_for(process.wait(), timeout=3)
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+        return process.returncode
+
+    async def _clear_session_approvals(self, session_id: int, reason: str) -> None:
+        request_ids = [
+            request_id
+            for request_id, pending_session_id in self.pending_sessions.items()
+            if pending_session_id == session_id
+        ]
+        for request_id in request_ids:
+            future = self.pending_approvals.get(request_id)
+            if future and not future.done():
+                future.set_exception(RuntimeError(reason))
+            answer_future = self.pending_questions.get(request_id)
+            if answer_future and not answer_future.done():
+                answer_future.set_exception(RuntimeError(reason))
+            self.pending_approvals.pop(request_id, None)
+            self.pending_questions.pop(request_id, None)
+            self.pending_question_specs.pop(request_id, None)
+            self.pending_sessions.pop(request_id, None)
+            self.pending_options.pop(request_id, None)
+
+    @staticmethod
+    async def _drain(task: asyncio.Task[str]) -> str:
+        """Collect stderr without hanging if the stream is still open."""
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), timeout=1)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            return ""
 
     async def _collect_stderr(
         self,
