@@ -133,7 +133,7 @@ Unchanged except for the new field. Every session, archived included:
 
 ```jsonc
 { "id": 7, "name": "fix login", "project_id": 1, "worktree_id": null,
-  "working_dir": "/projects/agent-ui",   // derived: the worktree's path, or the project's
+  "working_dir": "/projects/agent-ui",   // effective cwd: current/former worktree, or project
   "agent": "claude-code", "agent_session_id": "resume-1",
   "status": "idle", "created_at": "…", "last_active_at": "…",
   "archived_at": null,                                  // ← new
@@ -156,6 +156,29 @@ Errors:
 |-------|---------------------------------------------|------|
 | `404` | `Session not found`                         | Unknown id |
 | `409` | `Cannot archive a session while it is busy` | `status` is not `idle`, **or** a shell command is running (which `status` does not show — see below) |
+| `409` | `Cannot unarchive a session whose working directory is missing: …` | The session's effective `working_dir` is missing or is not a directory |
+
+This check applies to every archived session, whether it is attached to a
+worktree, detached from one, or runs in the project directory. Project
+unarchive has the same safety rule: it preflights every session its cascade
+would restore and returns `409` without writing anything if one or more working
+directories are missing or are not directories.
+
+### `POST /sessions/{id}/detach-worktree`
+
+Explicitly detaches an archived session from its worktree while preserving the
+absolute directory to which its agent harness is bound. The returned session has
+`worktree_id: null`, but `working_dir` remains the former worktree path. The
+operation does not touch the filesystem and is idempotent for retries.
+
+The session must already be archived. The first call requires an attached
+worktree; after it succeeds, the saved detached path distinguishes a retry from
+a project-directory session. A retry therefore returns `200` with the same
+session, while a session that never had a worktree returns `409`. Worktree
+deletion remains a separate request. Archiving never invokes this endpoint
+implicitly. The client offers detachment later, from an archived session's
+settings; it does not offer detachment during archival or automatically follow
+an archive with a detach.
 
 ### Blocked while archived
 
@@ -167,7 +190,8 @@ Errors:
 | `POST /sessions/{id}/bash`  | `409` | `Session is archived` |
 
 Still allowed on an archived session: `GET`, the WebSocket (including scrollback
-replay), `PATCH` (rename, toggles, unarchive), `POST /stop`, `DELETE`. And
+replay), `PATCH` (rename, toggles, unarchive), `POST /stop`,
+`POST /sessions/{id}/detach-worktree`, and `DELETE`. And
 `DELETE /projects` still sweeps archived sessions along with the rest — archiving
 is not a shield against deletion, and should not be presented as one.
 
@@ -176,8 +200,18 @@ is not a shield against deletion, and should not be presented as one.
 Worktrees have no `archived_at` and no archive of their own. Archiving is about
 what clutters the session and project lists, and a worktree appears in neither —
 it is reached through its project. So `GET /worktrees` keeps returning an
-archived project's worktrees, and `DELETE /worktrees/{id}` keeps working on
+archived project's worktrees, and `DELETE /worktrees/{id}` remains available on
 them, in the same spirit as being able to delete an archived session.
+
+The normal deletion precondition still applies: **any attached session blocks
+worktree deletion, including an archived session**. Archiving does not detach a
+session from its worktree, and the worktree's `session_count` includes both live
+and archived sessions. Consequently, a worktree whose sessions are all archived
+still returns `409` from `DELETE /worktrees/{id}`. A client can explicitly
+detach those sessions (preserving their original `working_dir`) or delete them,
+then retry worktree deletion. If a detached session is later unarchived, it
+still depends on that directory: the server refuses to delete a registered
+worktree at the same path until the session is archived again.
 
 The one rule that does apply: you cannot *create* a worktree in an archived
 project, exactly as you cannot create a session in one. Hide the control rather
@@ -196,9 +230,11 @@ A new server → client event, broadcast to every subscriber of that session:
 
 ```jsonc
 { "type": "archived", "archived_at": "2026-08-26T11:02:00Z" }   // null = brought back
+{ "type": "worktree_detached", "worktree_id": null,
+  "working_dir": "/projects/app-fix-login" }
 ```
 
-It fires on `PATCH /sessions/{id}` with `archived`, and on `PATCH /projects` for
+The `archived` event fires on `PATCH /sessions/{id}` with `archived`, and on `PATCH /projects` for
 each affected session that has a subscriber. **It is also sent on connect**,
 right after the `status` event, so a client that was offline when another device
 archived something still finds out. Treat it exactly like `status`: authoritative,
@@ -237,7 +273,10 @@ view needs is already in the two list responses; no extra requests.
 - Archived project: `session_count` is `0` and `last_active_at` is `null` by
   invariant. Do not render "no sessions" or "never used" for these — it is
   misleading. Use `archived_session_count` and `archived_at` instead.
-- An archived project must not offer **New session** (the server returns `409`).
+- An archived project must not offer **New session** or **New worktree** (the
+  server returns `409` for both). Its existing worktrees still list and can
+  still be deleted once no sessions—including archived sessions—remain attached;
+  see [Worktrees are not archivable](#worktrees-are-not-archivable).
 
 ### Archiving actions
 
@@ -253,7 +292,15 @@ view needs is already in the two list responses; no extra requests.
 - **Unarchive session** silently unarchives its project too, if that project was
   archived. Refetch `GET /projects` (or patch the project in your store) after
   it, or a project will be missing from the main list until the next poll. This
-  is the one place a session-level action has a project-level effect.
+  is the one place a session-level action has a project-level effect. If its
+  effective `working_dir` is missing or is not a directory, keep it archived
+  and explain that a directory must be recreated at the same absolute path
+  before it can resume.
+- **Detach worktree** is a later cleanup action in an archived session's
+  settings, not part of archival. Do not offer it in the archive confirmation
+  or automatically follow an archive with a detach. Make clear that deleting
+  the worktree afterward removes the directory the session needs for any
+  future unarchive.
 
 ### Archived session view
 
@@ -303,4 +350,6 @@ warrant new polling.
   explicit user action.
 - Any notion of archiving as protection from deletion — `DELETE /projects` still
   takes archived sessions with it, by design.
+- Archiving worktrees, or having a project's archive sweep them up. They carry
+  no flag and are removed only through `DELETE /worktrees/{id}`.
 - Exporting or compacting an archived session's scrollback.

@@ -326,6 +326,57 @@ class ArchiveTableTests(unittest.TestCase):
         second = self.database.set_session_archived(session["id"], True)
         self.assertEqual(second["archived_at"], first["archived_at"])
 
+    def test_detaching_preserves_the_worktree_path(self) -> None:
+        worktree = self.database.create_worktree(
+            self.project["id"], "/p/demo-fix", "fix"
+        )
+        session = self.database.create_session(
+            name="worktree",
+            project_id=self.project["id"],
+            agent="claude-code",
+            worktree_id=worktree["id"],
+        )
+        self.database.set_session_archived(session["id"], True)
+
+        detached = self.database.detach_session_from_worktree(session["id"])
+
+        self.assertIsNone(detached["worktree_id"])
+        self.assertEqual(detached["working_dir"], "/p/demo-fix")
+        self.assertEqual(
+            self.database.list_sessions_for_worktree(worktree["id"]), []
+        )
+        self.assertTrue(self.database.delete_worktree(worktree["id"]))
+        # The source row is gone, but the harness binding survives.
+        self.assertEqual(
+            self.database.require_session(session["id"])["working_dir"],
+            "/p/demo-fix",
+        )
+        # Losing an HTTP response after the update is safe to retry.
+        self.assertEqual(
+            self.database.detach_session_from_worktree(session["id"])[
+                "working_dir"
+            ],
+            "/p/demo-fix",
+        )
+
+    def test_only_archived_worktree_sessions_can_detach(self) -> None:
+        worktree = self.database.create_worktree(
+            self.project["id"], "/p/demo-fix", "fix"
+        )
+        attached = self.database.create_session(
+            name="attached",
+            project_id=self.project["id"],
+            agent="claude-code",
+            worktree_id=worktree["id"],
+        )
+        plain = self.add_session("plain")
+
+        with self.assertRaises(ValueError):
+            self.database.detach_session_from_worktree(attached["id"])
+        self.database.set_session_archived(plain["id"], True)
+        with self.assertRaises(ValueError):
+            self.database.detach_session_from_worktree(plain["id"])
+
     def test_unknown_ids_raise(self) -> None:
         with self.assertRaises(KeyError):
             self.database.set_session_archived(9999, True)
@@ -984,6 +1035,11 @@ class MigrationTests(unittest.TestCase):
 
             migrated = self.sessions_by_name(database)["one"]
             self.assertIsNone(migrated["archived_at"])
+            session_columns = {
+                row["name"]
+                for row in database._conn.execute("PRAGMA table_info(sessions)")
+            }
+            self.assertIn("detached_working_dir", session_columns)
             project = database.get_project("/p/demo")
             self.assertIsNone(project["archived_at"])
             self.assertEqual(project["session_count"], 1)
@@ -1015,6 +1071,7 @@ class MigrationTests(unittest.TestCase):
                     ("projects", "archived_at"),
                     ("sessions", "archived_at"),
                     ("sessions", "archived_with_project"),
+                    ("sessions", "detached_working_dir"),
                 ):
                     conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
             conn.close()
@@ -1840,6 +1897,112 @@ class ArchiveEndpointTests(SessionEndpointTestCase):
             ],
         )
 
+    async def test_archived_worktree_session_can_detach_then_delete_worktree(
+        self,
+    ) -> None:
+        project = self.make_project()
+        worktree, path = await self.worktree_for(project)
+        session = await self.create(
+            name="one", project_path=project["path"], worktree_id=worktree["id"]
+        )
+        await self.set_archived(session["id"], True)
+        self.events.clear()
+
+        detached = await self.main.detach_session_worktree(session["id"])
+
+        self.assertIsNone(detached["worktree_id"])
+        self.assertEqual(detached["working_dir"], str(path))
+        self.assertEqual(
+            self.events,
+            [{
+                "session_id": session["id"],
+                "type": "worktree_detached",
+                "worktree_id": None,
+                "working_dir": str(path),
+            }],
+        )
+        retried = await self.main.detach_session_worktree(session["id"])
+        self.assertEqual(retried, detached)
+
+        self.assertEqual(
+            await self.main.delete_worktree(worktree["id"]),
+            {"status": "deleted"},
+        )
+        self.assertFalse(path.exists())
+        self.assertEqual(
+            self.database.require_session(session["id"])["working_dir"],
+            str(path),
+        )
+
+    async def test_live_or_project_directory_session_cannot_detach(self) -> None:
+        project = self.make_project()
+        worktree, _ = await self.worktree_for(project)
+        attached = await self.create(
+            name="attached",
+            project_path=project["path"],
+            worktree_id=worktree["id"],
+        )
+        plain = await self.create(name="plain", project_path=project["path"])
+
+        with self.assertRaises(HTTPException) as caught:
+            await self.main.detach_session_worktree(attached["id"])
+        self.assertEqual(caught.exception.status_code, 409)
+
+        await self.set_archived(plain["id"], True)
+        with self.assertRaises(HTTPException) as caught:
+            await self.main.detach_session_worktree(plain["id"])
+        self.assertEqual(caught.exception.status_code, 409)
+
+    async def test_live_detached_session_protects_its_worktree_directory(self) -> None:
+        project = self.make_project()
+        worktree, path = await self.worktree_for(project)
+        session = await self.create(
+            name="one", project_path=project["path"], worktree_id=worktree["id"]
+        )
+        await self.set_archived(session["id"], True)
+        await self.main.detach_session_worktree(session["id"])
+        await self.set_archived(session["id"], False)
+
+        with self.assertRaises(HTTPException) as caught:
+            await self.main.delete_worktree(worktree["id"])
+
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertIn("one", caught.exception.detail)
+        self.assertTrue(path.is_dir())
+        self.assertIsNotNone(self.database.get_worktree(worktree["id"]))
+
+        # Archiving removes the active cwd dependency; detachment can now serve
+        # its cleanup purpose without losing the path stored on the session.
+        await self.set_archived(session["id"], True)
+        self.assertEqual(
+            await self.main.delete_worktree(worktree["id"]),
+            {"status": "deleted"},
+        )
+        self.assertFalse(path.exists())
+
+    async def test_detached_session_requires_its_directory_to_unarchive(self) -> None:
+        project = self.make_project()
+        worktree, path = await self.worktree_for(project)
+        session = await self.create(
+            name="one", project_path=project["path"], worktree_id=worktree["id"]
+        )
+        await self.set_archived(session["id"], True)
+        await self.main.detach_session_worktree(session["id"])
+        await self.main.delete_worktree(worktree["id"])
+
+        with self.assertRaises(HTTPException) as caught:
+            await self.set_archived(session["id"], False)
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertIn(str(path), caught.exception.detail)
+        self.assertIsNotNone(
+            self.database.require_session(session["id"])["archived_at"]
+        )
+
+        path.mkdir()
+        restored = await self.set_archived(session["id"], False)
+        self.assertIsNone(restored["archived_at"])
+        self.assertEqual(restored["working_dir"], str(path))
+
     async def test_archiving_a_running_session_is_refused(self) -> None:
         project = self.make_project(repo=False)
         session = await self.create(name="one", project_path=project["path"])
@@ -1933,6 +2096,30 @@ class ArchiveEndpointTests(SessionEndpointTestCase):
         # The one archived by hand beforehand stays exactly where it was.
         self.assertEqual(
             self.database.require_session(two["id"])["archived_at"], filed
+        )
+
+    async def test_project_unarchive_refuses_missing_detached_directories(
+        self,
+    ) -> None:
+        project = self.make_project()
+        worktree, path = await self.worktree_for(project)
+        session = await self.create(
+            name="one", project_path=project["path"], worktree_id=worktree["id"]
+        )
+        await self.set_project_archived(project["path"], True)
+        await self.main.detach_session_worktree(session["id"])
+        await self.main.delete_worktree(worktree["id"])
+
+        with self.assertRaises(HTTPException) as caught:
+            await self.set_project_archived(project["path"], False)
+
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertIn(str(path), caught.exception.detail)
+        self.assertIsNotNone(
+            self.database.get_project(project["path"])["archived_at"]
+        )
+        self.assertIsNotNone(
+            self.database.require_session(session["id"])["archived_at"]
         )
 
     async def test_unknown_project_is_404(self) -> None:

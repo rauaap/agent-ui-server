@@ -22,12 +22,13 @@ Three things to remove:
 | Gone | Replacement |
 |---|---|
 | `worktree: { path, branch }` block in `POST /sessions` | `POST /worktrees` first, then `worktree_id` in `POST /sessions` |
-| `owns_worktree` on session objects | `worktree_id` — `null` means the session runs in the project directory |
+| `owns_worktree` on session objects | `worktree_id` — `null` means the session runs in the project directory, unless it was previously detached while preserving its former path |
 | `worktree_removed` / `worktree_error` in the `DELETE /sessions/{id}` response | Nothing. That response is now `{"status": "deleted"}`; removal moved to `DELETE /worktrees/{id}` |
 
-`working_dir` is **unchanged** on every session object and still means "the cwd
-the agent runs in." It is now computed server-side rather than stored, which is
-invisible to you — keep rendering it exactly as before.
+`working_dir` is **unchanged** on every session object and still means "the
+effective cwd the agent runs in." Treat it as server-supplied and authoritative:
+it can come from the current worktree, the project directory, or a former
+worktree path preserved during detachment. Keep rendering it exactly as before.
 
 The `worktree_errors` array in the `DELETE /projects` response lost its
 `"session"` key (worktrees no longer belong to one session) and kept `"path"`
@@ -231,6 +232,7 @@ Removes the directory (`git worktree remove`, **never** `--force`) and the row.
 |---|---|---|
 | `404` | `Worktree not found` | Already gone; refresh |
 | `409` | `2 session(s) are still using this worktree: fix login, review` | See [Deleting a worktree](#deleting-a-worktree) |
+| `409` | `1 live detached session(s) still use this worktree directory: fix login` | Archive those sessions before retrying |
 | `409` | `fatal: '…' contains modified or untracked files, use --force to delete it` | See [Deleting a worktree](#deleting-a-worktree) |
 
 On any `409`, **nothing was removed and the row is still there** — re-render
@@ -250,6 +252,33 @@ the project directory. Errors specific to it:
 |---|---|---|
 | `404` | `Worktree not found` | Stale id — refresh the worktree list |
 | `400` | `worktree belongs to a different project` | Your picker offered a worktree from another project |
+
+### `POST /sessions/{id}/detach-worktree`
+
+Detaches an archived session from its worktree without changing the absolute
+`working_dir` to which its agent harness is bound. The response is the updated
+session: `worktree_id` is `null`, while `working_dir` remains the old worktree
+path. It does not remove anything from disk; call `DELETE /worktrees/{id}`
+separately once nothing remains attached.
+
+The session must already be archived. The first call requires an attached
+worktree; it saves that worktree's path before clearing the link. On a retry,
+that saved path distinguishes an already-completed detach (`200`) from a session
+that always ran in its project directory (`409`). Clients may therefore retry
+after losing the response. Archiving itself never detaches implicitly. The
+client offers detachment later from an archived session's settings, not during
+archival and not as an automatic follow-up to it.
+
+Detachment emits:
+
+```jsonc
+{ "type": "worktree_detached", "worktree_id": null,
+  "working_dir": "/projects/app-fix-login" }
+```
+
+A detached session can be unarchived only while `working_dir` names an existing
+directory. It need not still be a Git worktree; the harness cares about the
+absolute directory rather than Git metadata.
 
 ## UX
 
@@ -292,11 +321,28 @@ worth a hint rather than a hard validation.
 
 ### Deleting a worktree
 
-Two distinct `409`s, and neither is a failure the user should read as an error:
+Three distinct `409`s, and none is a failure the user should read as an error:
 
-**Sessions still attached.** The server lists their names in `detail`. Offer to
-show or delete those sessions, then retry. Do not offer to force it — there is
-no force for this case.
+**Sessions still attached.** The server lists their names in `detail`. Show
+those names and explain the available actions, but do not provide a guided
+cleanup workflow from the deletion error: a live session must be deleted, or
+archived and subsequently detached through Session settings; an archived
+session can be detached directly through Session settings. Once every session
+has been deleted or detached, the user can retry worktree deletion. Do not
+automatically archive, detach, or delete anything, and do not offer to force it
+— there is no force for this case.
+
+**Live detached sessions still using the directory.** A detached session may be
+unarchived without reattaching to the worktree row. While live, its preserved
+`working_dir` is an active harness dependency, so the server refuses to remove a
+registered worktree at that path. Show the supplied session names and ask the
+user to archive them before retrying. Do not silently archive them.
+
+**Pre-delete warning for archived detached sessions.** `GET /worktrees` has no
+detached-session count. Before deletion, inspect `GET /sessions` and match rows
+where `worktree_id === null`, `working_dir === worktree.path`, and
+`archived_at !== null`. Warn that deleting the worktree may remove the directory
+those sessions require for future unarchiving.
 
 **Dirty tree.** git counts **untracked** files as dirty, so any worktree an
 agent did real work in will refuse. This is the *common* path, not an edge case.
@@ -353,14 +399,15 @@ outside the app. Two things follow:
 
 ## Session objects
 
-Only one field is new:
+The current session shape includes both worktree and archive state:
 
 ```jsonc
 { "id": 12, "name": "fix login", "project_id": 1,
-  "worktree_id": 1,                              // null when in the project directory
-  "working_dir": "/projects/app-fix-login",      // unchanged meaning
+  "worktree_id": 1,                              // null in project directory or detached
+  "working_dir": "/projects/app-fix-login",      // server-supplied effective cwd
   "agent": "claude-code", "agent_session_id": null,
   "status": "idle", "created_at": "…", "last_active_at": "…",
+  "archived_at": null,
   "auto_approve_write": false, "auto_approve_command": false }
 ```
 
@@ -377,8 +424,9 @@ Do not design UI that implies these work — none of them have an endpoint:
 - Attaching a worktree to an **existing** branch or an arbitrary commit-ish.
 - Forced removal (`--force`) of a dirty worktree.
 - Moving a session to a different worktree after it is created. `worktree_id` is
-  set at creation and there is no `PATCH` for it. (`PATCH /sessions/{id}` still
-  handles `name` and the auto-approve toggles only.)
+  set at creation and there is no `PATCH` for it. `PATCH /sessions/{id}` handles
+  `name`, the auto-approve toggles, and `archived`; detachment has its own
+  endpoint and cannot move a session to another worktree.
 - Renaming or moving a worktree's `path`.
 - Adopting a worktree that already exists on disk into the app.
 - Any project endpoint keyed by `id` — the HTTP API stays path-keyed.

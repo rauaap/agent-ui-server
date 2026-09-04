@@ -213,6 +213,7 @@ and access is still "you are on the WireGuard network or you are not."
 | `GET`    | `/sessions`             | List all sessions with metadata                                  |
 | `POST`   | `/sessions`             | Create a session (`name`, `project_path`, `agent`, `worktree_id`) → `201` |
 | `PATCH`  | `/sessions/{id}`        | Update a session: rename (`name`), auto-approve toggles, `archived` |
+| `POST`   | `/sessions/{id}/detach-worktree` | Detach an archived session while preserving its working directory |
 | `POST`   | `/sessions/{id}/turn`   | Send a prompt and spawn a turn → `202`                           |
 | `POST`   | `/sessions/{id}/bash`   | Run a shell command (`command`), bypassing the agent → `202`     |
 | `POST`   | `/sessions/{id}/stop`   | Stop the running process and any shell command, status → `idle`  |
@@ -237,6 +238,16 @@ toggles (see [Auto-approval](#auto-approval)) and broadcast a `settings` event.
 `archived` files the session away or brings it back; see
 [Archiving](#archiving). All three broadcasts reach every WebSocket subscriber,
 so connected clients update live.
+
+`POST /sessions/{id}/detach-worktree` requires an archived session. On the first
+call it must be attached to a worktree: the server copies that path into the
+session's internal `detached_working_dir`, clears `worktree_id`, and returns the
+updated session. Its public `working_dir` therefore stays unchanged. On a retry,
+`worktree_id` is already `null`, but the saved detached path tells the server the
+operation previously completed, so it returns the same session successfully. A
+live session or a project-directory session (both path fields `null`) returns
+`409`. The operation never touches the filesystem; deleting the now-unreferenced
+worktree remains a separate request.
 
 #### `GET /agents`
 
@@ -420,6 +431,13 @@ attaching session — a `mkdir` would hand the agent a plain directory dressed u
 as a worktree — so attaching to one whose directory is gone succeeds and shows
 up as `exists: false`.
 
+An archived session can explicitly detach through
+`POST /sessions/{id}/detach-worktree`. Detachment preserves its absolute
+`working_dir` but removes its reference from the worktree's `session_count`, so
+that worktree can be deleted once every attached session has detached or been
+deleted. Archiving does not detach automatically; clients decide whether to
+compose those two operations.
+
 `DELETE /sessions/{id}` never touches a directory. A worktree outlives the
 sessions that used it: others may still be attached, and even the last one
 leaving does not mean the user is finished with the branch. Removing it is a
@@ -428,7 +446,10 @@ separate decision, and a separate request.
 `DELETE /worktrees/{id}` removes the directory and the row, and answers `409`
 with the reason in `detail` when it cannot:
 
-- sessions are still attached — their names are listed, delete them first;
+- sessions are still attached — their names are listed; delete them, or detach
+  them first when they are archived;
+- a live detached session still uses the worktree path as its harness working
+  directory — archive it before retrying;
 - git refuses because the tree has uncommitted or untracked work.
 
 Removal is **never forced**. Expect the dirty case to be the *common* outcome
@@ -482,6 +503,8 @@ either way.)
 { "type": "settings", "auto_approve_write": false,                    // auto-approve toggles changed
   "auto_approve_command": true }
 { "type": "archived", "archived_at": "2026-08-26T11:02:00Z" }         // filed away; null = brought back
+{ "type": "worktree_detached", "worktree_id": null,                 // archived session detached
+  "working_dir": "/projects/app-fix-login" }
 { "type": "done" }                                                    // turn complete
 { "type": "error", "message": "..." }
 
@@ -623,7 +646,10 @@ beforehand keeps its own timestamp and stays archived through the whole cycle.
 
 Unarchiving a *session* takes its project with it, since a live session under an
 archived project would have nowhere to show — but only that one session comes
-back, not everything the project's archive swept up.
+back, not everything the project's archive swept up. Since agent harnesses bind
+a resumed session to its absolute working directory, unarchiving returns `409`
+if that directory is missing. Project unarchive preflights every session its
+cascade would restore and likewise writes nothing if any directory is missing.
 
 **Archived is read-only, not sealed.** The scrollback still replays over the
 WebSocket, and the session can still be renamed, have its toggles flipped, and be
@@ -637,7 +663,11 @@ governs — a worktree is reached through its project — so they have no
 `archived_at`, `GET /worktrees` still returns an archived project's worktrees,
 and `DELETE /worktrees/{id}` still removes them. Archiving a project therefore
 leaves its worktrees on disk; they hold real uncommitted work and come off only
-through their own endpoint.
+through their own endpoint. Archived sessions remain attached by default, but a
+client may explicitly detach them before requesting worktree deletion. If a
+detached session is later unarchived, its preserved path becomes an active
+working-directory dependency and protects a still-registered worktree at that
+path from deletion until the session is archived again.
 
 **A busy session cannot be archived.** Archiving something mid-turn would leave
 it writing scrollback into a session the user has filed away, so a session whose
@@ -695,7 +725,8 @@ if you need the current branch.
 | `id`                | INTEGER PK | Autoincrement — never reused, so a stale URL cannot hit a later session |
 | `name`              | TEXT    | Human-readable label                                        |
 | `project_id`        | INTEGER FK | References `projects.id` (`ON DELETE CASCADE`), `NOT NULL` |
-| `worktree_id`       | INTEGER FK | References `worktrees.id` (`ON DELETE RESTRICT`); `NULL` means "runs in the project directory" |
+| `worktree_id`       | INTEGER FK | References `worktrees.id` (`ON DELETE RESTRICT`); `NULL` for project-directory and detached sessions |
+| `detached_working_dir` | TEXT | Original worktree path after explicit detachment; otherwise `NULL`; internal |
 | `agent`             | TEXT    | Which adapter to use, e.g. `claude-code`, `opencode`, or `pi` |
 | `agent_session_id`  | TEXT    | The agent's own resume id; `NULL` until the first turn completes |
 | `status`            | TEXT    | `idle` \| `running` \| `awaiting_approval`                  |
@@ -707,10 +738,11 @@ if you need the current branch.
 | `auto_approve_command` | INTEGER | `0`/`1` — auto-approve shell commands (default `0`)      |
 
 **There is no `working_dir` column.** Every session response carries one, but it
-is computed: `COALESCE(worktrees.path, projects.path)`. A session runs in its
-worktree if it has one and in its project's directory otherwise — there is no
-third possibility, so storing a copy would only be a second place for the same
-path to live, and to drift once several sessions share one worktree.
+is computed as the first non-null value of `worktrees.path`,
+`sessions.detached_working_dir`, and `projects.path`. The detached path is filled
+only when an archived worktree session explicitly severs its foreign-key link;
+while links are live, project and worktree paths still have a single source of
+truth.
 
 ### `scrollback` (append-only)
 
@@ -764,11 +796,11 @@ schema says structurally — the cwd is derived from the links, and "we created
 this directory" is a `worktrees` row existing. Session ids are preserved here,
 so unlike v3 this leaves `scrollback` untouched.
 
-The archiving columns are added by plain `ALTER TABLE` on open, for any database
-that does not have them yet. They run *after* every rebuild above rather than
-before: archiving postdates all of them, and each one copies an explicit column
-list into a fresh table, so columns added first would only be dropped again by
-whichever rebuild still had to run.
+The archiving columns and `sessions.detached_working_dir` are added by plain
+`ALTER TABLE` on open for any database that does not have them yet. They run
+*after* every rebuild above rather than before: these features postdate all of
+them, and each rebuild copies an explicit column list into a fresh table, so
+columns added first would only be dropped again by whichever rebuild remained.
 
 ### In-memory state
 

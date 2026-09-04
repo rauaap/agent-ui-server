@@ -26,14 +26,14 @@ BOOL_COLUMNS = tuple(
     f"auto_approve_{category}" for category in AUTO_APPROVE_CATEGORIES
 )
 
-# A session row with `working_dir` computed rather than stored. A session runs
-# in its worktree when it has one and in its project's directory otherwise —
-# there is no third possibility, so keeping a copy on the row would only be a
-# second place for the same path to live, and to drift once several sessions
-# share one worktree.
+# A session row with `working_dir` computed rather than stored. An attached
+# session takes the worktree's path, a detached one keeps the path it was bound
+# to, and an ordinary session takes the project's path. `detached_working_dir`
+# is populated only while severing a worktree link, so live links do not keep a
+# duplicate copy of the worktree path.
 _SESSION_QUERY = """
     SELECT s.id, s.name, s.project_id, s.worktree_id,
-           COALESCE(w.path, p.path) AS working_dir,
+           COALESCE(w.path, s.detached_working_dir, p.path) AS working_dir,
            s.agent, s.agent_session_id, s.status,
            s.created_at, s.last_active_at, s.archived_at,
            s.auto_approve_write, s.auto_approve_command
@@ -53,11 +53,14 @@ _SESSION_QUERY = """
 # project cascades to its sessions, and this records which sessions went along
 # for the ride so unarchiving the project can restore exactly those and leave
 # the ones archived on their own account alone.
-_ARCHIVE_COLUMNS = {
+_POST_MIGRATION_COLUMNS = {
     "projects": {"archived_at": "TEXT"},
     "sessions": {
         "archived_at": "TEXT",
         "archived_with_project": "INTEGER NOT NULL DEFAULT 0",
+        # The immutable harness cwd after an archived session is detached from
+        # its worktree. NULL while the project/worktree link still supplies it.
+        "detached_working_dir": "TEXT",
     },
 }
 
@@ -120,9 +123,10 @@ class Database:
                 )
                 """
             )
-            # `worktree_id` NULL means the session runs in its project's own
-            # directory. The RESTRICT is a backstop: `delete_worktree` refuses
-            # while sessions are attached, so nothing should reach it.
+            # `worktree_id` links a session to a managed worktree. NULL usually
+            # means the project directory; after explicit detachment the saved
+            # `detached_working_dir` supplies its harness cwd instead. RESTRICT
+            # is the backstop behind delete_worktree's attached-session check.
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS sessions (
@@ -130,6 +134,7 @@ class Database:
                     name TEXT NOT NULL,
                     project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
                     worktree_id INTEGER REFERENCES worktrees(id) ON DELETE RESTRICT,
+                    detached_working_dir TEXT,
                     agent TEXT NOT NULL,
                     agent_session_id TEXT,
                     status TEXT NOT NULL,
@@ -202,11 +207,11 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_scrollback_session_id_id "
                 "ON scrollback(session_id, id)"
             )
-            # Archiving postdates every rebuild above, and each of them copies
-            # an explicit column list into a fresh table — so these have to be
-            # added here rather than in the CREATE, or a database going through
-            # a rebuild on this same open would have them dropped again.
-            for table, columns in _ARCHIVE_COLUMNS.items():
+            # These features postdate every rebuild above, and each rebuild
+            # copies an explicit column list into a fresh table — so additions
+            # have to happen here or an older database would immediately lose
+            # them while being upgraded on this same open.
+            for table, columns in _POST_MIGRATION_COLUMNS.items():
                 self._add_missing_columns(table, columns)
 
     def _add_missing_columns(self, table: str, columns: dict[str, str]) -> None:
@@ -690,6 +695,79 @@ class Database:
                 (worktree_id,),
             ).fetchall()
         return [_row_to_session(row) for row in rows]
+
+    def list_live_detached_sessions_for_worktree(
+        self, worktree_id: int
+    ) -> list[dict[str, Any]]:
+        """Live detached sessions whose preserved cwd is this worktree's path."""
+        with self._lock:
+            rows = self._conn.execute(
+                _SESSION_QUERY.format(
+                    where=(
+                        "WHERE s.worktree_id IS NULL "
+                        "AND s.detached_working_dir = "
+                        "(SELECT path FROM worktrees WHERE id = ?) "
+                        "AND s.archived_at IS NULL"
+                    )
+                ),
+                (worktree_id,),
+            ).fetchall()
+        return [_row_to_session(row) for row in rows]
+
+    def list_sessions_archived_with_project(
+        self, project_id: int
+    ) -> list[dict[str, Any]]:
+        """Sessions a project unarchive would restore."""
+        with self._lock:
+            rows = self._conn.execute(
+                _SESSION_QUERY.format(
+                    where=(
+                        "WHERE s.project_id = ? "
+                        "AND s.archived_with_project = 1"
+                    )
+                ),
+                (project_id,),
+            ).fetchall()
+        return [_row_to_session(row) for row in rows]
+
+    def detach_session_from_worktree(self, session_id: int) -> dict[str, Any]:
+        """Sever an archived session's worktree link without changing its cwd.
+
+        The path copied here is the harness identity that must survive deletion
+        of the worktree row. A completed detach is idempotent so an HTTP client
+        can safely retry after losing the response.
+        """
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                """
+                SELECT s.archived_at, s.worktree_id, s.detached_working_dir,
+                       w.path AS worktree_path
+                FROM sessions s
+                LEFT JOIN worktrees w ON w.id = s.worktree_id
+                WHERE s.id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown session: {session_id}")
+            if row["archived_at"] is None:
+                raise ValueError("Session must be archived before detaching")
+            if row["worktree_id"] is None:
+                if row["detached_working_dir"] is not None:
+                    return self.require_session(session_id)
+                raise ValueError("Session is not attached to a worktree")
+            if row["worktree_path"] is None:
+                raise RuntimeError("Attached worktree is missing")
+
+            self._conn.execute(
+                """
+                UPDATE sessions
+                SET detached_working_dir = ?, worktree_id = NULL
+                WHERE id = ?
+                """,
+                (row["worktree_path"], session_id),
+            )
+        return self.require_session(session_id)
 
     # A project row plus the aggregates its card shows. The LEFT JOIN keeps
     # projects with no sessions, which report 0 / NULL. SQLite sorts NULL below

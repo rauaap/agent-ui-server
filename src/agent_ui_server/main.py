@@ -242,6 +242,22 @@ async def update_project(payload: UpdateProjectRequest) -> dict[str, Any]:
             )
         affected = db.archive_project(project["id"])
     else:
+        restoring = db.list_sessions_archived_with_project(project["id"])
+        missing = [
+            session for session in restoring
+            if not Path(session["working_dir"]).is_dir()
+        ]
+        if missing:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Cannot unarchive a project with missing session directories: "
+                    + ", ".join(
+                        f"{session['name']} ({session['working_dir']})"
+                        for session in missing
+                    )
+                ),
+            )
         affected = db.unarchive_project(project["id"])
 
     # The clients holding one of these sessions open are the reason this moved
@@ -495,6 +511,20 @@ async def delete_worktree(worktree_id: int) -> dict[str, Any]:
             ),
         )
 
+    # A detached session no longer references the worktree row, but once it is
+    # live its preserved cwd is an active harness dependency. Removing that
+    # directory would strand the session even though the foreign key permits it.
+    live_detached = db.list_live_detached_sessions_for_worktree(worktree_id)
+    if live_detached:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{len(live_detached)} live detached session(s) still use this "
+                "worktree directory: "
+                + ", ".join(session["name"] for session in live_detached)
+            ),
+        )
+
     project = db.get_project_by_id(worktree["project_id"])
     if project is not None:
         error = await git.remove_worktree(project["path"], worktree["path"])
@@ -535,6 +565,30 @@ async def update_session(
         session = await set_session_archived(session_id, payload.archived)
 
     return session if session is not None else require_session_or_404(session_id)
+
+
+@app.post("/sessions/{session_id}/detach-worktree")
+async def detach_session_worktree(session_id: int) -> dict[str, Any]:
+    """Detach an archived session while preserving its harness working directory.
+
+    This changes only the database association. Removing the worktree from disk
+    remains a separate, explicit `DELETE /worktrees/{id}` request.
+    """
+    require_session_or_404(session_id)
+    try:
+        session = db.detach_session_from_worktree(session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    await broadcast(
+        session_id,
+        {
+            "type": "worktree_detached",
+            "worktree_id": None,
+            "working_dir": session["working_dir"],
+        },
+    )
+    return session
 
 
 @app.post("/sessions/{session_id}/stop")
@@ -1010,6 +1064,18 @@ async def set_session_archived(session_id: int, archived: bool) -> dict[str, Any
     if archived and session_is_busy(current):
         raise HTTPException(
             status_code=409, detail="Cannot archive a session while it is busy"
+        )
+    if (
+        not archived
+        and current["archived_at"] is not None
+        and not Path(current["working_dir"]).is_dir()
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Cannot unarchive a session whose working directory is missing: "
+                + current["working_dir"]
+            ),
         )
 
     session = db.set_session_archived(session_id, archived)
