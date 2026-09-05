@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from . import git, shell
+from .actions import auto_approval_setting
 from .agent import AgentAdapter, ClaudeCodeAdapter, PiAdapter
 from .db import Database
 
@@ -855,14 +856,12 @@ async def run_turn(session_id: int, prompt: str) -> None:
             # carries the marker and we can skip the awaiting_approval status.
             # Re-read the session so a toggle flipped mid-turn applies on the
             # next approval, not only on the next turn.
-            auto_category: str | None = None
+            auto_setting: str | None = None
             if event_type == "approval_request":
-                category = event.get("category")
+                setting = auto_approval_setting(event.get("action"))
                 current = db.get_session(session_id) or session
-                if category in {"write", "command"} and current.get(
-                    f"auto_approve_{category}"
-                ):
-                    auto_category = category
+                if setting is not None and current.get(setting):
+                    auto_setting = setting
                     event = {**event, "auto_approved": True}
 
             persisted = event_type in {
@@ -873,7 +872,7 @@ async def run_turn(session_id: int, prompt: str) -> None:
                 "error",
             }
             awaiting = event_type == "question" or (
-                event_type == "approval_request" and auto_category is None
+                event_type == "approval_request" and auto_setting is None
             )
 
             def record_event() -> None:
@@ -907,7 +906,7 @@ async def run_turn(session_id: int, prompt: str) -> None:
 
             # Answer on the user's behalf right after the request is on the wire,
             # so the transcript shows the request followed by the auto-approval.
-            if auto_category is not None:
+            if auto_setting is not None:
                 await handle_approval(
                     session_id, event["request_id"], "allow", auto=True
                 )

@@ -11,8 +11,122 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
+from .actions import (
+    approval_request_event,
+    canonical_action,
+    other_action,
+    tool_use_event,
+)
+
 
 AgentEvent = dict[str, Any]
+
+
+def _optional(arguments: dict[str, Any], native: str, *, omit_empty: bool = False) -> dict[str, Any]:
+    """Return a one-field projection while preserving invalid values for validation."""
+    if native not in arguments or arguments[native] is None:
+        return {}
+    value = arguments[native]
+    if omit_empty and value == "":
+        return {}
+    return {native: value}
+
+
+def _normalized_or_other(name: Any, arguments: Any, provider: str) -> dict[str, Any]:
+    """Normalize one native call; malformed recognized calls safely become other."""
+    native_name = name if isinstance(name, str) else "tool"
+    args = arguments if isinstance(arguments, dict) else {}
+    try:
+        if provider == "claude":
+            if native_name == "Bash":
+                fields: dict[str, Any] = {"command": args.get("command"), "shell": "bash"}
+                if "description" in args and args["description"] is not None:
+                    if args["description"] != "":
+                        fields["description"] = args["description"]
+                if "timeout" in args and args["timeout"] is not None:
+                    fields["timeout_ms"] = args["timeout"]
+                return canonical_action("command", **fields)
+            if native_name == "Read":
+                return canonical_action("read", path=args.get("file_path"), **_optional(args, "offset"), **_optional(args, "limit"))
+            if native_name in {"Edit", "MultiEdit"}:
+                raw_edits = args.get("edits") if native_name == "MultiEdit" else [args]
+                edits = []
+                if isinstance(raw_edits, list):
+                    for edit in raw_edits:
+                        if not isinstance(edit, dict):
+                            edits.append(edit)
+                            continue
+                        item = {"old_text": edit.get("old_string"), "new_text": edit.get("new_string")}
+                        if "replace_all" in edit and edit["replace_all"] is not None:
+                            item["replace_all"] = edit["replace_all"]
+                        edits.append(item)
+                else:
+                    edits = raw_edits
+                return canonical_action("edit", path=args.get("file_path"), edits=edits)
+            if native_name == "Write":
+                return canonical_action("write", path=args.get("file_path"), content=args.get("content"))
+            if native_name == "Glob":
+                fields = {"mode": "files", "query": args.get("pattern")}
+                if "path" in args and args["path"] is not None:
+                    fields["path"] = args["path"]
+                return canonical_action("search", **fields)
+            if native_name == "Grep":
+                fields = {"mode": "content", "query": args.get("pattern")}
+                for native, canonical in (("path", "path"), ("glob", "glob"), ("head_limit", "limit")):
+                    if native in args and args[native] is not None:
+                        if canonical == "glob" and args[native] == "":
+                            continue
+                        fields[canonical] = args[native]
+                return canonical_action("search", **fields)
+            if native_name in {"WebFetch", "WebSearch"}:
+                operation = "fetch" if native_name == "WebFetch" else "search"
+                fields = {"operation": operation, "url" if operation == "fetch" else "query": args.get("url" if operation == "fetch" else "query")}
+                if "prompt" in args and args["prompt"] not in {None, ""}:
+                    fields["prompt"] = args["prompt"]
+                return canonical_action("web", **fields)
+            if native_name in {"Task", "Agent"}:
+                fields = {"description": args.get("description")}
+                for native, canonical in (("prompt", "prompt"), ("subagent_type", "agent")):
+                    if native in args and args[native] not in {None, ""}:
+                        fields[canonical] = args[native]
+                return canonical_action("task", **fields)
+        elif provider == "pi":
+            if native_name in {"bash", "powershell"}:
+                fields = {"command": args.get("command"), "shell": native_name}
+                if "timeout" in args and args["timeout"] is not None:
+                    timeout = args["timeout"]
+                    fields["timeout_ms"] = timeout * 1000 if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) else timeout
+                return canonical_action("command", **fields)
+            if native_name == "read":
+                return canonical_action("read", path=args.get("path"), **_optional(args, "offset"), **_optional(args, "limit"))
+            if native_name == "edit":
+                raw_edits = args.get("edits")
+                if raw_edits is None and ("oldText" in args or "newText" in args):
+                    raw_edits = [{"oldText": args.get("oldText"), "newText": args.get("newText")}]
+                edits = [{"old_text": item.get("oldText"), "new_text": item.get("newText")} if isinstance(item, dict) else item for item in raw_edits] if isinstance(raw_edits, list) else raw_edits
+                return canonical_action("edit", path=args.get("path"), edits=edits)
+            if native_name == "write":
+                return canonical_action("write", path=args.get("path"), content=args.get("content"))
+            if native_name in {"grep", "find"}:
+                fields = {"mode": "content" if native_name == "grep" else "files", "query": args.get("pattern")}
+                for field in ("path", "limit"):
+                    if field in args and args[field] is not None:
+                        fields[field] = args[field]
+                if native_name == "grep" and "glob" in args and args["glob"] is not None:
+                    if args["glob"] != "":
+                        fields["glob"] = args["glob"]
+                return canonical_action("search", **fields)
+            if native_name == "ls":
+                fields = {}
+                for field in ("path", "limit"):
+                    if field in args and args[field] is not None:
+                        fields[field] = args[field]
+                return canonical_action("list", **fields)
+    except (ValidationError, TypeError, ValueError):
+        pass
+    return other_action(native_name, args)
 
 
 @dataclass
@@ -228,18 +342,6 @@ class ClaudeCodeAdapter(AgentAdapter):
     # the user's pick into updatedInput.answers.
     QUESTION_TOOL = "AskUserQuestion"
 
-    # Maps a Claude Code tool name to an auto-approve category. Read-only tools
-    # are auto-allowed by `--permission-mode default` and never reach this gate,
-    # so only the mutating tools are listed; anything unmapped (e.g. WebFetch)
-    # always prompts.
-    TOOL_CATEGORIES = {
-        "Bash": "command",
-        "Write": "write",
-        "Edit": "write",
-        "MultiEdit": "write",
-        "NotebookEdit": "write",
-    }
-
     def __init__(self, executable: str | None = None) -> None:
         self.executable = executable or os.environ.get("CLAUDE_BIN", "claude")
         self.processes: dict[int, asyncio.subprocess.Process] = {}
@@ -250,6 +352,7 @@ class ClaudeCodeAdapter(AgentAdapter):
         # answers, and the spec is kept alongside so send_answer can validate.
         self.pending_questions: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self.pending_question_specs: dict[str, list[dict[str, Any]]] = {}
+        self.tool_actions: dict[tuple[int, str], dict[str, Any]] = {}
 
     async def start_turn(
         self,
@@ -339,6 +442,7 @@ class ClaudeCodeAdapter(AgentAdapter):
         finally:
             self.processes.pop(session_id, None)
             await self._clear_session_approvals(session_id, "Session ended")
+            self._clear_tool_actions(session_id)
             if not stderr_task.done():
                 stderr_task.cancel()
 
@@ -380,6 +484,7 @@ class ClaudeCodeAdapter(AgentAdapter):
     async def stop(self, session: dict[str, Any]) -> None:
         session_id = session["id"]
         await self._clear_session_approvals(session_id, "Session stopped")
+        self._clear_tool_actions(session_id)
 
         process = self.processes.get(session_id)
         if process is None:
@@ -404,27 +509,27 @@ class ClaudeCodeAdapter(AgentAdapter):
         event_type = event.get("type")
 
         if event_type == "assistant":
-            for output_event in self._assistant_events(event):
+            for output_event in self._assistant_events(event, session_id):
                 yield output_event
             return
 
         if event_type == "tool_use":
-            yield self._tool_use_event(event)
+            yield self._tool_use_event(event, session_id)
             return
 
         if event_type in {"control_request", "sdk_control_request"}:
-            request = self._approval_request_event(event)
-            if request is None:
+            native = self._permission_parts(event)
+            if native is None:
                 return
-
-            request_id = request["request_id"]
-            tool_input = request.get("input") or {}
+            request_id, tool, tool_input, _call_id = native
 
             # AskUserQuestion is a question for the user, not a run/deny gate:
             # surface it as a `question` event and answer it by writing the
             # user's pick into updatedInput.answers.
-            if request["tool"] == self.QUESTION_TOOL:
-                questions = _normalize_questions(tool_input.get("questions"))
+            if tool == self.QUESTION_TOOL:
+                questions = _normalize_questions(
+                    tool_input.get("questions") if isinstance(tool_input, dict) else None
+                )
                 loop = asyncio.get_running_loop()
                 answer_future: asyncio.Future[dict[str, Any]] = loop.create_future()
                 self.pending_questions[request_id] = answer_future
@@ -448,6 +553,10 @@ class ClaudeCodeAdapter(AgentAdapter):
                     self.pending_questions.pop(request_id, None)
                     self.pending_sessions.pop(request_id, None)
                     self.pending_question_specs.pop(request_id, None)
+                return
+
+            request = self._approval_request_event(event, session_id)
+            if request is None:
                 return
 
             loop = asyncio.get_running_loop()
@@ -481,7 +590,9 @@ class ClaudeCodeAdapter(AgentAdapter):
         if event_type == "error":
             yield {"type": "error", "message": self._error_message(event)}
 
-    def _assistant_events(self, event: dict[str, Any]) -> list[AgentEvent]:
+    def _assistant_events(
+        self, event: dict[str, Any], session_id: int = 0
+    ) -> list[AgentEvent]:
         message = event.get("message")
         if isinstance(message, dict):
             content = message.get("content")
@@ -504,28 +615,29 @@ class ClaudeCodeAdapter(AgentAdapter):
                     # control_request, so don't also emit a tool_use bubble.
                     if block.get("name") == self.QUESTION_TOOL:
                         continue
-                    events.append(self._tool_use_event(block))
+                    events.append(self._tool_use_event(block, session_id))
 
         if not events and event.get("text"):
             events.append({"type": "output", "text": event["text"]})
 
         return events
 
-    def _tool_use_event(self, event: dict[str, Any]) -> AgentEvent:
+    def _tool_use_event(
+        self, event: dict[str, Any], session_id: int = 0
+    ) -> AgentEvent:
         nested = event.get("tool_use") if isinstance(event.get("tool_use"), dict) else {}
         source = nested or event
-        return {
-            "type": "tool_use",
-            "tool": (
-                source.get("tool")
-                or source.get("tool_name")
-                or source.get("name")
-                or "tool"
-            ),
-            "input": source.get("input") or source.get("arguments") or {},
-        }
+        name = source.get("tool") or source.get("tool_name") or source.get("name") or "tool"
+        arguments = source.get("input") if "input" in source else source.get("arguments", {})
+        call_id = source.get("id") or source.get("tool_use_id") or f"tool_{uuid.uuid4().hex}"
+        call_id = str(call_id)
+        action = _normalized_or_other(name, arguments, "claude")
+        self.tool_actions[(session_id, call_id)] = action
+        return tool_use_event(call_id, action)
 
-    def _approval_request_event(self, event: dict[str, Any]) -> AgentEvent | None:
+    def _permission_parts(
+        self, event: dict[str, Any]
+    ) -> tuple[str, Any, Any, str] | None:
         request = event.get("request")
         if not isinstance(request, dict):
             request = event.get("control_request")
@@ -558,14 +670,22 @@ class ClaudeCodeAdapter(AgentAdapter):
             or {}
         )
 
-        return {
-            "type": "approval_request",
-            "request_id": request_id,
-            "tool": tool,
-            "input": tool_input,
-            "options": _event_options(self.OPTIONS),
-            "category": self.TOOL_CATEGORIES.get(tool),
-        }
+        call_id = request.get("tool_use_id") or event.get("tool_use_id") or f"tool_{uuid.uuid4().hex}"
+        return str(request_id), tool, tool_input, str(call_id)
+
+    def _approval_request_event(
+        self, event: dict[str, Any], session_id: int = 0
+    ) -> AgentEvent | None:
+        native = self._permission_parts(event)
+        if native is None:
+            return None
+        request_id, tool, tool_input, call_id = native
+        action = self.tool_actions.get((session_id, call_id))
+        if action is None:
+            action = _normalized_or_other(tool, tool_input, "claude")
+        return approval_request_event(
+            request_id, call_id, action, _event_options(self.OPTIONS)
+        )
 
     def _extract_session_id(self, event: dict[str, Any]) -> str | None:
         if event.get("session_id"):
@@ -674,6 +794,10 @@ class ClaudeCodeAdapter(AgentAdapter):
         process.stdin.write((json.dumps(payload) + "\n").encode("utf-8"))
         await process.stdin.drain()
 
+    def _clear_tool_actions(self, session_id: int) -> None:
+        for key in [key for key in self.tool_actions if key[0] == session_id]:
+            self.tool_actions.pop(key, None)
+
     async def _clear_session_approvals(self, session_id: int, reason: str) -> None:
         request_ids = [
             request_id
@@ -752,16 +876,6 @@ class PiAdapter(AgentAdapter):
         {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
         {"optionId": "deny", "name": "Deny", "kind": "reject_once"},
     ]
-
-    # Maps a Pi tool name to an auto-approve category. The extension lets the
-    # read-only tools through without a dialog, so only mutating ones appear
-    # here; anything unmapped prompts and cannot be auto-approved.
-    TOOL_CATEGORIES = {
-        "bash": "command",
-        "powershell": "command",
-        "edit": "write",
-        "write": "write",
-    }
 
     # Dialog methods that block the extension until answered. The fire-and-
     # forget ones (notify, setStatus, setWidget, ...) must NOT be answered.
@@ -848,6 +962,7 @@ class PiAdapter(AgentAdapter):
         #              until all `count` have arrived so the whole set reaches
         #              the client as one `question` event.
         tool_args: dict[str, dict[str, Any]] = {}
+        tool_actions: dict[str, dict[str, Any]] = {}
         deny_reasons: dict[str, str] = {}
         batches: dict[str, dict[str, Any]] = {}
         text_buf: list[str] = []
@@ -1015,7 +1130,9 @@ class PiAdapter(AgentAdapter):
                 return
 
             if kind == "approval":
-                tool_call_id = str(envelope.get("toolCallId") or "")
+                tool_call_id = str(
+                    envelope.get("toolCallId") or f"tool_{uuid.uuid4().hex}"
+                )
                 tool = str(envelope.get("toolName") or "tool")
                 request_id = f"perm_{uuid.uuid4().hex}"
                 future: asyncio.Future[ApprovalDecision] = loop.create_future()
@@ -1024,15 +1141,18 @@ class PiAdapter(AgentAdapter):
                 self.pending_options[request_id] = self.OPTIONS
 
                 await flush_text()
+                action = tool_actions.get(tool_call_id)
+                if action is None:
+                    action = _normalized_or_other(
+                        tool, tool_args.get(tool_call_id, {}), "pi"
+                    )
                 await queue.put(
-                    {
-                        "type": "approval_request",
-                        "request_id": request_id,
-                        "tool": tool,
-                        "input": tool_args.get(tool_call_id, {}),
-                        "options": _event_options(self.OPTIONS),
-                        "category": self.TOOL_CATEGORIES.get(tool),
-                    }
+                    approval_request_event(
+                        request_id,
+                        tool_call_id,
+                        action,
+                        _event_options(self.OPTIONS),
+                    )
                 )
                 # Resolved off the reader so a batch of parallel tool calls
                 # surfaces every approval at once instead of one at a time.
@@ -1074,15 +1194,18 @@ class PiAdapter(AgentAdapter):
                 tool = str(message.get("toolName") or "tool")
                 args = message.get("args")
                 args = args if isinstance(args, dict) else {}
-                tool_call_id = str(message.get("toolCallId") or "")
-                if tool_call_id:
-                    tool_args[tool_call_id] = args
+                tool_call_id = str(
+                    message.get("toolCallId") or f"tool_{uuid.uuid4().hex}"
+                )
+                tool_args[tool_call_id] = args
                 # The question tool is surfaced as a `question` event, so don't
                 # also emit a tool_use bubble for it.
                 if tool == self.QUESTION_TOOL:
                     return
+                action = _normalized_or_other(tool, args, "pi")
+                tool_actions[tool_call_id] = action
                 await flush_text()
-                await queue.put({"type": "tool_use", "tool": tool, "input": args})
+                await queue.put(tool_use_event(tool_call_id, action))
                 return
 
             if kind == "extension_ui_request":

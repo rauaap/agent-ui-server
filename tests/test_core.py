@@ -2362,6 +2362,7 @@ class ClaudeCodeAdapterParsingTests(unittest.TestCase):
                         {"type": "text", "text": "hello"},
                         {
                             "type": "tool_use",
+                            "id": "call-1",
                             "name": "Bash",
                             "input": {"command": "pwd"},
                         },
@@ -2373,7 +2374,11 @@ class ClaudeCodeAdapterParsingTests(unittest.TestCase):
         self.assertEqual(events[0], {"type": "output", "text": "hello"})
         self.assertEqual(
             events[1],
-            {"type": "tool_use", "tool": "Bash", "input": {"command": "pwd"}},
+            {
+                "type": "tool_use",
+                "call_id": "call-1",
+                "action": {"kind": "command", "command": "pwd", "shell": "bash"},
+            },
         )
 
     def test_permission_request_normalizes_to_approval_event(self) -> None:
@@ -2384,6 +2389,7 @@ class ClaudeCodeAdapterParsingTests(unittest.TestCase):
                     "subtype": "permission",
                     "request_id": "perm_1",
                     "tool_name": "Bash",
+                    "tool_use_id": "call-approval-1",
                     "input": {"command": "rm -rf /tmp/demo"},
                 },
             }
@@ -2394,13 +2400,16 @@ class ClaudeCodeAdapterParsingTests(unittest.TestCase):
             {
                 "type": "approval_request",
                 "request_id": "perm_1",
-                "tool": "Bash",
-                "input": {"command": "rm -rf /tmp/demo"},
+                "call_id": "call-approval-1",
+                "action": {
+                    "kind": "command",
+                    "command": "rm -rf /tmp/demo",
+                    "shell": "bash",
+                },
                 "options": [
                     {"id": "allow", "name": "Allow", "kind": "allow_once"},
                     {"id": "deny", "name": "Deny", "kind": "reject_once"},
                 ],
-                "category": "command",
             },
         )
 
@@ -2412,6 +2421,7 @@ class ClaudeCodeAdapterParsingTests(unittest.TestCase):
                 "request": {
                     "subtype": "can_use_tool",
                     "tool_name": "Write",
+                    "tool_use_id": "call-approval-2",
                     "input": {"file_path": "/projects/demo/a.txt", "content": "hi"},
                 },
             }
@@ -2422,19 +2432,20 @@ class ClaudeCodeAdapterParsingTests(unittest.TestCase):
             {
                 "type": "approval_request",
                 "request_id": "1",
-                "tool": "Write",
-                "input": {"file_path": "/projects/demo/a.txt", "content": "hi"},
+                "call_id": "call-approval-2",
+                "action": {
+                    "kind": "write",
+                    "path": "/projects/demo/a.txt",
+                    "content": "hi",
+                },
                 "options": [
                     {"id": "allow", "name": "Allow", "kind": "allow_once"},
                     {"id": "deny", "name": "Deny", "kind": "reject_once"},
                 ],
-                "category": "write",
             },
         )
 
-    def test_approval_request_category_none_for_read_only_tool(self) -> None:
-        # Read-only tools never reach the gate, but if one did it carries no
-        # auto-approve category (it is unmapped).
+    def test_approval_request_normalizes_read_only_tool(self) -> None:
         event = self.adapter._approval_request_event(
             {
                 "type": "control_request",
@@ -2446,7 +2457,8 @@ class ClaudeCodeAdapterParsingTests(unittest.TestCase):
                 },
             }
         )
-        self.assertIsNone(event["category"])
+        self.assertEqual(event["action"], {"kind": "read", "path": "/projects/demo/a.txt"})
+        self.assertNotIn("category", event)
 
     def test_result_session_id_is_extracted_from_nested_payload(self) -> None:
         session_id = self.adapter._extract_session_id(
@@ -2501,6 +2513,7 @@ class ClaudeCodeAdapterParsingTests(unittest.TestCase):
                         },
                         {
                             "type": "tool_use",
+                            "id": "call-2",
                             "name": "Bash",
                             "input": {"command": "pwd"},
                         },
@@ -2513,7 +2526,11 @@ class ClaudeCodeAdapterParsingTests(unittest.TestCase):
             events,
             [
                 {"type": "output", "text": "thinking"},
-                {"type": "tool_use", "tool": "Bash", "input": {"command": "pwd"}},
+                {
+                    "type": "tool_use",
+                    "call_id": "call-2",
+                    "action": {"kind": "command", "command": "pwd", "shell": "bash"},
+                },
             ],
         )
 
@@ -2546,11 +2563,6 @@ class PiAdapterParsingTests(unittest.TestCase):
         self.assertIsNone(self.adapter._envelope(json.dumps({"agent-ui": 99})))
         self.assertIsNone(self.adapter._envelope('{"agent-ui":'))
         self.assertIsNone(self.adapter._envelope(None))
-
-    def test_only_mutating_tools_map_to_a_category(self) -> None:
-        self.assertEqual(PiAdapter.TOOL_CATEGORIES["bash"], "command")
-        self.assertEqual(PiAdapter.TOOL_CATEGORIES["write"], "write")
-        self.assertNotIn("read", PiAdapter.TOOL_CATEGORIES)
 
     def test_bundled_node_dir_prefers_a_node_beside_pi(self) -> None:
         # pi's launcher is `#!/usr/bin/env node`, so PATH decides which Node it
@@ -2670,14 +2682,20 @@ for line in sys.stdin:
         by_type = {e["type"]: e for e in events}
 
         self.assertEqual(
-            by_type["tool_use"], {"type": "tool_use", "tool": "bash",
-                                  "input": {"command": "echo hi"}}
+            by_type["tool_use"],
+            {
+                "type": "tool_use",
+                "call_id": "c1",
+                "action": {
+                    "kind": "command", "command": "echo hi", "shell": "bash"
+                },
+            },
         )
         approval = by_type["approval_request"]
         # The dialog carries only an id; the arguments come from the
         # tool_execution_start that precedes it.
-        self.assertEqual(approval["input"], {"command": "echo hi"})
-        self.assertEqual(approval["category"], "command")
+        self.assertEqual(approval["call_id"], "c1")
+        self.assertEqual(approval["action"], by_type["tool_use"]["action"])
         self.assertEqual(by_type["output"]["text"], "done!")
         self.assertEqual(by_type["done"]["session_id"], "sess-abc")
 
@@ -3063,13 +3081,17 @@ class _AutoApproveAdapter:
 
     async def start_turn(self, session, prompt):
         self.future = asyncio.get_running_loop().create_future()
+        action = (
+            {"kind": "command", "command": "ls"}
+            if self.category == "command"
+            else {"kind": "read", "path": "README.md"}
+        )
         yield {
             "type": "approval_request",
             "request_id": "perm_1",
-            "tool": "Bash",
-            "input": {"command": "ls"},
+            "call_id": "call-1",
+            "action": action,
             "options": [],
-            "category": self.category,
         }
         await self.future
         yield {"type": "done", "session_id": "agent-1"}
