@@ -1,13 +1,13 @@
 /**
- * agent-ui-server's pi extension — approval gate + AskUserQuestion.
+ * agent-ui-server's Pi extension — approval gate + AskUserQuestion.
  *
  * Pi ships no permission system by design ("built-in tools can read files,
  * write files, edit files, and run shell commands with the permissions of the
- * pi process") and no tool for asking the user a question. Both are things
+ * Pi process") and no tool for asking the user a question. Both are things
  * agent-ui-server's wire contract requires, so both are built here. This file is
- * the pi-side counterpart of PiAdapter and is passed to the child with `-e`.
+ * the Pi-side counterpart of PiAdapter and is passed to the child with `-e`.
  *
- * Transport. In RPC mode `ctx.ui.select` / `ctx.ui.input` are not dialogs — pi
+ * Transport. In RPC mode `ctx.ui.select` / `ctx.ui.input` are not dialogs — Pi
  * swaps in implementations that write an `extension_ui_request` line to stdout
  * and resolve when the client answers with `extension_ui_response` on stdin.
  * The client is PiAdapter, which relays to the phone. Neither call has a field
@@ -30,11 +30,11 @@ const MARKER = "agent-ui";
 
 /**
  * Tools that never reach the gate. Claude Code auto-allows reads upstream, so
- * its adapter only sees mutating calls; pi has no
+ * its adapter only sees mutating calls; Pi has no
  * such filter and hands us every call, so the equivalent list lives here.
  *
  * Deliberately an allowlist: an unrecognized tool (another extension's, or one
- * added by a future pi release) prompts rather than slipping through.
+ * added by a future Pi release) prompts rather than slipping through.
  */
 const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls"]);
 
@@ -117,7 +117,7 @@ function normalizeQuestions(raw: unknown): Question[] {
 /**
  * Parameter schema for the question tool.
  *
- * Must be a real TypeBox schema rather than a plain JSON Schema literal: pi
+ * Must be a real TypeBox schema rather than a plain JSON Schema literal: Pi
  * types `ToolDefinition.parameters` as `TSchema` and validates the model's
  * arguments against it, which relies on TypeBox's symbol-keyed metadata. The
  * `typebox` specifier is aliased for extensions, so this resolves wherever the
@@ -152,7 +152,7 @@ export default function (pi: ExtensionAPI) {
 	/**
 	 * Startup handshake.
 	 *
-	 * If this file fails to load, pi does not refuse to start — it emits an
+	 * If this file fails to load, Pi does not refuse to start — it emits an
 	 * `extension_error` and runs on with no gate, which is a silent fail-open.
 	 * PiAdapter therefore waits for this notification before sending the first
 	 * prompt, turning that into a startup error.
@@ -214,7 +214,7 @@ export default function (pi: ExtensionAPI) {
 	 *
 	 * The transport can only carry one question per dialog, so `execute` fans
 	 * the batch out into concurrent `select` calls stamped with a shared
-	 * `toolCallId`; pi runs dialogs concurrently, and PiAdapter reassembles them
+	 * `toolCallId`; Pi runs dialogs concurrently, and PiAdapter reassembles them
 	 * into the single `question` event the clients already render.
 	 */
 	pi.registerTool({
@@ -232,7 +232,7 @@ export default function (pi: ExtensionAPI) {
 			"Every option needs a label and a description explaining what picking it means.",
 		],
 		parameters: QUESTION_SCHEMA,
-		// Failures are raised, not returned: pi's AgentToolResult carries only
+		// Failures are raised, not returned: Pi's AgentToolResult carries only
 		// `content` and `details`, and its contract is to throw rather than
 		// encode an error in the content.
 		async execute(toolCallId, params, signal, _onUpdate, ctx) {

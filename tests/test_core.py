@@ -2296,6 +2296,9 @@ class ListAgentsTests(unittest.IsolatedAsyncioTestCase):
             [agent["id"] for agent in agents], list(main.adapters.keys())
         )
         self.assertEqual([agent["id"] for agent in agents], ["claude-code", "pi"])
+        self.assertEqual(
+            [agent["name"] for agent in agents], ["Claude Code", "Pi"]
+        )
 
     async def test_session_for_removed_adapter_is_inert_but_deletable(self) -> None:
         from agent_ui_server import main

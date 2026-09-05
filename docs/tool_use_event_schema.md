@@ -183,7 +183,7 @@ form still works:
 To pick a specific option, send its `option_id` (the server derives `behavior`
 from it, so `behavior` may be omitted). A denial may carry a free-form `message`
 explaining what to do instead. `message` is only meaningful on a **deny** — it is
-ignored when the resolved behavior is `allow`. Claude Code and pi both forward
+ignored when the resolved behavior is `allow`. Claude Code and Pi both forward
 it to the agent inline in the same turn:
 
 ```json

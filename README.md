@@ -65,7 +65,7 @@ agent-ui-server/
 ├── src/agent_ui_server/
 │   ├── main.py      # FastAPI app — REST routes, WebSocket endpoint, turn orchestration
 │   ├── agent.py     # AgentAdapter base + ClaudeCodeAdapter (stream-json) + PiAdapter (RPC)
-│   ├── pi_extension.ts            # Bundled pi extension — approval gate + AskUserQuestion
+│   ├── pi_extension.ts            # Bundled Pi extension — approval gate + AskUserQuestion
 │   ├── shell.py     # Bash mode — one-shot `bash -lc`, timeout + output caps
 │   ├── git.py       # Worktrees — `git` via argv, never through a shell
 │   └── db.py        # SQLite — session metadata + append-only scrollback
@@ -135,7 +135,7 @@ intend to use needs its own login:
 
 ```sh
 docker compose exec agent-ui-server claude login          # Claude Code
-docker compose exec agent-ui-server pi                     # pi (authenticate, then quit)
+docker compose exec agent-ui-server pi                     # Pi (authenticate, then quit)
 ```
 
 Credentials are persisted on the `claude-auth` named volume (mounted at
@@ -146,7 +146,7 @@ logged in. To force a fresh login, remove the volume:
 docker volume rm <project>_claude-auth
 ```
 
-The container image is Fedora-based and ships `uv`, the Claude Code CLI, the pi
+The container image is Fedora-based and ships `uv`, the Claude Code CLI, the Pi
 CLI, `git`, and a nested **Podman** stack (`privileged: true` + `/dev/fuse` +
 `fuse-overlayfs`) so agents can run containers inside their working directory.
 Host networking is used so the container sees the WireGuard interface directly.
@@ -167,8 +167,8 @@ host/port behavior is identical whether you use uv or Compose.
 | `PORT`         | `8000`        | Listen port                                      |
 | `SESSION_DB`   | `sessions.db` | SQLite database path                             |
 | `CLAUDE_BIN`   | `claude`      | Path/name of the Claude Code executable          |
-| `PI_BIN`       | `pi`          | Path/name of the pi executable                   |
-| `PI_EXTENSION` | bundled `pi_extension.ts` | pi extension supplying the approval gate and AskUserQuestion |
+| `PI_BIN`       | `pi`          | Path/name of the Pi executable                   |
+| `PI_EXTENSION` | bundled `pi_extension.ts` | Pi extension supplying the approval gate and AskUserQuestion |
 | `WEB_ROOT`     | unset         | Directory of static files to serve at `/`; unset serves no UI |
 | `BASH_TIMEOUT_SECONDS` | `120` | Bash mode: how long a command may run before it is killed |
 | `BASH_OUTPUT_LIMIT`    | `102400` | Bash mode: bytes kept per stream before output is truncated |
@@ -250,7 +250,7 @@ worktree remains a separate request.
 ```json
 [
   { "id": "claude-code", "name": "Claude Code", "default": true },
-  { "id": "pi",          "name": "pi",          "default": false }
+  { "id": "pi",          "name": "Pi",          "default": false }
 ]
 ```
 
@@ -519,8 +519,8 @@ tool — the agent asking the user to *pick content*, distinct from a tool
 allow/deny. A pending question reuses the `awaiting_approval` status; the client
 tells them apart by event type.
 
-Support is per agent. **Claude Code** has the tool built in. **pi** has no such
-tool, so the bundled extension registers one — see [pi](#pi).
+Support is per agent. **Claude Code** has the tool built in. **Pi** has no such
+tool, so the bundled extension registers one — see [Pi](#pi).
 
 ### Bash mode
 
@@ -577,8 +577,8 @@ in `stderr` rather than raised.
 
 A `deny` may carry a `message` explaining what the agent should do instead.
 **Claude Code** delivers the reason inline in the denial, so the agent reacts to
-it in the same turn. **pi** also delivers it inline: the extension's `tool_call`
-hook returns `{block: true, reason}`, and pi hands the reason to the model as the
+it in the same turn. **Pi** also delivers it inline: the extension's `tool_call`
+hook returns `{block: true, reason}`, and Pi hands the reason to the model as the
 tool's error result.
 
 If the session is stopped or the process exits while an approval is pending, the
@@ -594,7 +594,7 @@ human or answers `allow` itself.
 
 Every `approval_request` carries a `category` the adapter derives from the tool —
 Claude Code by tool name (`Bash` → `command`; `Write`/`Edit`/`MultiEdit`/
-`NotebookEdit` → `write`) and pi by tool name (`bash`/`powershell` → `command`;
+`NotebookEdit` → `write`) and Pi by tool name (`bash`/`powershell` → `command`;
 `edit`/`write` → `write`). When the matching session toggle is
 on, `run_turn` marks the request `auto_approved`, broadcasts it without entering
 `awaiting_approval`, and immediately answers `allow` on the user's behalf (the
@@ -603,8 +603,8 @@ the database on each approval, so flipping it mid-turn takes effect on the next
 tool call.
 
 There is no `read` toggle: read-only tools are auto-allowed by Claude Code's
-`--permission-mode default` and — since pi filters nothing itself — by the
-allowlist in the bundled pi extension, so they
+`--permission-mode default` and — since Pi filters nothing itself — by the
+allowlist in the bundled Pi extension, so they
 never reach this gate. Tools with no category (e.g. `WebFetch`) always prompt.
 
 ### Archiving
@@ -816,7 +816,7 @@ class AgentAdapter:
 | Agent           | Per-turn process                          | Resume                  | Tool approval                                  |
 |-----------------|-------------------------------------------|-------------------------|------------------------------------------------|
 | **Claude Code** | `claude -p --output-format stream-json`   | `--resume <id>`         | `--permission-prompt-tool stdio` via stdin     |
-| **pi**          | `pi --mode rpc` (JSONL over stdio)        | `--session <id>`        | bundled extension's `tool_call` hook, over pi's dialog protocol |
+| **Pi**          | `pi --mode rpc` (JSONL over stdio)        | `--session <id>`        | bundled extension's `tool_call` hook, over Pi's dialog protocol |
 
 Both shipping adapters are **one short-lived subprocess per turn** and surface
 real multiple-choice approvals; they only differ in wire protocol.
@@ -826,14 +826,14 @@ message to stdin, stream JSON events from stdout, and answer
 `control_request`/`sdk_control_request` permission prompts by writing a
 `control_response` back to stdin.
 
-**pi** speaks its **RPC mode** — newline-delimited JSON on stdio. Each turn the
+**Pi** speaks its **RPC mode** — newline-delimited JSON on stdio. Each turn the
 adapter spawns `pi --mode rpc -e <extension> --no-extensions` (plus `--session
 <id>` on resume), waits for the extension's handshake, sends `get_state` to
 learn the session id, then `prompt`, and maps the event stream (`message_update`
 → `output`, `tool_execution_start` → `tool_use`, `agent_settled` → `done`).
 
-Unlike the other two, pi ships **no permission system at all** — its own docs
-say built-in tools "run shell commands with the permissions of the pi process"
+Unlike the other two, Pi ships **no permission system at all** — its own docs
+say built-in tools "run shell commands with the permissions of the Pi process"
 and recommend containerization instead — and no tool for asking the user a
 question. Both are supplied by the bundled `pi_extension.ts`, which the adapter
 passes with `-e`:
@@ -844,23 +844,23 @@ passes with `-e`:
 - A registered `AskUserQuestion` tool takes a batch of 1-4 questions, matching
   Claude Code's shape.
 
-The extension reaches the adapter over pi's extension dialog protocol: it calls
-`ctx.ui.select` / `ctx.ui.input`, which pi serializes as `extension_ui_request`
+The extension reaches the adapter over Pi's extension dialog protocol: it calls
+`ctx.ui.select` / `ctx.ui.input`, which Pi serializes as `extension_ui_request`
 lines answered with `extension_ui_response`. Neither call carries structured
 data, so the extension JSON-encodes what the adapter needs into the dialog
 `title`; tool *arguments* are not sent that way but recovered from the
-`tool_execution_start` pi emits just before. A question batch becomes N
+`tool_execution_start` Pi emits just before. A question batch becomes N
 concurrent dialogs sharing one `toolCallId`, which the adapter reassembles into
 a single `question` event.
 
-Because the gate lives in an extension rather than in pi, a failure to load it
+Because the gate lives in an extension rather than in Pi, a failure to load it
 would leave the agent running unrestricted and silent. The extension therefore
 announces itself on `session_start`, and the adapter **refuses to send the
 prompt** until it does. `--no-extensions` is passed alongside `-e` so a
 project's own `.pi/extensions` cannot join the session and mutate tool input
 after the user has approved it.
 
-One deployment note: pi's launcher is `#!/usr/bin/env node`, so it runs under
+One deployment note: Pi's launcher is `#!/usr/bin/env node`, so it runs under
 whatever `node` is first on `PATH`. Under too old a Node it fails deep inside
 its own bundle with an unrelated-looking `SyntaxError`, so the adapter promotes
 the Node shipped beside the `pi` binary, when there is one, to the front of the

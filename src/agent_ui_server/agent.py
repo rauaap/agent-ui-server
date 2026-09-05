@@ -711,24 +711,24 @@ class ClaudeCodeAdapter(AgentAdapter):
 
 
 class PiAdapter(AgentAdapter):
-    """Adapter for pi over its RPC mode (`pi --mode rpc`).
+    """Adapter for Pi over its RPC mode (`pi --mode rpc`).
 
     RPC mode is newline-delimited JSON on stdio: we write commands to stdin
     (`prompt`, `get_state`) and read a stream of events and responses from
     stdout. Like Claude Code, each turn is one short-lived process —
     spawn, prompt, stream until `agent_settled`, exit — with continuity coming
-    from pi's own session store via `--session <id>`.
+    from Pi's own session store via `--session <id>`.
 
     Pi ships no permission system and no way to ask the user a question, so
     both are supplied by the bundled `pi_extension.ts`, passed with `-e`. That
-    extension reaches us through pi's extension dialog protocol: it calls
-    `ctx.ui.select` / `ctx.ui.input`, which pi serializes as
+    extension reaches us through Pi's extension dialog protocol: it calls
+    `ctx.ui.select` / `ctx.ui.input`, which Pi serializes as
     `extension_ui_request` lines that we answer with `extension_ui_response`.
     Neither call has a field for structured data, so the extension JSON-encodes
     what we need into `title`; `_envelope` unpacks it.
     """
 
-    LABEL = "pi"
+    LABEL = "Pi"
 
     # Envelope contract with pi_extension.ts. Bump both in step.
     MARKER = "agent-ui"
@@ -753,7 +753,7 @@ class PiAdapter(AgentAdapter):
         {"optionId": "deny", "name": "Deny", "kind": "reject_once"},
     ]
 
-    # Maps a pi tool name to an auto-approve category. The extension lets the
+    # Maps a Pi tool name to an auto-approve category. The extension lets the
     # read-only tools through without a dialog, so only mutating ones appear
     # here; anything unmapped prompts and cannot be auto-approved.
     TOOL_CATEGORIES = {
@@ -822,7 +822,7 @@ class PiAdapter(AgentAdapter):
                 limit=STREAM_LIMIT,
             )
         except FileNotFoundError as exc:
-            yield {"type": "error", "message": f"Unable to start pi: {exc}"}
+            yield {"type": "error", "message": f"Unable to start Pi: {exc}"}
             return
         except NotADirectoryError as exc:
             yield {"type": "error", "message": f"Invalid working directory: {exc}"}
@@ -838,7 +838,7 @@ class PiAdapter(AgentAdapter):
 
         # Per-turn correlation state.
         #  tool_args   toolCallId -> arguments, captured from
-        #              tool_execution_start, which pi emits before the approval
+        #              tool_execution_start, which Pi emits before the approval
         #              dialog. That ordering is why the dialog envelope only
         #              needs to carry an id.
         #  deny_reasons toolCallId -> the reason the client sent with a denial,
@@ -1108,7 +1108,7 @@ class PiAdapter(AgentAdapter):
                     await queue.put(
                         {
                             "type": "error",
-                            "message": f"pi {message.get('command')} failed: "
+                            "message": f"Pi {message.get('command')} failed: "
                             f"{message.get('error')}",
                         }
                     )
@@ -1120,7 +1120,7 @@ class PiAdapter(AgentAdapter):
                 await queue.put(
                     {
                         "type": "error",
-                        "message": f"pi extension error: {message.get('error')}",
+                        "message": f"Pi extension error: {message.get('error')}",
                     }
                 )
 
@@ -1145,7 +1145,7 @@ class PiAdapter(AgentAdapter):
                 # when the process dies early.
                 if not ready.done():
                     ready.set_exception(
-                        RuntimeError("pi exited before the extension loaded")
+                        RuntimeError("Pi exited before the extension loaded")
                     )
                 await queue.put(None)
 
@@ -1164,7 +1164,7 @@ class PiAdapter(AgentAdapter):
                 detail = stderr.strip() or str(exc)
                 yield {
                     "type": "error",
-                    "message": "pi started without the agent-ui extension, so no "
+                    "message": "Pi started without the agent-ui extension, so no "
                     f"tool would be gated. Refusing to run the turn. {detail}",
                 }
                 return
@@ -1185,10 +1185,10 @@ class PiAdapter(AgentAdapter):
             returncode = await self._terminate(process)
             stderr = await self._drain(stderr_task)
             if not done_emitted:
-                detail = stderr.strip() or f"pi exited with {returncode}"
+                detail = stderr.strip() or f"Pi exited with {returncode}"
                 yield {"type": "error", "message": detail}
         except Exception as exc:
-            yield {"type": "error", "message": f"pi RPC error: {exc}"}
+            yield {"type": "error", "message": f"Pi RPC error: {exc}"}
         finally:
             self.processes.pop(session_id, None)
             await self._clear_session_approvals(session_id, "Session ended")
@@ -1271,12 +1271,12 @@ class PiAdapter(AgentAdapter):
         return env
 
     def _bundled_node_dir(self) -> str | None:
-        """Directory of the Node that ships beside pi, if there is one.
+        """Directory of the Node that ships beside Pi, if there is one.
 
-        pi's launcher is `#!/usr/bin/env node`, so it runs under whatever Node
+        Pi's launcher is `#!/usr/bin/env node`, so it runs under whatever Node
         is first on PATH. Installed via its own installer it sits next to a
         pinned Node, and running it under an older system Node fails deep
-        inside pi's bundle with an unrelated-looking SyntaxError. Putting the
+        inside Pi's bundle with an unrelated-looking SyntaxError. Putting the
         neighbouring Node first turns that into a non-issue.
         """
         resolved = shutil.which(self.executable)
