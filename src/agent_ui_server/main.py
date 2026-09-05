@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import os
 from collections import defaultdict
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -16,6 +18,9 @@ from .db import Database
 
 
 SCROLLBACK_REPLAY_LIMIT = 200
+WEBSOCKET_LIVE_QUEUE_CAPACITY = 256
+WEBSOCKET_SEND_TIMEOUT_SECONDS = 30.0
+WEBSOCKET_CLOSE_TIMEOUT_SECONDS = 5.0
 
 app = FastAPI(title="agent-ui-server")
 db = Database(os.environ.get("SESSION_DB", "sessions.db"))
@@ -24,7 +29,22 @@ adapters: dict[str, AgentAdapter] = {
     "opencode": OpenCodeAdapter(),
     "pi": PiAdapter(),
 }
-subscribers: dict[int, set[WebSocket]] = defaultdict(set)
+
+
+@dataclass(eq=False)
+class Subscriber:
+    websocket: WebSocket
+    outbound: asyncio.Queue[dict[str, Any]]
+    writer: asyncio.Task[None] | None = None
+    retired: bool = False
+    closed: bool = False
+    send_failed: bool = False
+
+
+subscribers: dict[int, set[Subscriber]] = defaultdict(set)
+# Session ids are monotonic and the expected count is tiny. Keeping locks for
+# the process lifetime avoids unsafe cleanup while another task is waiting.
+stream_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 running_tasks: dict[int, asyncio.Task[None]] = {}
 # Bash-mode commands are tracked separately from agent turns on purpose: they
 # are allowed to run alongside one, so they must not share the turn's slot.
@@ -543,22 +563,27 @@ async def update_session(
     session: dict[str, Any] | None = None
 
     if payload.name is not None:
-        session = db.rename_session(session_id, payload.name)
-        await broadcast(session_id, {"type": "renamed", "name": payload.name})
+        session = await commit_stream(
+            session_id,
+            lambda: db.rename_session(session_id, payload.name),
+            lambda _session: [{"type": "renamed", "name": payload.name}],
+        )
 
     if payload.auto_approve_write is not None or payload.auto_approve_command is not None:
-        session = db.set_auto_approve(
+        session = await commit_stream(
             session_id,
-            write=payload.auto_approve_write,
-            command=payload.auto_approve_command,
-        )
-        await broadcast(
-            session_id,
-            {
-                "type": "settings",
-                "auto_approve_write": session["auto_approve_write"],
-                "auto_approve_command": session["auto_approve_command"],
-            },
+            lambda: db.set_auto_approve(
+                session_id,
+                write=payload.auto_approve_write,
+                command=payload.auto_approve_command,
+            ),
+            lambda updated: [
+                {
+                    "type": "settings",
+                    "auto_approve_write": updated["auto_approve_write"],
+                    "auto_approve_command": updated["auto_approve_command"],
+                }
+            ],
         )
 
     if payload.archived is not None:
@@ -575,20 +600,24 @@ async def detach_session_worktree(session_id: int) -> dict[str, Any]:
     remains a separate, explicit `DELETE /worktrees/{id}` request.
     """
     require_session_or_404(session_id)
-    try:
-        session = db.detach_session_from_worktree(session_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    await broadcast(
+    def detach() -> dict[str, Any]:
+        try:
+            return db.detach_session_from_worktree(session_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    return await commit_stream(
         session_id,
-        {
-            "type": "worktree_detached",
-            "worktree_id": None,
-            "working_dir": session["working_dir"],
-        },
+        detach,
+        lambda session: [
+            {
+                "type": "worktree_detached",
+                "worktree_id": None,
+                "working_dir": session["working_dir"],
+            }
+        ],
     )
-    return session
 
 
 @app.post("/sessions/{session_id}/stop")
@@ -599,8 +628,11 @@ async def stop_session(session_id: int) -> dict[str, str]:
     # Stop means everything this session is running, agent or not — otherwise a
     # runaway `!` command would have no kill switch short of the timeout.
     await cancel_bash(session_id)
-    db.update_status(session_id, "idle")
-    await broadcast(session_id, {"type": "status", "status": "idle"})
+    await commit_stream(
+        session_id,
+        lambda: db.update_status(session_id, "idle"),
+        lambda _result: [{"type": "status", "status": "idle"}],
+    )
     return {"status": "idle"}
 
 
@@ -631,23 +663,64 @@ async def start_bash(session_id: int, payload: BashRequest) -> dict[str, str]:
 
 @app.websocket("/ws/sessions/{session_id}")
 async def session_websocket(websocket: WebSocket, session_id: int) -> None:
-    session = db.get_session(session_id)
-    if session is None:
+    if db.get_session(session_id) is None:
         await websocket.close(code=1008)
         return
 
     await websocket.accept()
-    subscribers[session_id].add(websocket)
+    subscriber: Subscriber | None = None
+    async with stream_locks[session_id]:
+        session = db.get_session(session_id)
+        if session is not None:
+            outbound: asyncio.Queue[dict[str, Any]] = asyncio.Queue(
+                maxsize=(
+                    SCROLLBACK_REPLAY_LIMIT
+                    + 2
+                    + WEBSOCKET_LIVE_QUEUE_CAPACITY
+                )
+            )
+            subscriber = Subscriber(websocket=websocket, outbound=outbound)
+            for row in db.recent_scrollback(
+                session_id, SCROLLBACK_REPLAY_LIMIT
+            ):
+                outbound.put_nowait(frame_for_scrollback(row))
+            outbound.put_nowait(
+                {"type": "status", "status": session["status"]}
+            )
+            outbound.put_nowait(
+                {"type": "archived", "archived_at": session["archived_at"]}
+            )
+            subscriber.writer = asyncio.create_task(
+                write_subscriber(subscriber)
+            )
+            subscribers[session_id].add(subscriber)
 
+    if subscriber is None:
+        await close_websocket(websocket, code=1008)
+        return
+
+    receiver = asyncio.create_task(receive_subscriber(session_id, subscriber))
+    assert subscriber.writer is not None
+    tasks = {subscriber.writer, receiver}
     try:
-        await replay_scrollback(websocket, session_id)
-        await websocket.send_json({"type": "status", "status": session["status"]})
-        # Alongside status for the same reason: a client that was offline when
-        # another device archived this session would otherwise never hear.
-        await websocket.send_json(
-            {"type": "archived", "archived_at": session["archived_at"]}
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        async with stream_locks[session_id]:
+            retire_subscriber_locked(session_id, subscriber)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await teardown_subscribers(
+            [subscriber], code=1011 if subscriber.send_failed else 1000
         )
 
+
+async def receive_subscriber(
+    session_id: int, subscriber: Subscriber
+) -> None:
+    websocket = subscriber.websocket
+    try:
         while True:
             message = await websocket.receive_json()
             message_type = message.get("type")
@@ -655,30 +728,42 @@ async def session_websocket(websocket: WebSocket, session_id: int) -> None:
             if message_type == "input":
                 prompt = str(message.get("text", "")).strip()
                 if not prompt:
-                    await websocket.send_json(
-                        {"type": "error", "message": "Prompt cannot be empty"}
-                    )
+                    if not await enqueue_local(
+                        session_id,
+                        subscriber,
+                        {"type": "error", "message": "Prompt cannot be empty"},
+                    ):
+                        return
                     continue
                 try:
                     await begin_turn(session_id, prompt)
                 except HTTPException as exc:
-                    await websocket.send_json(
-                        {"type": "error", "message": str(exc.detail)}
-                    )
+                    if not await enqueue_local(
+                        session_id,
+                        subscriber,
+                        {"type": "error", "message": str(exc.detail)},
+                    ):
+                        return
 
             elif message_type == "bash":
                 command = str(message.get("command", "")).strip()
                 if not command:
-                    await websocket.send_json(
-                        {"type": "error", "message": "Command cannot be empty"}
-                    )
+                    if not await enqueue_local(
+                        session_id,
+                        subscriber,
+                        {"type": "error", "message": "Command cannot be empty"},
+                    ):
+                        return
                     continue
                 try:
                     await begin_bash(session_id, command)
                 except HTTPException as exc:
-                    await websocket.send_json(
-                        {"type": "error", "message": str(exc.detail)}
-                    )
+                    if not await enqueue_local(
+                        session_id,
+                        subscriber,
+                        {"type": "error", "message": str(exc.detail)},
+                    ):
+                        return
 
             elif message_type == "approval_response":
                 request_id = str(message.get("request_id", ""))
@@ -696,7 +781,12 @@ async def session_websocket(websocket: WebSocket, session_id: int) -> None:
                         message=deny_message,
                     )
                 except (KeyError, ValueError) as exc:
-                    await websocket.send_json({"type": "error", "message": str(exc)})
+                    if not await enqueue_local(
+                        session_id,
+                        subscriber,
+                        {"type": "error", "message": str(exc)},
+                    ):
+                        return
 
             elif message_type == "question_response":
                 request_id = str(message.get("request_id", ""))
@@ -704,17 +794,20 @@ async def session_websocket(websocket: WebSocket, session_id: int) -> None:
                 try:
                     await handle_question_answer(session_id, request_id, answers)
                 except (KeyError, ValueError, NotImplementedError) as exc:
-                    await websocket.send_json({"type": "error", "message": str(exc)})
-            else:
-                await websocket.send_json(
-                    {"type": "error", "message": "Unsupported WebSocket message"}
-                )
+                    if not await enqueue_local(
+                        session_id,
+                        subscriber,
+                        {"type": "error", "message": str(exc)},
+                    ):
+                        return
+            elif not await enqueue_local(
+                session_id,
+                subscriber,
+                {"type": "error", "message": "Unsupported WebSocket message"},
+            ):
+                return
     except WebSocketDisconnect:
-        pass
-    finally:
-        subscribers[session_id].discard(websocket)
-        if not subscribers[session_id]:
-            subscribers.pop(session_id, None)
+        return
 
 
 async def begin_turn(session_id: int, prompt: str) -> None:
@@ -727,11 +820,19 @@ async def begin_turn(session_id: int, prompt: str) -> None:
         ):
             raise HTTPException(status_code=409, detail="Session is already running")
 
-        db.append_scrollback(session_id, "input", {"text": prompt})
-        db.update_status(session_id, "running")
-        db.touch_session(session_id)
-        await broadcast(session_id, {"type": "input", "text": prompt})
-        await broadcast(session_id, {"type": "status", "status": "running"})
+        def start() -> None:
+            db.append_scrollback(session_id, "input", {"text": prompt})
+            db.update_status(session_id, "running")
+            db.touch_session(session_id)
+
+        await commit_stream(
+            session_id,
+            start,
+            lambda _result: [
+                {"type": "input", "text": prompt},
+                {"type": "status", "status": "running"},
+            ],
+        )
 
         task = asyncio.create_task(run_turn(session_id, prompt))
         running_tasks[session_id] = task
@@ -767,35 +868,45 @@ async def run_turn(session_id: int, prompt: str) -> None:
                     auto_category = category
                     event = {**event, "auto_approved": True}
 
-            if event_type in {
+            persisted = event_type in {
                 "output",
                 "tool_use",
                 "approval_request",
                 "question",
                 "error",
-            }:
-                db.append_scrollback(
-                    session_id,
-                    event_type,
-                    {key: value for key, value in event.items() if key != "type"},
-                )
-
-            # A pending question blocks on the user just like an approval; reuse
-            # the awaiting_approval status (the client tells them apart by
-            # event). An auto-approved request never blocks, so it stays running.
-            if event_type == "question" or (
+            }
+            awaiting = event_type == "question" or (
                 event_type == "approval_request" and auto_category is None
-            ):
-                db.update_status(session_id, "awaiting_approval")
-                await broadcast(
-                    session_id,
-                    {"type": "status", "status": "awaiting_approval"},
-                )
+            )
 
-            if event_type == "done" and event.get("session_id"):
-                db.set_agent_session_id(session_id, event["session_id"])
+            def record_event() -> None:
+                if persisted:
+                    db.append_scrollback(
+                        session_id,
+                        event_type,
+                        {
+                            key: value
+                            for key, value in event.items()
+                            if key != "type"
+                        },
+                    )
+                # A pending question blocks on the user just like an approval.
+                # Auto-approved requests never leave running state.
+                if awaiting:
+                    db.update_status(session_id, "awaiting_approval")
+                if event_type == "done" and event.get("session_id"):
+                    db.set_agent_session_id(session_id, event["session_id"])
 
-            await broadcast(session_id, event)
+            frames = (
+                [{"type": "status", "status": "awaiting_approval"}, event]
+                if awaiting
+                else [event]
+            )
+            await commit_stream(
+                session_id,
+                record_event,
+                lambda _result: frames,
+            )
 
             # Answer on the user's behalf right after the request is on the wire,
             # so the transcript shows the request followed by the auto-approval.
@@ -805,11 +916,19 @@ async def run_turn(session_id: int, prompt: str) -> None:
                 )
     except Exception as exc:
         message = f"Agent turn failed: {exc}"
-        db.append_scrollback(session_id, "error", {"message": message})
-        await broadcast(session_id, {"type": "error", "message": message})
+        await commit_stream(
+            session_id,
+            lambda: db.append_scrollback(
+                session_id, "error", {"message": message}
+            ),
+            lambda _result: [{"type": "error", "message": message}],
+        )
     finally:
-        db.update_status(session_id, "idle")
-        await broadcast(session_id, {"type": "status", "status": "idle"})
+        await commit_stream(
+            session_id,
+            lambda: db.update_status(session_id, "idle"),
+            lambda _result: [{"type": "status", "status": "idle"}],
+        )
         running_tasks.pop(session_id, None)
 
     if followup_prompt:
@@ -837,9 +956,15 @@ async def begin_bash(session_id: int, command: str) -> None:
             status_code=409, detail="A command is already running in this session"
         )
 
-    db.append_scrollback(session_id, "bash_input", {"command": command})
-    db.touch_session(session_id)
-    await broadcast(session_id, {"type": "bash_input", "command": command})
+    def start() -> None:
+        db.append_scrollback(session_id, "bash_input", {"command": command})
+        db.touch_session(session_id)
+
+    await commit_stream(
+        session_id,
+        start,
+        lambda _result: [{"type": "bash_input", "command": command}],
+    )
 
     bash_tasks[session_id] = asyncio.create_task(run_bash(session_id, command))
 
@@ -849,8 +974,11 @@ async def run_bash(session_id: int, command: str) -> None:
         session = db.require_session(session_id)
         result = await shell.run_command(command, cwd=session["working_dir"])
         payload = {"command": command, **result}
-        db.append_scrollback(session_id, "bash_output", payload)
-        await broadcast(session_id, {"type": "bash_output", **payload})
+        await commit_stream(
+            session_id,
+            lambda: db.append_scrollback(session_id, "bash_output", payload),
+            lambda _result: [{"type": "bash_output", **payload}],
+        )
     except asyncio.CancelledError:
         # Stopped by the user or shutting down; the process group is already
         # dead. Say so in the transcript rather than leaving the command
@@ -872,8 +1000,11 @@ async def report_bash_error(session_id: int, message: str) -> None:
     """
     if db.get_session(session_id) is None:
         return
-    db.append_scrollback(session_id, "error", {"message": message})
-    await broadcast(session_id, {"type": "error", "message": message})
+    await commit_stream(
+        session_id,
+        lambda: db.append_scrollback(session_id, "error", {"message": message}),
+        lambda _result: [{"type": "error", "message": message}],
+    )
 
 
 async def cancel_bash(session_id: int) -> None:
@@ -906,10 +1037,19 @@ async def handle_approval(
         payload["message"] = message
     if auto:
         payload["auto"] = True
-    db.append_scrollback(session_id, "approval_response", payload)
-    db.update_status(session_id, "running")
-    await broadcast(session_id, {"type": "approval_response", **payload})
-    await broadcast(session_id, {"type": "status", "status": "running"})
+
+    def record_response() -> None:
+        db.append_scrollback(session_id, "approval_response", payload)
+        db.update_status(session_id, "running")
+
+    await commit_stream(
+        session_id,
+        record_response,
+        lambda _result: [
+            {"type": "approval_response", **payload},
+            {"type": "status", "status": "running"},
+        ],
+    )
 
 
 async def handle_question_answer(
@@ -922,30 +1062,134 @@ async def handle_question_answer(
     validated = await adapter.send_answer(session, request_id, answers)
 
     payload = {"request_id": request_id, "answers": validated}
-    db.append_scrollback(session_id, "question_response", payload)
-    db.update_status(session_id, "running")
-    await broadcast(session_id, {"type": "question_response", **payload})
-    await broadcast(session_id, {"type": "status", "status": "running"})
+
+    def record_response() -> None:
+        db.append_scrollback(session_id, "question_response", payload)
+        db.update_status(session_id, "running")
+
+    await commit_stream(
+        session_id,
+        record_response,
+        lambda _result: [
+            {"type": "question_response", **payload},
+            {"type": "status", "status": "running"},
+        ],
+    )
 
 
-async def replay_scrollback(websocket: WebSocket, session_id: int) -> None:
-    for row in db.recent_scrollback(session_id, SCROLLBACK_REPLAY_LIMIT):
-        payload = row["payload"] if isinstance(row["payload"], dict) else {}
-        await websocket.send_json({"type": row["type"], **payload})
+def frame_for_scrollback(row: dict[str, Any]) -> dict[str, Any]:
+    payload = row["payload"] if isinstance(row["payload"], dict) else {}
+    return {"type": row["type"], **payload}
+
+
+def retire_subscriber_locked(session_id: int, subscriber: Subscriber) -> bool:
+    if subscriber.retired:
+        return False
+    subscriber.retired = True
+    session_subscribers = subscribers.get(session_id)
+    if session_subscribers is not None:
+        session_subscribers.discard(subscriber)
+        if not session_subscribers:
+            subscribers.pop(session_id, None)
+    writer = subscriber.writer
+    if (
+        writer is not None
+        and writer is not asyncio.current_task()
+        and not writer.done()
+    ):
+        writer.cancel()
+    return True
+
+
+def enqueue_for_subscribers(
+    session_id: int, frames: list[dict[str, Any]]
+) -> list[Subscriber]:
+    retired: list[Subscriber] = []
+    for subscriber in list(subscribers.get(session_id, set())):
+        if subscriber.retired:
+            continue
+        try:
+            for frame in frames:
+                subscriber.outbound.put_nowait(frame)
+        except asyncio.QueueFull:
+            if retire_subscriber_locked(session_id, subscriber):
+                retired.append(subscriber)
+    return retired
+
+
+async def close_websocket(websocket: WebSocket, *, code: int) -> None:
+    try:
+        async with asyncio.timeout(WEBSOCKET_CLOSE_TIMEOUT_SECONDS):
+            await websocket.close(code=code)
+    except Exception:
+        # Closing is best effort. The endpoint tasks are canceled independently.
+        pass
+
+
+async def teardown_subscribers(
+    doomed: list[Subscriber], *, code: int = 1011
+) -> None:
+    current = asyncio.current_task()
+    for subscriber in doomed:
+        if subscriber.closed:
+            continue
+        subscriber.closed = True
+        writer = subscriber.writer
+        if writer is not None and writer is not current and not writer.done():
+            writer.cancel()
+        if writer is not None and writer is not current:
+            try:
+                async with asyncio.timeout(WEBSOCKET_CLOSE_TIMEOUT_SECONDS):
+                    await asyncio.gather(writer, return_exceptions=True)
+            except TimeoutError:
+                pass
+        await close_websocket(subscriber.websocket, code=code)
+
+
+async def commit_stream(
+    session_id: int,
+    mutation: Callable[[], Any],
+    frames_for_result: Callable[[Any], list[dict[str, Any]]],
+) -> Any:
+    async with stream_locks[session_id]:
+        result = mutation()
+        retired = enqueue_for_subscribers(session_id, frames_for_result(result))
+    await teardown_subscribers(retired)
+    return result
 
 
 async def broadcast(session_id: int, message: dict[str, Any]) -> None:
-    stale: list[WebSocket] = []
-    for websocket in list(subscribers.get(session_id, set())):
-        try:
-            await websocket.send_json(message)
-        except Exception:
-            stale.append(websocket)
+    await commit_stream(session_id, lambda: None, lambda _result: [message])
 
-    for websocket in stale:
-        subscribers[session_id].discard(websocket)
-    if session_id in subscribers and not subscribers[session_id]:
-        subscribers.pop(session_id, None)
+
+async def enqueue_local(
+    session_id: int,
+    subscriber: Subscriber,
+    message: dict[str, Any],
+) -> bool:
+    retired: list[Subscriber] = []
+    async with stream_locks[session_id]:
+        if subscriber.retired:
+            return False
+        try:
+            subscriber.outbound.put_nowait(message)
+        except asyncio.QueueFull:
+            if retire_subscriber_locked(session_id, subscriber):
+                retired.append(subscriber)
+    await teardown_subscribers(retired)
+    return not retired
+
+
+async def write_subscriber(subscriber: Subscriber) -> None:
+    try:
+        while True:
+            frame = await subscriber.outbound.get()
+            async with asyncio.timeout(WEBSOCKET_SEND_TIMEOUT_SECONDS):
+                await subscriber.websocket.send_json(frame)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        subscriber.send_failed = True
 
 
 async def teardown_session(session: dict[str, Any]) -> None:
@@ -967,14 +1211,13 @@ async def teardown_session(session: dict[str, Any]) -> None:
     # Before the row goes: the command's own error path writes scrollback.
     await cancel_bash(session_id)
 
-    for websocket in list(subscribers.get(session_id, set())):
-        try:
-            await websocket.close(code=1000)
-        except Exception:
-            pass
-    subscribers.pop(session_id, None)
+    async with stream_locks[session_id]:
+        doomed = list(subscribers.get(session_id, set()))
+        for subscriber in doomed:
+            retire_subscriber_locked(session_id, subscriber)
+        db.delete_session(session_id)
 
-    db.delete_session(session_id)
+    await teardown_subscribers(doomed, code=1000)
 
 
 def with_worktree_existence(worktree: dict[str, Any]) -> dict[str, Any]:
@@ -1060,30 +1303,39 @@ async def set_session_archived(session_id: int, archived: bool) -> dict[str, Any
     archived project would have nowhere to show — but only that one session
     comes back, not everything the project's archive swept up.
     """
-    current = require_session_or_404(session_id)
-    if archived and session_is_busy(current):
-        raise HTTPException(
-            status_code=409, detail="Cannot archive a session while it is busy"
-        )
-    if (
-        not archived
-        and current["archived_at"] is not None
-        and not Path(current["working_dir"]).is_dir()
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Cannot unarchive a session whose working directory is missing: "
-                + current["working_dir"]
-            ),
-        )
 
-    session = db.set_session_archived(session_id, archived)
-    if not archived:
-        db.unarchive_project(session["project_id"], restore_sessions=False)
+    def update_archive() -> dict[str, Any]:
+        current = require_session_or_404(session_id)
+        if archived and session_is_busy(current):
+            raise HTTPException(
+                status_code=409,
+                detail="Cannot archive a session while it is busy",
+            )
+        if (
+            not archived
+            and current["archived_at"] is not None
+            and not Path(current["working_dir"]).is_dir()
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Cannot unarchive a session whose working directory is missing: "
+                    + current["working_dir"]
+                ),
+            )
 
-    await broadcast_archived(session)
-    return session
+        session = db.set_session_archived(session_id, archived)
+        if not archived:
+            db.unarchive_project(session["project_id"], restore_sessions=False)
+        return session
+
+    return await commit_stream(
+        session_id,
+        update_archive,
+        lambda session: [
+            {"type": "archived", "archived_at": session["archived_at"]}
+        ],
+    )
 
 
 def session_is_busy(session: dict[str, Any]) -> bool:

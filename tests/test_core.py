@@ -1855,15 +1855,20 @@ class ArchiveEndpointTests(SessionEndpointTestCase):
     def setUp(self) -> None:
         super().setUp()
         self.events: list[dict[str, Any]] = []
-        self._original_broadcast = self.main.broadcast
+        self._original_enqueue = self.main.enqueue_for_subscribers
 
-        async def fake_broadcast(session_id: int, message: dict[str, Any]) -> None:
-            self.events.append({"session_id": session_id, **message})
+        def fake_enqueue(
+            session_id: int, messages: list[dict[str, Any]]
+        ) -> list[Any]:
+            self.events.extend(
+                {"session_id": session_id, **message} for message in messages
+            )
+            return []
 
-        self.main.broadcast = fake_broadcast
+        self.main.enqueue_for_subscribers = fake_enqueue
 
     def tearDown(self) -> None:
-        self.main.broadcast = self._original_broadcast
+        self.main.enqueue_for_subscribers = self._original_enqueue
         self.main.bash_tasks.clear()
         super().tearDown()
 
@@ -2884,6 +2889,251 @@ class SendApprovalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(future.result().option_id, "always")
 
 
+class _FakeWebSocket:
+    def __init__(self, *, send_open: bool = True, accept_open: bool = True) -> None:
+        self.sent: list[dict[str, Any]] = []
+        self.send_gate = asyncio.Event()
+        self.accept_gate = asyncio.Event()
+        if send_open:
+            self.send_gate.set()
+        if accept_open:
+            self.accept_gate.set()
+        self.closed = False
+        self.close_code: int | None = None
+        self._receive: asyncio.Future[dict[str, Any]] | None = None
+
+    async def accept(self) -> None:
+        await self.accept_gate.wait()
+
+    async def send_json(self, message: dict[str, Any]) -> None:
+        await self.send_gate.wait()
+        self.sent.append(message)
+
+    async def receive_json(self) -> dict[str, Any]:
+        if self.closed:
+            from fastapi import WebSocketDisconnect
+
+            raise WebSocketDisconnect()
+        self._receive = asyncio.get_running_loop().create_future()
+        return await self._receive
+
+    async def close(self, code: int = 1000) -> None:
+        self.closed = True
+        self.close_code = code
+        if self._receive is not None and not self._receive.done():
+            from fastapi import WebSocketDisconnect
+
+            self._receive.set_exception(WebSocketDisconnect())
+
+
+class WebSocketOrderingTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        from agent_ui_server import main
+
+        self.main = main
+        self.tmp = tempfile.TemporaryDirectory()
+        self.original_db = main.db
+        main.db = Database(Path(self.tmp.name) / "sessions.db")
+        self.session = make_session(main.db, self.tmp.name)
+        main.subscribers.clear()
+        main.stream_locks.clear()
+
+    async def asyncTearDown(self) -> None:
+        pending = [
+            subscriber
+            for group in self.main.subscribers.values()
+            for subscriber in group
+        ]
+        for subscriber in pending:
+            subscriber.retired = True
+        await self.main.teardown_subscribers(pending)
+        self.main.subscribers.clear()
+        self.main.stream_locks.clear()
+        self.main.db.close()
+        self.main.db = self.original_db
+        self.tmp.cleanup()
+
+    async def wait_for(self, predicate, timeout: float = 1.0) -> None:
+        async with asyncio.timeout(timeout):
+            while not predicate():
+                await asyncio.sleep(0)
+
+    async def test_snapshot_frames_precede_a_live_status(self) -> None:
+        session_id = self.session["id"]
+        self.main.db.append_scrollback(session_id, "output", {"text": "old"})
+        self.main.db.update_status(session_id, "running")
+        websocket = _FakeWebSocket(send_open=False)
+
+        endpoint = asyncio.create_task(
+            self.main.session_websocket(websocket, session_id)
+        )
+        await self.wait_for(lambda: bool(self.main.subscribers.get(session_id)))
+
+        await self.main.commit_stream(
+            session_id,
+            lambda: self.main.db.update_status(session_id, "idle"),
+            lambda _result: [{"type": "status", "status": "idle"}],
+        )
+        websocket.send_gate.set()
+        await self.wait_for(lambda: len(websocket.sent) == 4)
+
+        self.assertEqual(
+            websocket.sent,
+            [
+                {"type": "output", "text": "old"},
+                {"type": "status", "status": "running"},
+                {"type": "archived", "archived_at": None},
+                {"type": "status", "status": "idle"},
+            ],
+        )
+        endpoint.cancel()
+        await asyncio.gather(endpoint, return_exceptions=True)
+
+    async def test_approval_transition_stays_after_initial_snapshot(self) -> None:
+        session_id = self.session["id"]
+        websocket = _FakeWebSocket(send_open=False)
+        endpoint = asyncio.create_task(
+            self.main.session_websocket(websocket, session_id)
+        )
+        await self.wait_for(lambda: bool(self.main.subscribers.get(session_id)))
+
+        adapter = _AutoApproveAdapter("command")
+        original_adapter = self.main.adapters["claude-code"]
+        self.main.adapters["claude-code"] = adapter
+        turn = asyncio.create_task(self.main.run_turn(session_id, "go"))
+        try:
+            await self.wait_for(
+                lambda: self.main.db.require_session(session_id)["status"]
+                == "awaiting_approval"
+            )
+            websocket.send_gate.set()
+            await self.wait_for(lambda: len(websocket.sent) == 4)
+
+            self.assertEqual(
+                [event["type"] for event in websocket.sent],
+                ["status", "archived", "status", "approval_request"],
+            )
+            self.assertEqual(
+                websocket.sent[2]["status"], "awaiting_approval"
+            )
+            self.assertEqual(
+                self.main.db.recent_scrollback(session_id)[-1]["type"],
+                "approval_request",
+            )
+        finally:
+            turn.cancel()
+            await asyncio.gather(turn, return_exceptions=True)
+            endpoint.cancel()
+            await asyncio.gather(endpoint, return_exceptions=True)
+            self.main.adapters["claude-code"] = original_adapter
+
+    async def test_slow_writer_does_not_delay_another_subscriber(self) -> None:
+        session_id = self.session["id"]
+        slow_socket = _FakeWebSocket(send_open=False)
+        fast_socket = _FakeWebSocket()
+        slow = self.main.Subscriber(slow_socket, asyncio.Queue(maxsize=10))
+        fast = self.main.Subscriber(fast_socket, asyncio.Queue(maxsize=10))
+        slow.writer = asyncio.create_task(self.main.write_subscriber(slow))
+        fast.writer = asyncio.create_task(self.main.write_subscriber(fast))
+        self.main.subscribers[session_id].update({slow, fast})
+
+        await self.main.broadcast(session_id, {"type": "output", "text": "now"})
+        await self.wait_for(lambda: len(fast_socket.sent) == 1)
+
+        self.assertEqual(fast_socket.sent[0]["text"], "now")
+        self.assertEqual(slow_socket.sent, [])
+
+    async def test_concurrent_publications_follow_commit_order(self) -> None:
+        session_id = self.session["id"]
+        subscriber = self.main.Subscriber(
+            _FakeWebSocket(), asyncio.Queue(maxsize=10)
+        )
+        self.main.subscribers[session_id].add(subscriber)
+        committed: list[int] = []
+
+        async def publish(value: int) -> None:
+            await self.main.commit_stream(
+                session_id,
+                lambda: committed.append(value),
+                lambda _result: [{"type": "sequence", "value": value}],
+            )
+
+        await asyncio.gather(*(publish(value) for value in range(5)))
+        delivered = [
+            subscriber.outbound.get_nowait()["value"] for _ in range(5)
+        ]
+
+        self.assertEqual(delivered, committed)
+
+    async def test_full_queue_retires_only_that_subscriber(self) -> None:
+        session_id = self.session["id"]
+        full_socket = _FakeWebSocket()
+        healthy_socket = _FakeWebSocket()
+        full = self.main.Subscriber(full_socket, asyncio.Queue(maxsize=1))
+        healthy = self.main.Subscriber(healthy_socket, asyncio.Queue(maxsize=2))
+        full.outbound.put_nowait({"type": "output", "text": "stuck"})
+        self.main.subscribers[session_id].update({full, healthy})
+
+        await self.main.broadcast(session_id, {"type": "status", "status": "idle"})
+
+        self.assertTrue(full.retired)
+        self.assertTrue(full_socket.closed)
+        self.assertFalse(healthy.retired)
+        self.assertEqual(
+            healthy.outbound.get_nowait(), {"type": "status", "status": "idle"}
+        )
+
+    async def test_send_timeout_closes_connection_and_receive_task(self) -> None:
+        session_id = self.session["id"]
+        websocket = _FakeWebSocket(send_open=False)
+        original_timeout = self.main.WEBSOCKET_SEND_TIMEOUT_SECONDS
+        self.main.WEBSOCKET_SEND_TIMEOUT_SECONDS = 0.01
+        try:
+            endpoint = asyncio.create_task(
+                self.main.session_websocket(websocket, session_id)
+            )
+            await asyncio.wait_for(endpoint, timeout=1)
+        finally:
+            self.main.WEBSOCKET_SEND_TIMEOUT_SECONDS = original_timeout
+
+        self.assertTrue(websocket.closed)
+        self.assertEqual(websocket.close_code, 1011)
+        self.assertNotIn(session_id, self.main.subscribers)
+
+    async def test_receive_disconnect_stops_writer_and_removes_subscriber(self) -> None:
+        session_id = self.session["id"]
+        websocket = _FakeWebSocket()
+        endpoint = asyncio.create_task(
+            self.main.session_websocket(websocket, session_id)
+        )
+        await self.wait_for(lambda: len(websocket.sent) == 2)
+        subscriber = next(iter(self.main.subscribers[session_id]))
+        assert subscriber.writer is not None
+
+        await websocket.close()
+        await asyncio.wait_for(endpoint, timeout=1)
+
+        self.assertTrue(subscriber.writer.done())
+        self.assertNotIn(session_id, self.main.subscribers)
+
+    async def test_deletion_while_accepting_fails_revalidation(self) -> None:
+        session_id = self.session["id"]
+        websocket = _FakeWebSocket(accept_open=False)
+        endpoint = asyncio.create_task(
+            self.main.session_websocket(websocket, session_id)
+        )
+        await asyncio.sleep(0)
+
+        await self.main.teardown_session(self.session)
+        websocket.accept_gate.set()
+        await asyncio.wait_for(endpoint, timeout=1)
+
+        self.assertTrue(websocket.closed)
+        self.assertEqual(websocket.close_code, 1008)
+        self.assertIsNone(self.main.db.get_session(session_id))
+        self.assertNotIn(session_id, self.main.subscribers)
+
+
 class _AutoApproveAdapter:
     """Minimal adapter: emit one approval_request, then finish on approval.
 
@@ -2935,15 +3185,16 @@ class RunTurnAutoApproveTests(unittest.IsolatedAsyncioTestCase):
 
             events: list[dict] = []
 
-            async def fake_broadcast(session_id, message):
-                events.append(message)
+            def fake_enqueue(session_id, messages):
+                events.extend(messages)
+                return []
 
-            original = main.broadcast
-            main.broadcast = fake_broadcast
+            original = main.enqueue_for_subscribers
+            main.enqueue_for_subscribers = fake_enqueue
             try:
                 await main.run_turn(session["id"], "go")
             finally:
-                main.broadcast = original
+                main.enqueue_for_subscribers = original
                 main.adapters.pop("fake", None)
                 status = main.db.require_session(session["id"])["status"]
                 main.db.close()
@@ -3221,16 +3472,17 @@ class BashModeTests(unittest.IsolatedAsyncioTestCase):
     async def _capture(self, main):
         events: list[dict] = []
 
-        async def fake_broadcast(session_id, message):
-            events.append(message)
+        def fake_enqueue(session_id, messages):
+            events.extend(messages)
+            return []
 
-        main.broadcast = fake_broadcast
+        main.enqueue_for_subscribers = fake_enqueue
         return events
 
     async def test_echo_then_output_without_status_changes(self) -> None:
         from agent_ui_server import main
 
-        original = main.broadcast
+        original = main.enqueue_for_subscribers
         with tempfile.TemporaryDirectory() as tmpdir:
             main_mod, session = await self._session(tmpdir)
             events = await self._capture(main_mod)
@@ -3257,13 +3509,13 @@ class BashModeTests(unittest.IsolatedAsyncioTestCase):
                     [row["type"] for row in rows], ["bash_input", "bash_output"]
                 )
             finally:
-                main_mod.broadcast = original
+                main_mod.enqueue_for_subscribers = original
                 main_mod.db.close()
 
     async def test_runs_while_the_agent_turn_is_running(self) -> None:
         from agent_ui_server import main
 
-        original = main.broadcast
+        original = main.enqueue_for_subscribers
         with tempfile.TemporaryDirectory() as tmpdir:
             main_mod, session = await self._session(tmpdir)
             events = await self._capture(main_mod)
@@ -3278,13 +3530,13 @@ class BashModeTests(unittest.IsolatedAsyncioTestCase):
                     main_mod.db.require_session(session["id"])["status"], "running"
                 )
             finally:
-                main_mod.broadcast = original
+                main_mod.enqueue_for_subscribers = original
                 main_mod.db.close()
 
     async def test_second_command_while_one_is_in_flight_is_rejected(self) -> None:
         from agent_ui_server import main
 
-        original = main.broadcast
+        original = main.enqueue_for_subscribers
         with tempfile.TemporaryDirectory() as tmpdir:
             main_mod, session = await self._session(tmpdir)
             await self._capture(main_mod)
@@ -3296,13 +3548,13 @@ class BashModeTests(unittest.IsolatedAsyncioTestCase):
 
                 await main_mod.cancel_bash(session["id"])
             finally:
-                main_mod.broadcast = original
+                main_mod.enqueue_for_subscribers = original
                 main_mod.db.close()
 
     async def test_cancel_bash_reports_the_stop(self) -> None:
         from agent_ui_server import main
 
-        original = main.broadcast
+        original = main.enqueue_for_subscribers
         with tempfile.TemporaryDirectory() as tmpdir:
             main_mod, session = await self._session(tmpdir)
             events = await self._capture(main_mod)
@@ -3315,7 +3567,7 @@ class BashModeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("Command stopped", events[-1]["message"])
                 self.assertNotIn(session["id"], main_mod.bash_tasks)
             finally:
-                main_mod.broadcast = original
+                main_mod.enqueue_for_subscribers = original
                 main_mod.db.close()
 
     async def test_unknown_session_is_404(self) -> None:
