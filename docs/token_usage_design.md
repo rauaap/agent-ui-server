@@ -1,5 +1,9 @@
 # Design: session token usage tracking
 
+> **Historical note:** OpenCode has since been removed from the shipped server.
+> Its protocol research below is retained only as historical context in case the
+> old adapter is inspected through version control.
+
 Status: **implemented server-side** (db.py / agent.py / main.py, plus tests) on
 the `usage` branch. The Android client is **not** done — nothing renders these
 numbers yet. Live verification against both harnesses (see [Live

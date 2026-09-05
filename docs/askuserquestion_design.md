@@ -1,5 +1,9 @@
 # Design: `AskUserQuestion` support (interactive multiple-choice questions)
 
+> **Historical note:** OpenCode has since been removed from the shipped server.
+> References to its former lack of question support are retained only as context
+> for the original design.
+
 Status: **proposed / not yet implemented.** This document is a hand-off spec for
 an implementing agent. It is self-contained: it includes the protocol findings
 (verified empirically against Claude Code 2.1.183) so you do not have to

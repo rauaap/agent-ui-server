@@ -29,8 +29,8 @@ const PROTOCOL_VERSION = 1;
 const MARKER = "agent-ui";
 
 /**
- * Tools that never reach the gate. Claude Code and OpenCode both auto-allow
- * reads upstream, so their adapters only ever see mutating calls; pi has no
+ * Tools that never reach the gate. Claude Code auto-allows reads upstream, so
+ * its adapter only sees mutating calls; pi has no
  * such filter and hands us every call, so the equivalent list lives here.
  *
  * Deliberately an allowlist: an unrecognized tool (another extension's, or one

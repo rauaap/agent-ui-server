@@ -18,7 +18,6 @@ from agent_ui_server import git, shell
 from agent_ui_server.agent import (
     ApprovalDecision,
     ClaudeCodeAdapter,
-    OpenCodeAdapter,
     PiAdapter,
     _event_options,
     _normalize_questions,
@@ -2296,6 +2295,32 @@ class ListAgentsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [agent["id"] for agent in agents], list(main.adapters.keys())
         )
+        self.assertEqual([agent["id"] for agent in agents], ["claude-code", "pi"])
+
+    async def test_session_for_removed_adapter_is_inert_but_deletable(self) -> None:
+        from agent_ui_server import main
+
+        original_db = main.db
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Database(Path(tmpdir) / "sessions.db")
+            main.db = database
+            try:
+                session = make_session(database, tmpdir, agent="opencode")
+
+                with self.assertRaises(HTTPException) as caught:
+                    await main.begin_turn(session["id"], "hello")
+
+                self.assertEqual(caught.exception.status_code, 409)
+                self.assertEqual(
+                    database.require_session(session["id"])["status"], "idle"
+                )
+                self.assertEqual(database.recent_scrollback(session["id"], 10), [])
+
+                await main.teardown_session(session)
+                self.assertIsNone(database.get_session(session["id"]))
+            finally:
+                main.db = original_db
+                database.close()
 
     async def test_marks_exactly_the_creation_default(self) -> None:
         from agent_ui_server import main
@@ -2487,106 +2512,6 @@ class ClaudeCodeAdapterParsingTests(unittest.TestCase):
                 {"type": "output", "text": "thinking"},
                 {"type": "tool_use", "tool": "Bash", "input": {"command": "pwd"}},
             ],
-        )
-
-
-class OpenCodeAdapterParsingTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.adapter = OpenCodeAdapter(executable="opencode")
-
-    def test_bundled_permission_config_does_not_override_model(self) -> None:
-        config = json.loads(Path(OpenCodeAdapter.DEFAULT_CONFIG).read_text())
-
-        self.assertNotIn("model", config)
-        self.assertEqual(
-            config["permission"],
-            {
-                "bash": "ask",
-                "edit": "ask",
-                "write": "ask",
-                "webfetch": "ask",
-            },
-        )
-
-    def test_message_chunk_classified_as_text(self) -> None:
-        self.assertEqual(
-            self.adapter._classify_update(
-                {
-                    "sessionUpdate": "agent_message_chunk",
-                    "content": {"type": "text", "text": "hi"},
-                }
-            ),
-            ("text", None, "hi"),
-        )
-
-    def test_tool_call_update_with_input_becomes_tool_use(self) -> None:
-        kind, key, payload = self.adapter._classify_update(
-            {
-                "sessionUpdate": "tool_call_update",
-                "toolCallId": "call_1",
-                "title": "bash",
-                "rawInput": {"command": "echo hi"},
-            }
-        )
-        self.assertEqual(kind, "tool")
-        self.assertEqual(key, "call_1")
-        self.assertEqual(
-            payload,
-            {"type": "tool_use", "tool": "bash", "input": {"command": "echo hi"}},
-        )
-
-    def test_tool_call_without_input_is_skipped(self) -> None:
-        self.assertIsNone(
-            self.adapter._classify_update(
-                {"sessionUpdate": "tool_call", "toolCallId": "call_1", "rawInput": {}}
-            )
-        )
-
-    def test_thought_and_usage_updates_are_ignored(self) -> None:
-        self.assertIsNone(
-            self.adapter._classify_update(
-                {
-                    "sessionUpdate": "agent_thought_chunk",
-                    "content": {"type": "text", "text": "thinking"},
-                }
-            )
-        )
-        self.assertIsNone(
-            self.adapter._classify_update({"sessionUpdate": "usage_update", "used": 5})
-        )
-
-    def test_select_option_prefers_allow_once_and_reject_once(self) -> None:
-        options = [
-            {"optionId": "once", "kind": "allow_once"},
-            {"optionId": "always", "kind": "allow_always"},
-            {"optionId": "reject", "kind": "reject_once"},
-        ]
-        self.assertEqual(self.adapter._select_option(options, "allow"), "once")
-        self.assertEqual(self.adapter._select_option(options, "deny"), "reject")
-
-    def test_kind_categories_map_mutating_acp_kinds(self) -> None:
-        self.assertEqual(self.adapter.KIND_CATEGORIES.get("execute"), "command")
-        self.assertEqual(self.adapter.KIND_CATEGORIES.get("edit"), "write")
-        self.assertEqual(self.adapter.KIND_CATEGORIES.get("delete"), "write")
-        self.assertEqual(self.adapter.KIND_CATEGORIES.get("move"), "write")
-        # Read-oriented kinds are not auto-approvable.
-        self.assertIsNone(self.adapter.KIND_CATEGORIES.get("read"))
-        self.assertIsNone(self.adapter.KIND_CATEGORIES.get("fetch"))
-
-    def test_denial_followup_prompt_restates_tool_and_reason(self) -> None:
-        prompt = self.adapter._denial_followup_prompt(
-            "bash", {"command": "rm -rf build/"}, "Use a dry run first."
-        )
-        self.assertEqual(
-            prompt,
-            'I denied your request to run the bash tool with input '
-            '{"command": "rm -rf build/"}. Use a dry run first.',
-        )
-
-    def test_denial_followup_prompt_omits_empty_input(self) -> None:
-        prompt = self.adapter._denial_followup_prompt("bash", {}, "No shell please.")
-        self.assertEqual(
-            prompt, "I denied your request to run the bash tool. No shell please."
         )
 
 
@@ -2873,20 +2798,6 @@ class SendApprovalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(effective, "deny")
         self.assertEqual(future.result(), ApprovalDecision("deny", message="too risky"))
 
-    async def test_opencode_selects_explicit_option(self) -> None:
-        adapter = OpenCodeAdapter(executable="opencode")
-        options = [
-            {"optionId": "always", "kind": "allow_always"},
-            {"optionId": "reject", "kind": "reject_once"},
-        ]
-        future = self._arm(adapter, "perm_2", options)
-
-        effective = await adapter.send_approval(
-            {"id": "s1"}, "perm_2", "", option_id="always"
-        )
-
-        self.assertEqual(effective, "allow")
-        self.assertEqual(future.result().option_id, "always")
 
 
 class _FakeWebSocket:
@@ -3316,11 +3227,6 @@ class SendAnswerTests(unittest.IsolatedAsyncioTestCase):
             await adapter.send_answer(
                 {"id": "s1"}, "perm_1", {"Which emoji do you want?": "Taco"}
             )
-
-    async def test_opencode_send_answer_not_supported(self) -> None:
-        adapter = OpenCodeAdapter(executable="opencode")
-        with self.assertRaises(NotImplementedError):
-            await adapter.send_answer({"id": "s1"}, "perm_1", {})
 
     async def test_write_question_response_allows_with_answers(self) -> None:
         adapter = ClaudeCodeAdapter(executable="claude")

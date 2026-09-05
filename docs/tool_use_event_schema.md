@@ -151,9 +151,8 @@ The agent is asking permission to run a tool; session status flips to
 `request_id` the client must echo back to respond, and an `options` array of the
 available choices. Each option is `{ "id", "name", "kind" }`, where `kind` is
 one of `allow_once`, `allow_always`, `reject_once`, `reject_always` (the client
-may use it to style the buttons). For Claude Code the options are always Allow /
-Deny; for OpenCode they are whatever the agent offered. The client may either
-echo a `behavior` (`allow`/`deny`) or pick a specific `option_id`.
+may use it to style the buttons). The client may either echo a `behavior`
+(`allow`/`deny`) or pick a specific `option_id`.
 
 `options` is best-effort and may be **absent or empty** (e.g. an agent that
 offers no choices). Treat it defensively: when there are no options, fall back to
@@ -184,11 +183,8 @@ form still works:
 To pick a specific option, send its `option_id` (the server derives `behavior`
 from it, so `behavior` may be omitted). A denial may carry a free-form `message`
 explaining what to do instead. `message` is only meaningful on a **deny** — it is
-ignored when the resolved behavior is `allow`. **Claude Code** forwards it to the agent inline
-(in the same turn). **OpenCode**'s ACP protocol can carry neither a free-form
-reason nor a cancel, so the server instead ends the current turn and immediately
-starts a fresh one whose prompt restates the denied tool plus your reason — the
-client will see that as a normal `input` event followed by a new turn:
+ignored when the resolved behavior is `allow`. Claude Code and pi both forward
+it to the agent inline in the same turn:
 
 ```json
 {

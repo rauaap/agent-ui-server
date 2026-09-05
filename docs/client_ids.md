@@ -19,7 +19,7 @@ Numbers, from the server's own tables:
 **Strings, and staying strings.** These are minted by an agent or by the
 approval protocol, not by our database, and nothing here applies to them:
 
-- `agent_session_id` — Claude Code's or OpenCode's own resume id
+- `agent_session_id` — the selected agent harness's own resume id
 - `request_id` — an approval or question request
 - `option_id`, and the `id` inside an approval `options[]` entry — e.g.
   `"allow"`, `"deny"`

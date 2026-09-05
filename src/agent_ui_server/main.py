@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from . import git, shell
-from .agent import AgentAdapter, ClaudeCodeAdapter, OpenCodeAdapter, PiAdapter
+from .agent import AgentAdapter, ClaudeCodeAdapter, PiAdapter
 from .db import Database
 
 
@@ -26,7 +26,6 @@ app = FastAPI(title="agent-ui-server")
 db = Database(os.environ.get("SESSION_DB", "sessions.db"))
 adapters: dict[str, AgentAdapter] = {
     "claude-code": ClaudeCodeAdapter(),
-    "opencode": OpenCodeAdapter(),
     "pi": PiAdapter(),
 }
 
@@ -623,8 +622,9 @@ async def detach_session_worktree(session_id: int) -> dict[str, Any]:
 @app.post("/sessions/{session_id}/stop")
 async def stop_session(session_id: int) -> dict[str, str]:
     session = require_session_or_404(session_id)
-    adapter = adapters[session["agent"]]
-    await adapter.stop(session)
+    adapter = adapters.get(session["agent"])
+    if adapter is not None:
+        await adapter.stop(session)
     # Stop means everything this session is running, agent or not — otherwise a
     # runaway `!` command would have no kill switch short of the timeout.
     await cancel_bash(session_id)
@@ -814,6 +814,11 @@ async def begin_turn(session_id: int, prompt: str) -> None:
     async with turn_lock:
         session = require_session_or_404(session_id)
         require_not_archived(session)
+        if session["agent"] not in adapters:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Agent is no longer available: {session['agent']}",
+            )
         existing_task = running_tasks.get(session_id)
         if session["status"] != "idle" or (
             existing_task and not existing_task.done()
@@ -841,18 +846,10 @@ async def begin_turn(session_id: int, prompt: str) -> None:
 async def run_turn(session_id: int, prompt: str) -> None:
     session = db.require_session(session_id)
     adapter = adapters[session["agent"]]
-    followup_prompt: str | None = None
 
     try:
         async for event in adapter.start_turn(session, prompt):
             event_type = event.get("type")
-
-            # Internal orchestration event: the adapter ended the turn and wants
-            # a new one started (OpenCode's deny-with-reason). Not persisted or
-            # broadcast on its own — it surfaces as the next turn's input.
-            if event_type == "followup":
-                followup_prompt = event.get("prompt")
-                continue
 
             # Decide auto-approval before persisting/broadcasting so the event
             # carries the marker and we can skip the awaiting_approval status.
@@ -930,15 +927,6 @@ async def run_turn(session_id: int, prompt: str) -> None:
             lambda _result: [{"type": "status", "status": "idle"}],
         )
         running_tasks.pop(session_id, None)
-
-    if followup_prompt:
-        # Chain the denial follow-up as a fresh turn now that this one is idle.
-        # A new turn only auto-chains again if the user denies again, so this
-        # can't spin on its own.
-        try:
-            await begin_turn(session_id, followup_prompt)
-        except HTTPException:
-            pass
 
 
 async def begin_bash(session_id: int, command: str) -> None:
@@ -1025,7 +1013,9 @@ async def handle_approval(
     auto: bool = False,
 ) -> None:
     session = db.require_session(session_id)
-    adapter = adapters[session["agent"]]
+    adapter = adapters.get(session["agent"])
+    if adapter is None:
+        raise KeyError(f"Agent is no longer available: {session['agent']}")
     effective = await adapter.send_approval(
         session, request_id, behavior, option_id=option_id, message=message
     )
@@ -1058,7 +1048,9 @@ async def handle_question_answer(
     answers: Any,
 ) -> None:
     session = db.require_session(session_id)
-    adapter = adapters[session["agent"]]
+    adapter = adapters.get(session["agent"])
+    if adapter is None:
+        raise KeyError(f"Agent is no longer available: {session['agent']}")
     validated = await adapter.send_answer(session, request_id, answers)
 
     payload = {"request_id": request_id, "answers": validated}
@@ -1200,9 +1192,10 @@ async def teardown_session(session: dict[str, Any]) -> None:
     nothing here that can fail halfway.
     """
     session_id = session["id"]
-    adapter = adapters[session["agent"]]
+    adapter = adapters.get(session["agent"])
 
-    await adapter.stop(session)
+    if adapter is not None:
+        await adapter.stop(session)
     task = running_tasks.pop(session_id, None)
     if task:
         task.cancel()
