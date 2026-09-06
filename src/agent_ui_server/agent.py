@@ -11,122 +11,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from pydantic import ValidationError
-
-from .actions import (
-    approval_request_event,
-    canonical_action,
-    other_action,
-    tool_use_event,
+from .actions import approval_request_event, tool_use_event
+from .tool_actions import (
+    CLAUDE_TOOL_TRANSLATORS,
+    PI_TOOL_TRANSLATORS,
+    action_or_other,
 )
 
 
 AgentEvent = dict[str, Any]
-
-
-def _optional(arguments: dict[str, Any], native: str, *, omit_empty: bool = False) -> dict[str, Any]:
-    """Return a one-field projection while preserving invalid values for validation."""
-    if native not in arguments or arguments[native] is None:
-        return {}
-    value = arguments[native]
-    if omit_empty and value == "":
-        return {}
-    return {native: value}
-
-
-def _normalized_or_other(name: Any, arguments: Any, provider: str) -> dict[str, Any]:
-    """Normalize one native call; malformed recognized calls safely become other."""
-    native_name = name if isinstance(name, str) else "tool"
-    args = arguments if isinstance(arguments, dict) else {}
-    try:
-        if provider == "claude":
-            if native_name == "Bash":
-                fields: dict[str, Any] = {"command": args.get("command"), "shell": "bash"}
-                if "description" in args and args["description"] is not None:
-                    if args["description"] != "":
-                        fields["description"] = args["description"]
-                if "timeout" in args and args["timeout"] is not None:
-                    fields["timeout_ms"] = args["timeout"]
-                return canonical_action("command", **fields)
-            if native_name == "Read":
-                return canonical_action("read", path=args.get("file_path"), **_optional(args, "offset"), **_optional(args, "limit"))
-            if native_name in {"Edit", "MultiEdit"}:
-                raw_edits = args.get("edits") if native_name == "MultiEdit" else [args]
-                edits = []
-                if isinstance(raw_edits, list):
-                    for edit in raw_edits:
-                        if not isinstance(edit, dict):
-                            edits.append(edit)
-                            continue
-                        item = {"old_text": edit.get("old_string"), "new_text": edit.get("new_string")}
-                        if "replace_all" in edit and edit["replace_all"] is not None:
-                            item["replace_all"] = edit["replace_all"]
-                        edits.append(item)
-                else:
-                    edits = raw_edits
-                return canonical_action("edit", path=args.get("file_path"), edits=edits)
-            if native_name == "Write":
-                return canonical_action("write", path=args.get("file_path"), content=args.get("content"))
-            if native_name == "Glob":
-                fields = {"mode": "files", "query": args.get("pattern")}
-                if "path" in args and args["path"] is not None:
-                    fields["path"] = args["path"]
-                return canonical_action("search", **fields)
-            if native_name == "Grep":
-                fields = {"mode": "content", "query": args.get("pattern")}
-                for native, canonical in (("path", "path"), ("glob", "glob"), ("head_limit", "limit")):
-                    if native in args and args[native] is not None:
-                        if canonical == "glob" and args[native] == "":
-                            continue
-                        fields[canonical] = args[native]
-                return canonical_action("search", **fields)
-            if native_name in {"WebFetch", "WebSearch"}:
-                operation = "fetch" if native_name == "WebFetch" else "search"
-                fields = {"operation": operation, "url" if operation == "fetch" else "query": args.get("url" if operation == "fetch" else "query")}
-                if "prompt" in args and args["prompt"] not in {None, ""}:
-                    fields["prompt"] = args["prompt"]
-                return canonical_action("web", **fields)
-            if native_name in {"Task", "Agent"}:
-                fields = {"description": args.get("description")}
-                for native, canonical in (("prompt", "prompt"), ("subagent_type", "agent")):
-                    if native in args and args[native] not in {None, ""}:
-                        fields[canonical] = args[native]
-                return canonical_action("task", **fields)
-        elif provider == "pi":
-            if native_name in {"bash", "powershell"}:
-                fields = {"command": args.get("command"), "shell": native_name}
-                if "timeout" in args and args["timeout"] is not None:
-                    timeout = args["timeout"]
-                    fields["timeout_ms"] = timeout * 1000 if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) else timeout
-                return canonical_action("command", **fields)
-            if native_name == "read":
-                return canonical_action("read", path=args.get("path"), **_optional(args, "offset"), **_optional(args, "limit"))
-            if native_name == "edit":
-                raw_edits = args.get("edits")
-                if raw_edits is None and ("oldText" in args or "newText" in args):
-                    raw_edits = [{"oldText": args.get("oldText"), "newText": args.get("newText")}]
-                edits = [{"old_text": item.get("oldText"), "new_text": item.get("newText")} if isinstance(item, dict) else item for item in raw_edits] if isinstance(raw_edits, list) else raw_edits
-                return canonical_action("edit", path=args.get("path"), edits=edits)
-            if native_name == "write":
-                return canonical_action("write", path=args.get("path"), content=args.get("content"))
-            if native_name in {"grep", "find"}:
-                fields = {"mode": "content" if native_name == "grep" else "files", "query": args.get("pattern")}
-                for field in ("path", "limit"):
-                    if field in args and args[field] is not None:
-                        fields[field] = args[field]
-                if native_name == "grep" and "glob" in args and args["glob"] is not None:
-                    if args["glob"] != "":
-                        fields["glob"] = args["glob"]
-                return canonical_action("search", **fields)
-            if native_name == "ls":
-                fields = {}
-                for field in ("path", "limit"):
-                    if field in args and args[field] is not None:
-                        fields[field] = args[field]
-                return canonical_action("list", **fields)
-    except (ValidationError, TypeError, ValueError):
-        pass
-    return other_action(native_name, args)
 
 
 @dataclass
@@ -631,7 +524,7 @@ class ClaudeCodeAdapter(AgentAdapter):
         arguments = source.get("input") if "input" in source else source.get("arguments", {})
         call_id = source.get("id") or source.get("tool_use_id") or f"tool_{uuid.uuid4().hex}"
         call_id = str(call_id)
-        action = _normalized_or_other(name, arguments, "claude")
+        action = action_or_other(name, arguments, CLAUDE_TOOL_TRANSLATORS)
         self.tool_actions[(session_id, call_id)] = action
         return tool_use_event(call_id, action)
 
@@ -682,7 +575,9 @@ class ClaudeCodeAdapter(AgentAdapter):
         request_id, tool, tool_input, call_id = native
         action = self.tool_actions.get((session_id, call_id))
         if action is None:
-            action = _normalized_or_other(tool, tool_input, "claude")
+            action = action_or_other(
+                tool, tool_input, CLAUDE_TOOL_TRANSLATORS
+            )
         return approval_request_event(
             request_id, call_id, action, _event_options(self.OPTIONS)
         )
@@ -1143,8 +1038,10 @@ class PiAdapter(AgentAdapter):
                 await flush_text()
                 action = tool_actions.get(tool_call_id)
                 if action is None:
-                    action = _normalized_or_other(
-                        tool, tool_args.get(tool_call_id, {}), "pi"
+                    action = action_or_other(
+                        tool,
+                        tool_args.get(tool_call_id, {}),
+                        PI_TOOL_TRANSLATORS,
                     )
                 await queue.put(
                     approval_request_event(
@@ -1202,7 +1099,7 @@ class PiAdapter(AgentAdapter):
                 # also emit a tool_use bubble for it.
                 if tool == self.QUESTION_TOOL:
                     return
-                action = _normalized_or_other(tool, args, "pi")
+                action = action_or_other(tool, args, PI_TOOL_TRANSLATORS)
                 tool_actions[tool_call_id] = action
                 await flush_text()
                 await queue.put(tool_use_event(tool_call_id, action))

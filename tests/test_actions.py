@@ -10,7 +10,12 @@ from agent_ui_server.actions import (
     other_action,
     tool_use_event,
 )
-from agent_ui_server.agent import ClaudeCodeAdapter, _normalized_or_other
+from agent_ui_server.agent import ClaudeCodeAdapter
+from agent_ui_server.tool_actions import (
+    CLAUDE_TOOL_TRANSLATORS,
+    PI_TOOL_TRANSLATORS,
+    action_or_other,
+)
 
 
 class CanonicalActionTests(unittest.TestCase):
@@ -65,31 +70,62 @@ class CanonicalActionTests(unittest.TestCase):
 
 class ProviderNormalizationTests(unittest.TestCase):
     def test_claude_and_pi_share_command_and_edit_shapes(self):
-        claude_command = _normalized_or_other("Bash", {"command": "ls"}, "claude")
-        pi_command = _normalized_or_other("bash", {"command": "ls"}, "pi")
+        claude_command = action_or_other(
+            "Bash", {"command": "ls"}, CLAUDE_TOOL_TRANSLATORS
+        )
+        pi_command = action_or_other(
+            "bash", {"command": "ls"}, PI_TOOL_TRANSLATORS
+        )
         self.assertEqual(claude_command, pi_command)
 
-        claude_edit = _normalized_or_other("Edit", {
-            "file_path": "a", "old_string": "x", "new_string": "y"
-        }, "claude")
-        pi_edit = _normalized_or_other("edit", {
-            "path": "a", "edits": [{"oldText": "x", "newText": "y"}]
-        }, "pi")
+        claude_edit = action_or_other(
+            "Edit",
+            {"file_path": "a", "old_string": "x", "new_string": "y"},
+            CLAUDE_TOOL_TRANSLATORS,
+        )
+        pi_edit = action_or_other(
+            "edit",
+            {"path": "a", "edits": [{"oldText": "x", "newText": "y"}]},
+            PI_TOOL_TRANSLATORS,
+        )
         self.assertEqual(claude_edit, pi_edit)
 
     def test_malformed_recognized_and_unknown_calls_become_other(self):
-        self.assertEqual(_normalized_or_other("Read", {"file_path": ""}, "claude"), {
-            "kind": "other", "name": "Read", "arguments": {"file_path": ""}
-        })
-        self.assertEqual(_normalized_or_other("Deploy", ["bad"], "pi"), {
-            "kind": "other", "name": "Deploy", "arguments": {}
-        })
+        self.assertEqual(
+            action_or_other(
+                "Read", {"file_path": ""}, CLAUDE_TOOL_TRANSLATORS
+            ),
+            {"kind": "other", "name": "Read", "arguments": {"file_path": ""}},
+        )
+        self.assertEqual(
+            action_or_other("Deploy", ["bad"], PI_TOOL_TRANSLATORS),
+            {"kind": "other", "name": "Deploy", "arguments": {}},
+        )
+
+    def test_fallback_does_not_hide_normalizer_bugs(self):
+        def broken(_arguments):
+            raise TypeError("programming error")
+
+        with self.assertRaisesRegex(TypeError, "programming error"):
+            action_or_other("tool", {}, {"tool": broken})
 
     def test_pi_timeout_conversion_and_legacy_edit(self):
-        self.assertEqual(_normalized_or_other("bash", {"command": "x", "timeout": 2.5}, "pi")["timeout_ms"], 2500.0)
-        self.assertEqual(_normalized_or_other("edit", {
-            "path": "a", "oldText": "x", "newText": "y"
-        }, "pi")["edits"], [{"old_text": "x", "new_text": "y"}])
+        self.assertEqual(
+            action_or_other(
+                "bash",
+                {"command": "x", "timeout": 2.5},
+                PI_TOOL_TRANSLATORS,
+            )["timeout_ms"],
+            2500.0,
+        )
+        self.assertEqual(
+            action_or_other(
+                "edit",
+                {"path": "a", "oldText": "x", "newText": "y"},
+                PI_TOOL_TRANSLATORS,
+            )["edits"],
+            [{"old_text": "x", "new_text": "y"}],
+        )
 
     def test_claude_permission_reuses_session_scoped_cached_action(self):
         adapter = ClaudeCodeAdapter(executable="claude")
