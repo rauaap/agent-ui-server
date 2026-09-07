@@ -16,7 +16,12 @@ from . import git, shell
 from .actions import auto_approval_setting
 from .agent import AgentAdapter, ClaudeCodeAdapter, PiAdapter
 from .db import Database
-
+from .file_tree import (
+    FileTreeError,
+    file_tree_manager,
+    normalize_root,
+    receive_disconnect,
+)
 
 SCROLLBACK_REPLAY_LIMIT = 200
 WEBSOCKET_LIVE_QUEUE_CAPACITY = 256
@@ -42,6 +47,7 @@ class Subscriber:
 
 
 subscribers: dict[int, set[Subscriber]] = defaultdict(set)
+file_socket_tasks: dict[int, set[asyncio.Task[None]]] = defaultdict(set)
 # Session ids are monotonic and the expected count is tiny. Keeping locks for
 # the process lifetime avoids unsafe cleanup while another task is waiting.
 stream_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -162,11 +168,16 @@ async def startup() -> None:
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
-    pending = list(running_tasks.values()) + list(bash_tasks.values())
+    pending = (
+        list(running_tasks.values())
+        + list(bash_tasks.values())
+        + [task for group in file_socket_tasks.values() for task in group]
+    )
     for task in pending:
         task.cancel()
     if pending:
         await asyncio.gather(*pending, return_exceptions=True)
+    await file_tree_manager.shutdown()
     db.close()
 
 
@@ -660,6 +671,117 @@ async def start_turn(session_id: int, payload: TurnRequest) -> dict[str, str]:
 async def start_bash(session_id: int, payload: BashRequest) -> dict[str, str]:
     await begin_bash(session_id, payload.command)
     return {"status": "running"}
+
+
+@app.websocket("/ws/sessions/{session_id}/files")
+async def file_tree_websocket(websocket: WebSocket, session_id: int) -> None:
+    session = db.get_session(session_id)
+    if session is None or not os.path.isdir(session["working_dir"]):
+        await websocket.close(code=1008)
+        return
+
+    root = normalize_root(session["working_dir"])
+    await websocket.accept()
+    endpoint_task = asyncio.current_task()
+    assert endpoint_task is not None
+    endpoint_registered = False
+    async with stream_locks[session_id]:
+        current = db.get_session(session_id)
+        if (
+            current is not None
+            and normalize_root(current["working_dir"]) == root
+            and os.path.isdir(root)
+        ):
+            file_socket_tasks[session_id].add(endpoint_task)
+            endpoint_registered = True
+    if not endpoint_registered:
+        await close_websocket(websocket, code=1008)
+        return
+
+    receiver = asyncio.create_task(receive_disconnect(websocket))
+    acquisition = asyncio.create_task(file_tree_manager.acquire(root))
+    tree = None
+    subscriber = None
+    pending_reserved = False
+    try:
+        done, _pending = await asyncio.wait(
+            {receiver, acquisition}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if receiver in done:
+            if not acquisition.done():
+                acquisition.cancel()
+            await asyncio.gather(acquisition, return_exceptions=True)
+            if not acquisition.cancelled() and acquisition.exception() is None:
+                pending_reserved = True
+            return
+
+        tree = acquisition.result()
+        pending_reserved = True
+        unavailable = False
+        async with stream_locks[session_id]:
+            current = db.get_session(session_id)
+            if (
+                current is None
+                or normalize_root(current["working_dir"]) != root
+                or not os.path.isdir(root)
+            ):
+                unavailable = True
+            else:
+                subscriber = await file_tree_manager.add_subscriber(
+                    tree, session_id, websocket
+                )
+                pending_reserved = False
+        if unavailable:
+            await file_tree_manager.release_pending(root)
+            pending_reserved = False
+            await close_websocket(websocket, code=1008)
+            return
+
+        assert subscriber is not None and subscriber.writer is not None
+        await asyncio.wait(
+            {receiver, subscriber.writer}, return_when=asyncio.FIRST_COMPLETED
+        )
+    except FileTreeError as exc:
+        if pending_reserved:
+            await file_tree_manager.release_pending(root)
+            pending_reserved = False
+        try:
+            async with asyncio.timeout(WEBSOCKET_SEND_TIMEOUT_SECONDS):
+                await websocket.send_json(exc.frame())
+        except Exception:
+            pass
+        await close_websocket(websocket, code=1011)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        if pending_reserved:
+            await file_tree_manager.release_pending(root)
+            pending_reserved = False
+        error = FileTreeError("watcher_failed", f"The file-tree watcher failed: {exc}")
+        try:
+            async with asyncio.timeout(WEBSOCKET_SEND_TIMEOUT_SECONDS):
+                await websocket.send_json(error.frame())
+        except Exception:
+            pass
+        await close_websocket(websocket, code=1011)
+    finally:
+        if pending_reserved:
+            await file_tree_manager.release_pending(root)
+        if subscriber is not None and tree is not None:
+            await file_tree_manager.remove_subscriber(tree, subscriber)
+        for task in (receiver, acquisition):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(receiver, acquisition, return_exceptions=True)
+        if endpoint_registered:
+            async with stream_locks[session_id]:
+                tasks = file_socket_tasks.get(session_id)
+                if tasks is not None:
+                    tasks.discard(endpoint_task)
+                    if not tasks:
+                        file_socket_tasks.pop(session_id, None)
+        if subscriber is None:
+            await close_websocket(websocket, code=1000)
 
 
 @app.websocket("/ws/sessions/{session_id}")
@@ -1207,9 +1329,16 @@ async def teardown_session(session: dict[str, Any]) -> None:
         doomed = list(subscribers.get(session_id, set()))
         for subscriber in doomed:
             retire_subscriber_locked(session_id, subscriber)
+        file_endpoints = list(file_socket_tasks.get(session_id, set()))
         db.delete_session(session_id)
 
+    for endpoint in file_endpoints:
+        if endpoint is not asyncio.current_task() and not endpoint.done():
+            endpoint.cancel()
+    if file_endpoints:
+        await asyncio.gather(*file_endpoints, return_exceptions=True)
     await teardown_subscribers(doomed, code=1000)
+    await file_tree_manager.close_session(session_id)
 
 
 def with_worktree_existence(worktree: dict[str, Any]) -> dict[str, Any]:

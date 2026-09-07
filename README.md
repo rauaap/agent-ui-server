@@ -458,15 +458,23 @@ and exits 0, so the request succeeds and tidies the row away.
 
 ### WebSocket
 
-| Path                  | Description                                                  |
-|-----------------------|-------------------------------------------------------------|
-| `/ws/sessions/{id}`   | Bidirectional — replay scrollback, stream output, approvals |
+| Path                        | Description                                                   |
+|-----------------------------|---------------------------------------------------------------|
+| `/ws/sessions/{id}`         | Bidirectional — replay scrollback, stream output, approvals   |
+| `/ws/sessions/{id}/files`   | Server-only — synchronized working-directory path tree        |
 
 On connect, the backend replays the last 200 scrollback rows, then sends the
 current `status` and `archived` state. The same connection accepts input prompts and approval
 responses, and receives every event broadcast for that session. (Prompts and
 stops can also be issued over REST; everything is broadcast to all subscribers
 either way.)
+
+The separate `/files` socket sends an authoritative `file_tree_snapshot`, then
+revisioned `file_tree_patch` frames as paths change. It may instead send
+`file_tree_error` and close when the root, watcher, ignore rules, or configured
+resource limits make synchronization unavailable. Clients send no application
+messages on this socket. The full protocol and ignore behavior are documented
+in [`docs/file_tree_completion_design.md`](docs/file_tree_completion_design.md).
 
 #### Message protocol
 
