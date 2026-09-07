@@ -1,917 +1,521 @@
 # agent-ui-server
 
-A lightweight, self-hosted backend for driving [Claude Code](https://github.com/anthropics/claude-code)
-agent sessions on a VPS from your phone. It replaces the Termux + tmux workflow:
-spawn a session, stream its output, and approve or deny tool requests from a
-native **Android app** over WireGuard.
+A self-hosted backend for running coding-agent sessions remotely from a browser
+or phone.
 
-> **Scope.** This repo is the backend / control plane: a FastAPI app, a Claude
-> Code adapter, and a SQLite store. It is implemented and tested. The client is
-> a separate Android app —
-> [rauaap/agent-ui-server-android](https://github.com/rauaap/agent-ui-server-android) — that
-> talks to it over the REST + WebSocket API documented below; that API is also
-> reachable from any WebSocket client (`curl`, `websocat`, etc.) for testing.
+Agent UI gives projects, worktrees, agent sessions, transcripts, interactive
+approvals, and shell commands a stable HTTP/WebSocket API. It is not tied to one
+agent harness: adapters translate each harness's native protocol into a shared,
+provider-neutral event and action schema. The server currently ships adapters
+for:
 
-## Why
+- [Claude Code](https://github.com/anthropics/claude-code)
+- [Pi](https://github.com/earendil-works/pi/tree/main/packages/coding-agent)
 
-Controlling a coding agent from a phone usually means SSH'ing into a box and
-fighting a terminal multiplexer through a touchscreen keyboard. agent-ui-server gives
-each session stable metadata, streams output as plain JSON events, and surfaces
-tool-approval requests as simple allow/deny messages the Android app renders as
-buttons — no PTY, no terminal emulator, no copy-paste gymnastics.
+A client renders the same `command`, `edit`, `read`, `search`, and other actions
+regardless of which agent produced them. Supporting another harness is primarily
+an adapter concern rather than a coordinated client rewrite.
 
-### Goals
+This repository contains the backend only. The current clients are:
 
-- Spawn, resume, and stop Claude Code sessions remotely
-- Stream agent output in real time
-- Persist session metadata and scrollback so sessions survive backend restarts
-- Handle tool-approval requests interactively
-- Stay simple enough to read and modify in one sitting
+- [agent-ui-desktop](https://github.com/rauaap/agent-ui-desktop) — static browser UI
+- [agent-ui-android](https://github.com/rauaap/agent-ui-android) — native Android app
+
+The API can also be exercised directly with tools such as `curl` and
+`websocat`.
+
+## What it does
+
+- Registers project directories and reports their session activity
+- Creates, resumes, stops, archives, and deletes agent sessions
+- Selects an agent per session through the adapter registry
+- Streams output and persists the latest transcript history in SQLite
+- Normalizes provider-specific tool calls into a canonical action schema
+- Presents tool approvals and multiple-choice agent questions to clients
+- Supports per-session auto-approval for commands and file writes
+- Creates and manages Git worktrees independently of sessions
+- Runs explicit one-shot shell commands without involving the agent
+- Synchronizes a session's working-directory file tree for path completion
+- Optionally serves a static web client from the same origin as the API
 
 ### Non-goals
 
-- Multi-user support
-- Application-level authentication (access control is delegated to WireGuard)
-- A full terminal emulator (no xterm.js, no PTY)
+- Multi-user accounts
+- Application-level authentication
+- A terminal emulator or persistent interactive shell
+- A sandbox or filesystem security boundary
 
 ## Architecture
 
-```
-Android app (WireGuard peer)
-    |  WireGuard tunnel (plain HTTP, no TLS needed)
-uvicorn (bound to the WireGuard interface IP)
-    |  WebSocket (output streaming, input, approval prompts)
-    |  HTTP REST (session CRUD + turn/stop)
-FastAPI ......................... main.py
-    |  AgentAdapter interface ... agent.py
-ClaudeCodeAdapter
-    -> claude -p --output-format stream-json --input-format stream-json
-              --permission-prompt-tool stdio --permission-mode default --verbose
-              [--resume <claude_session_id>]   # omitted on the first turn
-    |  Bash mode (no agent) .... shell.py  ->  bash -lc '<command>'
-    |  Worktrees .............. git.py    ->  git worktree add/remove (argv, no shell)
-SQLite .......................... db.py  ->  sessions.db (metadata + scrollback)
-```
-
-Each turn spawns a fresh `claude` subprocess that runs one-shot: write the user
-message to stdin, stream JSON events from stdout, exit. Session continuity is
-provided by Claude Code's own on-disk session files, referenced via `--resume`
-with the `session_id` captured from the previous turn's `result` event.
-
-### Source layout
-
-```
-agent-ui-server/
-├── src/agent_ui_server/
-│   ├── main.py      # FastAPI app — REST routes, WebSocket endpoint, turn orchestration
-│   ├── agent.py     # AgentAdapter base + ClaudeCodeAdapter (stream-json) + PiAdapter (RPC)
-│   ├── pi_extension.ts            # Bundled Pi extension — approval gate + AskUserQuestion
-│   ├── shell.py     # Bash mode — one-shot `bash -lc`, timeout + output caps
-│   ├── git.py       # Worktrees — `git` via argv, never through a shell
-│   └── db.py        # SQLite — session metadata + append-only scrollback
-├── pyproject.toml   # Package metadata + dependencies (managed with uv)
-├── Dockerfile       # Fedora + uv + Claude Code CLI + nested Podman
-├── compose.yaml     # Host-network service, bind mounts, named auth volume
-├── docs/            # Design notes + the WebSocket event schema reference
-├── tests/           # Unit tests (db lifecycle + adapter stream-json parsing)
-└── sessions.db      # SQLite file — gitignored, bind-mounted into the container
+```text
+Desktop / Android / another API client
+          │
+          ├── REST: projects, worktrees, sessions, turns, shell commands
+          ├── WebSocket: transcript, status, approvals, questions
+          └── WebSocket: revisioned working-directory file tree
+          │
+FastAPI application ................................ main.py
+          │
+          ├── session orchestration + canonical wire events
+          ├── AgentAdapter registry ................ agent.py
+          │     ├── ClaudeCodeAdapter (stream-json over stdio)
+          │     └── PiAdapter (RPC JSONL over stdio)
+          ├── provider → canonical tool actions .... tool_actions.py / actions.py
+          ├── one-shot shell commands .............. shell.py
+          ├── Git worktrees ........................ git.py
+          ├── inotify file-tree synchronization .... file_tree.py
+          └── SQLite metadata + transcript ......... db.py
 ```
 
-## Security
+An Agent UI session belongs to a project and selects an adapter by id. Each
+shipping adapter starts one short-lived subprocess per turn. Continuity comes
+from the harness's own persisted session id, stored by Agent UI as
+`agent_session_id` and supplied on the next turn.
 
-There is **no application-level auth**. The service binds exclusively to the
-WireGuard interface IP and is unreachable from the public internet — only
-WireGuard peers can reach it.
+The adapter boundary has two layers:
 
+1. **Lifecycle adaptation:** start a turn, stream text, pause for approvals or
+   questions, resume, stop, and capture the harness session id.
+2. **Schema adaptation:** convert native tool names and argument spellings into
+   canonical actions. For example, Claude Code's `Edit` and Pi's `edit` both
+   become an `action` with `kind: "edit"` and the same fields.
+
+Provider-specific protocols stop at this boundary. REST clients, WebSocket
+clients, persistence, and auto-approval logic operate on the common schema.
+
+## Source layout
+
+```text
+src/agent_ui_server/
+├── main.py           # FastAPI routes, WebSockets, orchestration
+├── agent.py          # AgentAdapter, Claude Code adapter, Pi adapter
+├── actions.py        # validated canonical action/event models
+├── tool_actions.py   # provider-specific action projections
+├── pi_extension.ts   # Pi approval gate and AskUserQuestion tool
+├── db.py             # SQLite schema, migrations, transcript storage
+├── file_tree.py      # snapshots, patches, ignore rules, inotify lifecycle
+├── git.py            # bounded Git worktree operations
+└── shell.py          # bounded one-shot bash execution
+
+tests/
+├── test_core.py      # API, database, adapters, WebSocket ordering, shell, Git
+├── test_actions.py   # canonical schema and provider normalization
+├── test_file_tree.py # scans, watches, limits, patches, endpoint lifecycle
+└── fixtures/         # captured native tool events from supported agents
 ```
-uvicorn --host <wireguard-ip> --port 8000   # NOT exposed to the internet
-```
 
-No reverse proxy, no TLS, no bearer tokens, no login form. The entire access
-model is "you are on the WireGuard network or you are not." Do not bind this to
-`0.0.0.0` or expose the port publicly.
+## Security model
 
-[Bash mode](#bash-mode) sharpens this considerably: `POST /sessions/{id}/bash`
-is unauthenticated arbitrary code execution as the server user, and unlike the
-agent's own `Bash` tool it has **no approval gate at all** — that is the point
-of the feature. Anyone who can reach the port has a shell. This is acceptable
-only because the port is reachable from the WireGuard network and nowhere else;
-if that ever stops being true, this endpoint is the first thing to remove.
-
-## Running
-
-The app binds to `WIREGUARD_IP` (default `127.0.0.1`) on `PORT` (default `8000`).
-
-### With uv (no Docker)
-
-Requires the Claude Code CLI (`claude`) and [`uv`](https://docs.astral.sh/uv/)
-on the host. Log in to Claude Code once — credentials live in `~/.claude`:
-
-```sh
-claude login
-uv sync
-uv run agent-ui-server
-```
-
-`uv sync` installs the project itself (a `src/` layout package, built with
-hatchling), so `agent-ui-server` is on the path inside the venv. It can equally
-be installed anywhere else — `uv tool install .`, `uv pip install .`, `pipx
-install .` — or run as `python -m agent_ui_server`.
-
-Bind explicitly to the WireGuard interface:
+There is **no application-level authentication**. The intended deployment binds
+uvicorn to a WireGuard interface and permits only trusted peers to reach it:
 
 ```sh
 WIREGUARD_IP=10.0.0.1 PORT=8000 uv run agent-ui-server
 ```
 
-### With Docker / Podman Compose
+Do not expose this service directly to the internet. In particular,
+`POST /sessions/{id}/bash` is intentional arbitrary command execution as the
+server user. It has no agent approval gate. Agents also have the filesystem and
+process privileges of their subprocess unless the deployment provides stronger
+isolation.
+
+Gitignore rules and `.agent-ui-ignore` only control what the file-tree endpoint
+indexes. They do not prevent an agent or shell command from reading a path.
+
+The Compose configuration uses host networking so the container can bind the
+host's WireGuard address. It also runs privileged with `/dev/fuse` to support
+nested Podman for agents that need containers. Treat that as a powerful,
+trusted-user deployment, not a hardened multi-tenant sandbox.
+
+## Running
+
+The server binds to `WIREGUARD_IP` (default `127.0.0.1`) and `PORT` (default
+`8000`). Python 3.11 or newer is required.
+
+### With uv
+
+Install [`uv`](https://docs.astral.sh/uv/) and the CLI for every agent you want
+to use. The shipping CLIs can both be installed from npm (Pi requires Node.js
+22.19 or newer). Authenticate each CLI once, then install and start the server:
 
 ```sh
-docker compose up -d
+npm install -g @anthropic-ai/claude-code @earendil-works/pi-coding-agent
+claude login       # when using Claude Code
+pi                 # when using Pi; authenticate, then quit
+
+uv sync
+WIREGUARD_IP=127.0.0.1 PORT=8000 uv run agent-ui-server
 ```
 
-After the **first** deploy, log in once inside the container — each agent you
-intend to use needs its own login:
+You only need to install the agent CLI(s) you intend to use. For example, a
+Claude Code-only deployment does not need Pi installed. Note that `/agents`
+lists the adapters built into the server; it does not check whether each CLI is
+installed or authenticated. A turn fails when its selected CLI is unavailable.
+
+The package also exposes `python -m agent_ui_server` and can be installed with
+`uv tool install .`, `pip`, or `pipx`.
+
+### With Docker or Podman Compose
 
 ```sh
-docker compose exec agent-ui-server claude login          # Claude Code
-docker compose exec agent-ui-server pi                     # Pi (authenticate, then quit)
+docker compose up -d --build
 ```
 
-Credentials are persisted on the `claude-auth` named volume (mounted at
-`HOME=/home/agent`), so later rebuilds (`docker compose up -d --build`) stay
-logged in. To force a fresh login, remove the volume:
+Authenticate the bundled agent CLIs after the first deployment:
 
 ```sh
-docker volume rm <project>_claude-auth
+docker compose exec agent-ui-server claude login
+docker compose exec agent-ui-server pi
 ```
 
-The container image is Fedora-based and ships `uv`, the Claude Code CLI, the Pi
-CLI, `git`, and a nested **Podman** stack (`privileged: true` + `/dev/fuse` +
-`fuse-overlayfs`) so agents can run containers inside their working directory.
-Host networking is used so the container sees the WireGuard interface directly.
-Project directories are bind-mounted at `/projects`; create projects with
-`path` values like `/projects/<name>`, and sessions with a matching
-`project_path`. A worktree must live under the same bind mount to be visible
-inside the container — a sibling like `/projects/<name>-<branch>` is the shape
-the client suggests.
+The named `claude-auth` volume is the container user's complete home directory,
+so it persists credentials for both harnesses despite its historical name. The
+image contains Fedora, Python, uv, Node.js, Claude Code, Pi, Git, and nested
+Podman support.
 
-Both paths run the same entry point (the `agent-ui-server` console script), so
-host/port behavior is identical whether you use uv or Compose.
+The provided Compose file bind-mounts:
+
+- `./sessions.db` at `/app/sessions.db`
+- `/home/wawa/projects` at `/projects`
+- `../agent-ui-desktop` at `/web` and serves it through `WEB_ROOT`
+
+Adjust those host paths for your machine. Project and worktree paths submitted
+to the API must use their paths *inside* the container, such as
+`/projects/my-project`.
 
 ### Configuration
 
-| Variable       | Default       | Purpose                                          |
-|----------------|---------------|--------------------------------------------------|
-| `WIREGUARD_IP` | `127.0.0.1`   | Interface IP uvicorn binds to                    |
-| `PORT`         | `8000`        | Listen port                                      |
-| `SESSION_DB`   | `sessions.db` | SQLite database path                             |
-| `CLAUDE_BIN`   | `claude`      | Path/name of the Claude Code executable          |
-| `PI_BIN`       | `pi`          | Path/name of the Pi executable                   |
-| `PI_EXTENSION` | bundled `pi_extension.ts` | Pi extension supplying the approval gate and AskUserQuestion |
-| `WEB_ROOT`     | unset         | Directory of static files to serve at `/`; unset serves no UI |
-| `BASH_TIMEOUT_SECONDS` | `120` | Bash mode: how long a command may run before it is killed |
-| `BASH_OUTPUT_LIMIT`    | `102400` | Bash mode: bytes kept per stream before output is truncated |
-| `GIT_TIMEOUT_SECONDS`  | `30`  | Worktrees: how long a `git` invocation may run before it is killed |
-| `GIT_OUTPUT_LIMIT`     | `4096` | Worktrees: bytes of git output kept for an error message |
+| Variable | Default | Purpose |
+|---|---|---|
+| `WIREGUARD_IP` | `127.0.0.1` | Address uvicorn binds to |
+| `PORT` | `8000` | HTTP/WebSocket port |
+| `SESSION_DB` | `sessions.db` | SQLite database path |
+| `CLAUDE_BIN` | `claude` | Claude Code executable |
+| `PI_BIN` | `pi` | Pi executable |
+| `PI_EXTENSION` | bundled `pi_extension.ts` | Pi approval/question extension |
+| `WEB_ROOT` | unset | Static files mounted at `/` |
+| `BASH_TIMEOUT_SECONDS` | `120` | Timeout for a direct shell command |
+| `BASH_OUTPUT_LIMIT` | `102400` | Bytes retained per stdout/stderr stream |
+| `GIT_TIMEOUT_SECONDS` | `30` | Timeout for a Git operation |
+| `GIT_OUTPUT_LIMIT` | `4096` | Git error-output limit |
 
-### Serving a web client
+When `WEB_ROOT` is set, static files are mounted after the API routes, so API
+and WebSocket paths continue to take precedence. A same-origin client can infer
+its API URL without CORS configuration.
 
-Setting `WEB_ROOT` mounts a directory of static files at `/`, so a browser
-client is served from the same origin as the API — no CORS, and nothing to
-configure client-side because the page infers the API from its own URL. The
-desktop client, [rauaap/agent-ui-desktop](https://github.com/rauaap/agent-ui-desktop),
-is a zero-build static app meant to be pointed at exactly this:
+## API overview
 
-```sh
-WEB_ROOT=../agent-ui-desktop uv run agent-ui-server
-```
-
-The mount is registered after every route, so `/projects`, `/sessions` and
-`/ws/sessions/{id}` still win over any file of the same name. Serving a UI does
-not change the security model — the API was already reachable at that address,
-and access is still "you are on the WireGuard network or you are not."
-
-## API
+FastAPI also exposes generated OpenAPI documentation at `/docs`.
 
 ### REST
 
-| Method   | Path                    | Description                                                       |
-|----------|-------------------------|------------------------------------------------------------------|
-| `GET`    | `/agents`               | List the agents this server can run, for a client's agent picker |
-| `GET`    | `/projects`             | List projects (working directories) with session aggregates      |
-| `POST`   | `/projects`             | Create a project: `mkdir -p` + row (`path`, `name`) → `201`      |
-| `PATCH`  | `/projects`             | Archive or unarchive a project (`path`, `archived`), cascading to its sessions |
-| `DELETE` | `/projects`             | Forget a project and its sessions (`path`); disk untouched       |
-| `GET`    | `/worktrees`            | List worktrees, optionally `?project_path=`, with session counts |
-| `POST`   | `/worktrees`            | Create a worktree (`project_path`, `path`, `branch`) → `201`     |
-| `DELETE` | `/worktrees/{id}`       | Remove the worktree from disk and forget it                      |
-| `GET`    | `/sessions`             | List all sessions with metadata                                  |
-| `POST`   | `/sessions`             | Create a session (`name`, `project_path`, `agent`, `worktree_id`) → `201` |
-| `PATCH`  | `/sessions/{id}`        | Update a session: rename (`name`), auto-approve toggles, `archived` |
-| `POST`   | `/sessions/{id}/detach-worktree` | Detach an archived session while preserving its working directory |
-| `POST`   | `/sessions/{id}/turn`   | Send a prompt and spawn a turn → `202`                           |
-| `POST`   | `/sessions/{id}/bash`   | Run a shell command (`command`), bypassing the agent → `202`     |
-| `POST`   | `/sessions/{id}/stop`   | Stop the running process and any shell command, status → `idle`  |
-| `DELETE` | `/sessions/{id}`        | Stop the process and delete the session and its scrollback       |
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/agents` | List registered agent adapters for a picker |
+| `GET` | `/projects` | List projects and live/archive session aggregates |
+| `POST` | `/projects` | Register/create a project directory |
+| `PATCH` | `/projects` | Archive or unarchive a project and cascade sessions |
+| `DELETE` | `/projects` | Forget a project, sessions, and managed worktrees |
+| `GET` | `/worktrees` | List worktrees; optionally filter by `project_path` |
+| `POST` | `/worktrees` | Create a worktree on a new branch from project HEAD |
+| `DELETE` | `/worktrees/{id}` | Remove a clean, unused worktree |
+| `GET` | `/sessions` | List sessions and current metadata |
+| `POST` | `/sessions` | Create a session for a registered project |
+| `PATCH` | `/sessions/{id}` | Rename, archive, or change auto-approval settings |
+| `POST` | `/sessions/{id}/detach-worktree` | Detach an archived session while preserving its cwd |
+| `POST` | `/sessions/{id}/turn` | Start an agent turn |
+| `POST` | `/sessions/{id}/bash` | Start a direct one-shot shell command |
+| `POST` | `/sessions/{id}/stop` | Stop the agent turn and shell command |
+| `DELETE` | `/sessions/{id}` | Delete a session and its transcript |
 
-`POST /sessions` requires an absolute `project_path` naming a project that
-already exists — a session belongs to a project by foreign key, so an
-unregistered path is a `404`; create the project first. (`working_dir` is still
-accepted as a deprecated alias for `project_path`, for clients written before
-the rename.) The directory is created (`mkdir -p`) if missing. `agent` is one of
-the registered adapters, which `GET /agents` lists — `"claude-code"` (the
-default) or `"pi"`. The
-optional `worktree_id` attaches the session to one of the project's worktrees,
-which it runs in instead; see [Worktrees](#worktrees). Starting a turn on a
-session that is not `idle` returns `409`.
+### Agents and sessions
 
-`PATCH /sessions/{id}` is a partial update; every field is optional and only the
-supplied ones are applied. `name` (a non-empty 1–120 char label, trimmed)
-renames the session and broadcasts a `renamed` event. `auto_approve_write` and
-`auto_approve_command` are booleans that flip the per-session auto-approval
-toggles (see [Auto-approval](#auto-approval)) and broadcast a `settings` event.
-`archived` files the session away or brings it back; see
-[Archiving](#archiving). All three broadcasts reach every WebSocket subscriber,
-so connected clients update live.
-
-`POST /sessions/{id}/detach-worktree` requires an archived session. On the first
-call it must be attached to a worktree: the server copies that path into the
-session's internal `detached_working_dir`, clears `worktree_id`, and returns the
-updated session. Its public `working_dir` therefore stays unchanged. On a retry,
-`worktree_id` is already `null`, but the saved detached path tells the server the
-operation previously completed, so it returns the same session successfully. A
-live session or a project-directory session (both path fields `null`) returns
-`409`. The operation never touches the filesystem; deleting the now-unreferenced
-worktree remains a separate request.
-
-#### `GET /agents`
+`GET /agents` currently returns:
 
 ```json
 [
   { "id": "claude-code", "name": "Claude Code", "default": true },
-  { "id": "pi",          "name": "Pi",          "default": false }
+  { "id": "pi", "name": "Pi", "default": false }
 ]
 ```
 
-Everything a client needs to render an agent picker: the `id` to send back as
-`agent`, a `name` to show, and which one to preselect. Both fields are derived
-rather than restated — the label from the adapter class, the default from the
-same model that validates `POST /sessions` — so the list cannot advertise an
-agent the server would reject, or miss one it would accept. The order is the
-order adapters are registered in.
+Create a project before creating a session:
 
-#### Projects
+```sh
+curl -X POST http://127.0.0.1:8000/projects \
+  -H 'content-type: application/json' \
+  -d '{"path":"/absolute/path/to/project","name":"my project"}'
 
-A **project** is a working directory, stored as a row in `projects` and keyed by
-its path. The server never scans the filesystem to discover projects and has no
-configured projects root: a project exists because it was created through
-`POST /projects`, and nowhere else.
-
-```jsonc
-[
-  { "id": 1, "path": "/projects/agent-ui", "name": "agent-ui",
-    "exists": true, "is_git_repo": true, "archived_at": null,
-    "session_count": 3, "archived_session_count": 1,
-    "last_active_at": "2026-07-28T09:14:02Z" },
-  { "id": 2, "path": "/projects/scratch",  "name": "scratch",
-    "exists": false, "is_git_repo": false, "archived_at": null,
-    "session_count": 0, "archived_session_count": 0, "last_active_at": null }
-]
+curl -X POST http://127.0.0.1:8000/sessions \
+  -H 'content-type: application/json' \
+  -d '{"name":"refactor","project_path":"/absolute/path/to/project","agent":"pi"}'
 ```
 
-`session_count` and `last_active_at` are a `LEFT JOIN` onto `sessions` matched on
-`sessions.project_id`, so a project with no sessions yet reports `0` / `null` —
-and a session running in a worktree somewhere else still counts towards the
-project it was cut from. Both cover *live* sessions only, with
-`archived_session_count` holding the rest, so a project cannot claim five
-sessions while displaying none. Results are sorted by `last_active_at`
-descending — SQLite sorts `NULL` below everything, so never-used projects land
-last — then by `path` ascending.
+A session's effective `working_dir` is derived from its attached worktree,
+preserved detached-worktree path, or project path, in that order. It is not a
+stored session column. `working_dir` remains accepted as a deprecated request
+alias for `project_path`.
 
-`id` is the project's identity, and a JSON **number** — not a string. It exists
-so a project's `path` can change later without taking its sessions with it, and
-it is what sessions store; the HTTP API itself is still addressed by `path`
-everywhere. Client code that compares, stores or renders an id should read
-[docs/client_ids.md](docs/client_ids.md) first — the number/string distinction
-has sharp edges in a browser.
+Only one agent turn may run per session. A direct shell command has a separate
+slot and may run while the agent is running or awaiting approval. Starting new
+work in an archived session or project is rejected.
 
-`exists` is a `stat` of the stored path at request time, not a discovery scan.
-Because the row is the record, a directory removed outside the app leaves the
-project in place; the flag is how a client can say so and offer to forget it.
+### Projects and worktrees
 
-`is_git_repo` is one more `exists`, on `<path>/.git` — a hint so a client can
-hide the worktree toggle for projects that cannot have one. It is only a hint:
-`POST /worktrees` runs the real check. A `.git` *file* counts, so a project that
-is itself a worktree reads as a repo; a project in a subdirectory of a repo
-reads as `false`, which is deliberate.
+Projects are explicit database records; the server never scans the filesystem
+to discover them. Paths must be absolute and are normalized lexically. Deleting
+a project removes its Agent UI records and transcripts but **does not delete the
+project directory**.
 
-#### `POST /projects`
+Worktrees are first-class resources rather than session-owned temporary
+directories. `POST /worktrees` runs `git worktree add -b`, and any number of
+sessions can attach to the resulting row. Deleting a session never removes its
+worktree. Worktree removal is never forced: attached sessions, live detached
+sessions, or dirty/untracked files cause `409` and leave both directory and row
+intact.
 
-Takes `{ "path": "/projects/foo", "name": "foo" }`, creates the directory
-(`mkdir -p`), inserts the row, and returns the same shape as a list entry.
-
-- `path` must be absolute, and is normalised lexically (`..` and duplicate
-  slashes collapsed, trailing slash dropped) so one directory cannot enter the
-  table twice under two spellings. `/` itself is a `400`.
-- `name` is optional and defaults to the path's last segment. It is stored
-  separately because the client lets you break the link between the two — a
-  project may be called `api` while living in `/projects/backend-rewrite`.
-- An **existing** directory is adopted as-is, but it has to be usable: a path
-  that exists and is not a directory, or a directory the server cannot write to,
-  is a `400` rather than a project that fails on its first turn.
-- Creating a project that already exists is a no-op returning its real
-  aggregates, not an error.
-
-#### `DELETE /projects`
-
-Takes `{ "path": "/projects/foo" }` and **never touches the filesystem** — the
-directory and everything the agent wrote in it stay exactly where they are.
-
-What it does remove is the row *and every session belonging to it*, along with
-their scrollback: sessions are reachable only through their project, so leaving
-them would strand history with no way to open or delete it. The project's
-worktrees go the same way, under the never-forced policy described below:
-
-```jsonc
-{ "status": "deleted", "sessions_deleted": 3,
-  "worktrees_removed": 1,
-  "worktree_errors": [
-    { "path": "/projects/app-fix-login",
-      "error": "fatal: '…' contains modified or untracked files, …" }
-  ] }
-```
-
-Sessions are torn down before any worktree is touched, so nothing is still
-attached when git is asked to remove one. A worktree git refuses to remove stays
-on disk and is reported — but its **row goes anyway**, with the project. That is
-the one place a directory outlives its row, and it is deliberate: this endpoint
-already leaves the project's own directory behind, so it is a "forget all of
-this" operation rather than a delete.
-
-Running sessions are stopped first. Unknown path → `404`.
-
-The path travels in the body rather than the URL for the same reason there are
-no nested `/projects/{path}/sessions` routes: a filesystem path does not belong
-in a URL segment. `GET /sessions` already carries `project_id` and `working_dir`
-on every row, so clients group locally.
-
-Sessions **are** restricted to projects: `sessions.project_id` is `NOT NULL`
-with a real foreign key, so `POST /sessions` at an unregistered path is a `404`
-rather than a session nothing in the UI can reach.
-
-#### Worktrees
-
-A **worktree** is a git worktree of a project, with its own row and its own
-endpoints, so two sessions on one project can work on separate branches without
-fighting over a single checkout — and any number of sessions can share one
-worktree when that is what you want.
-
-```jsonc
-[
-  { "id": 1, "project_id": 1, "path": "/projects/app-fix-login",
-    "branch": "fix-login", "created_at": "2026-08-31T09:14:02Z",
-    "session_count": 2, "exists": true }
-]
-```
-
-`POST /worktrees` takes `{ "project_path", "path", "branch" }` and runs
-`git worktree add -b <branch> <path>`, always cutting a **new** branch off the
-project's current HEAD. Attaching to an existing branch or commit-ish is not
-offered. The row's existence is the record that the server created the
-directory and is the one responsible for removing it; if the insert fails after
-git succeeded, the worktree is removed again.
-
-Failure modes, all `400` with the reason in `detail`: the project is not a git
-repository, the branch name is not one git accepts (`git check-ref-format`), the
-branch already exists, the target path is the project directory itself, the
-target path exists and is not an empty directory, or the directory could not be
-created. An empty directory *is* accepted — that is git's own rule. An
-unregistered `project_path` is a `404`.
-
-The directory is created with `Path.mkdir` **before** git runs, even though
-`git worktree add` would create it itself. That command is not atomic: it writes
-the new branch ref before creating the leading directories, so a filesystem
-failure there leaves the branch behind with no worktree attached (verified, git
-2.47.3), and the obvious retry then fails with `a branch named '…' already
-exists` — an error about the wrong thing entirely. Creating it first moves the
-failure ahead of the ref, so there is nothing to unwind, and `OSError` carries a
-real errno, so the message is `Permission denied` rather than git's
-`could not create leading directories of '…/.git'`.
-
-A path that is **already a registered worktree** is a `409` naming the branch it
-is on, checked before anything touches the filesystem. It has its own status and
-message because `worktrees.path` is `UNIQUE` — so this is what stops the insert
-failing after git has already done the work — and because both errors that would
-otherwise fire describe the symptom rather than the cause: git blames a
-non-empty directory, or, if the directory was deleted by hand, its own leftover
-admin files. Clients that derive the path from a template hit this whenever two
-worktrees would be named the same way.
-
-Paths must be **absolute**; a relative one is a `400`. They are normalised
-lexically (`os.path.normpath`, no symlink resolution), so a client is free to
-build one by naive joining — `/projects/app/../app-fix` arrives as
-`/projects/app-fix`.
-
-`session_count` is a `LEFT JOIN` onto `sessions.worktree_id`. Zero is an
-ordinary state: a worktree with nothing attached is one you can still attach to,
-not a leak. `exists` is a `stat` of the path, the same hint `GET /projects`
-carries — a worktree deleted by hand keeps its row, and this is how a client can
-say so and offer to tidy up.
-
-A session attaches at creation time by passing `worktree_id` to `POST /sessions`
-(`404` if unknown, `400` if it belongs to a different project). Its
-`working_dir` is then the worktree's path. **Nothing is created on disk** for an
-attaching session — a `mkdir` would hand the agent a plain directory dressed up
-as a worktree — so attaching to one whose directory is gone succeeds and shows
-up as `exists: false`.
-
-An archived session can explicitly detach through
-`POST /sessions/{id}/detach-worktree`. Detachment preserves its absolute
-`working_dir` but removes its reference from the worktree's `session_count`, so
-that worktree can be deleted once every attached session has detached or been
-deleted. Archiving does not detach automatically; clients decide whether to
-compose those two operations.
-
-`DELETE /sessions/{id}` never touches a directory. A worktree outlives the
-sessions that used it: others may still be attached, and even the last one
-leaving does not mean the user is finished with the branch. Removing it is a
-separate decision, and a separate request.
-
-`DELETE /worktrees/{id}` removes the directory and the row, and answers `409`
-with the reason in `detail` when it cannot:
-
-- sessions are still attached — their names are listed; delete them, or detach
-  them first when they are archived;
-- a live detached session still uses the worktree path as its harness working
-  directory — archive it before retrying;
-- git refuses because the tree has uncommitted or untracked work.
-
-Removal is **never forced**. Expect the dirty case to be the *common* outcome
-rather than an edge case: git counts untracked files as dirty, so any worktree
-whose agent created a single new file will refuse. Clients should phrase it as a
-notice, not an error. Unlike deleting a session, the row does **not** go
-regardless — the row *is* the worktree, so keeping it while the directory
-survives is what stops it becoming an orphan nothing can see. A worktree whose
-directory was deleted by hand needs no special case: git prunes its admin files
-and exits 0, so the request succeeds and tidies the row away.
-
-### WebSocket
-
-| Path                        | Description                                                   |
-|-----------------------------|---------------------------------------------------------------|
-| `/ws/sessions/{id}`         | Bidirectional — replay scrollback, stream output, approvals   |
-| `/ws/sessions/{id}/files`   | Server-only — synchronized working-directory path tree        |
-
-On connect, the backend replays the last 200 scrollback rows, then sends the
-current `status` and `archived` state. The same connection accepts input prompts and approval
-responses, and receives every event broadcast for that session. (Prompts and
-stops can also be issued over REST; everything is broadcast to all subscribers
-either way.)
-
-The separate `/files` socket sends an authoritative `file_tree_snapshot`, then
-revisioned `file_tree_patch` frames as paths change. It may instead send
-`file_tree_error` and close when the root, watcher, ignore rules, or configured
-resource limits make synchronization unavailable. Clients send no application
-messages on this socket. The full protocol and ignore behavior are documented
-in [`docs/file_tree_completion_design.md`](docs/file_tree_completion_design.md).
-
-#### Message protocol
-
-```jsonc
-// Server -> Client
-{ "type": "output", "text": "..." }                                   // agent text
-{ "type": "tool_use", "tool": "Bash", "input": { "command": "..." } } // tool notification
-{ "type": "approval_request", "request_id": "perm_1",                 // process blocked on stdin
-  "tool": "Bash", "input": { "command": "rm -rf /tmp/test" },
-  "category": "command",                                              // write | command | null
-  "auto_approved": true,                                              // (optional) answered by a toggle
-  "options": [ { "id": "allow", "name": "Allow", "kind": "allow_once" },
-               { "id": "deny", "name": "Deny", "kind": "reject_once" } ] }
-{ "type": "approval_response", "request_id": "perm_1",                // broadcast when an approval resolves
-  "behavior": "allow" | "deny", "auto": true }                       // `auto` set on toggle auto-approvals
-{ "type": "question", "request_id": "perm_2",                         // AskUserQuestion (Claude only) — blocks
-  "questions": [ { "question": "...", "header": "...", "multiSelect": false,
-                   "options": [ { "label": "...", "description": "..." } ] } ] }
-{ "type": "question_response", "request_id": "perm_2",               // broadcast when a question is answered
-  "answers": { "<question text>": "<label>" } }
-{ "type": "input", "text": "..." }                                    // echo of a submitted prompt
-{ "type": "bash_input", "command": "df -h" }                          // echo of a `!` command
-{ "type": "bash_output", "command": "df -h",                          // that command, once it exits
-  "stdout": "...", "stderr": "",
-  "exit_code": 0,                                                     // null if it never started
-  "duration_ms": 41, "timed_out": false, "truncated": false }
-{ "type": "status", "status": "running" | "idle" | "awaiting_approval" }
-{ "type": "renamed", "name": "..." }                                  // session label changed
-{ "type": "settings", "auto_approve_write": false,                    // auto-approve toggles changed
-  "auto_approve_command": true }
-{ "type": "archived", "archived_at": "2026-08-26T11:02:00Z" }         // filed away; null = brought back
-{ "type": "worktree_detached", "worktree_id": null,                 // archived session detached
-  "working_dir": "/projects/app-fix-login" }
-{ "type": "done" }                                                    // turn complete
-{ "type": "error", "message": "..." }
-
-// Client -> Server
-{ "type": "input", "text": "..." }                                    // start a new turn
-{ "type": "bash", "command": "df -h" }                                // run a shell command
-{ "type": "approval_response", "request_id": "perm_1",                // answer an approval
-  "behavior": "allow" | "deny",                                       // or pick a specific option:
-  "option_id": "deny",                                                // (optional) one of options[].id
-  "message": "..." }                                                  // (optional) denial reason
-{ "type": "question_response", "request_id": "perm_2",               // answer an AskUserQuestion
-  "answers": { "<question text>": "<label>" } }                       // label, or [labels] for multiSelect
-```
-
-`question` / `question_response` cover Claude Code's built-in **AskUserQuestion**
-tool — the agent asking the user to *pick content*, distinct from a tool
-allow/deny. A pending question reuses the `awaiting_approval` status; the client
-tells them apart by event type.
-
-Support is per agent. **Claude Code** has the tool built in. **Pi** has no such
-tool, so the bundled extension registers one — see [Pi](#pi).
-
-### Bash mode
-
-A message the user prefixes with `!` is not a prompt. The **client** strips the
-`!` and sends `{"type": "bash", "command": "..."}` (or `POST
-/sessions/{id}/bash`); the server spawns `bash -lc '<command>'` in the session's
-`working_dir`, captures stdout and stderr, and writes the result to scrollback
-as a `bash_output` event. The agent is never involved — no tokens, no context,
-no approval prompt.
-
-The server never inspects prompt text for a leading `!`. Keeping the split on
-the client means a prompt that legitimately begins with `!` stays sendable, and
-the wire says what it means.
-
-- **Nothing persists between invocations.** Each command is a fresh shell:
-  `cd`, `export` and shell functions are gone by the next one. Every command
-  starts in the session's `working_dir`.
-- **Independent of the agent.** Bash never takes the turn lock and never
-  changes `status`, so a command can run while the session is `running` or
-  parked in `awaiting_approval`, and neither side notices the other. A client
-  should not gate the `!` path on session status.
-- **One at a time per session.** A second command while one is in flight is
-  rejected with `409` (REST) or an `error` event (WebSocket).
-- **Bounded.** A command is killed after `BASH_TIMEOUT_SECONDS` (SIGTERM to the
-  whole process group, SIGKILL 3s later, so backgrounded children die too) and
-  the result comes back with `timed_out: true` plus whatever it printed first.
-  Output past `BASH_OUTPUT_LIMIT` per stream is replaced mid-way by a
-  `… N bytes omitted …` marker keeping the head and the tail, with
-  `truncated: true`. The reader keeps draining past the cap, so a command like
-  `yes` cannot wedge on a full pipe.
-- **stdin is `/dev/null`,** so a command that decides to prompt gets EOF instead
-  of hanging until the timeout.
-- **Killable.** `POST /sessions/{id}/stop` kills an in-flight command as well as
-  the agent process; the transcript gets an `error` event saying it was stopped.
-
-`exit_code` is `null` when the command never started — most often a
-`working_dir` that was deleted after the session was created, which is reported
-in `stderr` rather than raised.
-
-### Approval flow
-
-1. The `claude` subprocess emits a `control_request` / `sdk_control_request`
-   (subtype `permission` or `can_use_tool`) and blocks on stdin.
-2. The backend sets status → `awaiting_approval`, persists the request to
-   scrollback, and broadcasts an `approval_request` (with the available
-   `options`) to all subscribers. The approval is held in an in-memory
-   `asyncio.Future` keyed by `request_id`.
-3. A client answers with `approval_response`, supplying either a `behavior`
-   (`allow`/`deny`) or a specific `option_id`, plus an optional denial `message`.
-4. The backend resolves the Future and writes a `control_response` to the
-   subprocess stdin — `allow` echoes `updatedInput`, `deny` sends the client's
-   `message` (falling back to a default) — then flips status back to `running`
-   and the process continues.
-
-A `deny` may carry a `message` explaining what the agent should do instead.
-**Claude Code** delivers the reason inline in the denial, so the agent reacts to
-it in the same turn. **Pi** also delivers it inline: the extension's `tool_call`
-hook returns `{block: true, reason}`, and Pi hands the reason to the model as the
-tool's error result.
-
-If the session is stopped or the process exits while an approval is pending, the
-Future is failed and the prompt is cleared.
-
-### Auto-approval
-
-Each session carries two toggles — `auto_approve_write` and
-`auto_approve_command` — set via `PATCH /sessions/{id}`. Nothing changes on the
-agent side: both adapters still run in "ask every time" mode and still emit an
-`approval_request`. The toggles only change whether the *backend* waits for a
-human or answers `allow` itself.
-
-Every `approval_request` carries a `category` the adapter derives from the tool —
-Claude Code by tool name (`Bash` → `command`; `Write`/`Edit`/`MultiEdit`/
-`NotebookEdit` → `write`) and Pi by tool name (`bash`/`powershell` → `command`;
-`edit`/`write` → `write`). When the matching session toggle is
-on, `run_turn` marks the request `auto_approved`, broadcasts it without entering
-`awaiting_approval`, and immediately answers `allow` on the user's behalf (the
-resulting `approval_response` carries `auto: true`). The toggle is re-read from
-the database on each approval, so flipping it mid-turn takes effect on the next
-tool call.
-
-There is no `read` toggle: read-only tools are auto-allowed by Claude Code's
-`--permission-mode default` and — since Pi filters nothing itself — by the
-allowlist in the bundled Pi extension, so they
-never reach this gate. Tools with no category (e.g. `WebFetch`) always prompt.
+See [`docs/worktree_sessions_design.md`](docs/worktree_sessions_design.md) and
+[`docs/archive_worktree_design_decisions.md`](docs/archive_worktree_design_decisions.md)
+for the detailed lifecycle decisions.
 
 ### Archiving
 
-Archiving files a session or a project away without deleting it, so old work can
-be kept without cluttering the list. It lives on the server rather than in the
-client precisely so it does not have to be redone on every device.
+Projects and sessions use nullable `archived_at` timestamps. List endpoints
+return both live and archived rows; clients split the views.
 
-Both `projects` and `sessions` carry a nullable `archived_at`: `null` is live, a
-timestamp is archived. A timestamp rather than a boolean because the archive view
-wants to sort by when things went in. Re-archiving something already archived
-keeps the original timestamp, so a no-op does not reorder the archive.
+Archiving a project archives its live sessions. Unarchiving restores only the
+sessions archived by that cascade. Busy sessions prevent archiving, and missing
+working directories prevent restoration. Archived sessions retain transcript
+access and can still be renamed, reconfigured, detached, or deleted, but cannot
+start turns or shell commands.
 
-**The list endpoints do not filter.** `GET /projects` and `GET /sessions` return
-everything with `archived_at` attached, and the client decides which list a row
-belongs in. Filtering server-side would silently change what existing clients
-see; this way the flag is additive.
+## Session WebSocket
 
-**Archiving a project cascades to its sessions.** An archived project must not
-leave sessions showing in the main list, so `PATCH /projects` with
-`{"archived": true}` archives every live session under it and reports how many in
-`sessions_affected`. Unarchiving restores exactly those, so the round trip leaves
-the project as it was found — a `sessions.archived_with_project` flag, which the
-API never exposes, is what tells the two apart. A session archived by hand
-beforehand keeps its own timestamp and stays archived through the whole cycle.
+Connect to:
 
-Unarchiving a *session* takes its project with it, since a live session under an
-archived project would have nowhere to show — but only that one session comes
-back, not everything the project's archive swept up. Since agent harnesses bind
-a resumed session to its absolute working directory, unarchiving returns `409`
-if that directory is missing. Project unarchive preflights every session its
-cascade would restore and likewise writes nothing if any directory is missing.
+```text
+/ws/sessions/{session_id}
+```
 
-**Archived is read-only, not sealed.** The scrollback still replays over the
-WebSocket, and the session can still be renamed, have its toggles flipped, and be
-deleted; `DELETE /projects` still sweeps archived sessions along with the rest.
-Only starting *new* work is blocked, because that is what would need unarchiving
-to be visible: `POST /sessions/{id}/turn`, `POST /sessions/{id}/bash`, and
-`POST /sessions` or `POST /worktrees` into an archived project all return `409`.
+The socket is bidirectional. On connect, the server atomically establishes a
+snapshot boundary, queues up to the latest 200 persisted transcript rows, then
+sends current `status` and `archived` snapshots. Live events follow the snapshot
+without interleaving. Every connection has one bounded writer queue, so a slow
+or failed client cannot block healthy subscribers.
 
-Worktrees themselves are not archivable. They appear in neither list archiving
-governs — a worktree is reached through its project — so they have no
-`archived_at`, `GET /worktrees` still returns an archived project's worktrees,
-and `DELETE /worktrees/{id}` still removes them. Archiving a project therefore
-leaves its worktrees on disk; they hold real uncommitted work and come off only
-through their own endpoint. Archived sessions remain attached by default, but a
-client may explicitly detach them before requesting worktree deletion. If a
-detached session is later unarchived, its preserved path becomes an active
-working-directory dependency and protects a still-registered worktree at that
-path from deletion until the session is archived again.
+Clients can send:
 
-**A busy session cannot be archived.** Archiving something mid-turn would leave
-it writing scrollback into a session the user has filed away, so a session whose
-`status` is not `idle` — or which has a shell command running, which `status`
-does not cover — is a `409`. For a project the check runs across every session
-first, and a single busy one refuses the whole request without writing anything.
+```jsonc
+{ "type": "input", "text": "Implement the parser" }
+{ "type": "bash", "command": "git status --short" }
+{ "type": "approval_response", "request_id": "perm_1", "behavior": "allow" }
+{ "type": "approval_response", "request_id": "perm_1", "option_id": "deny",
+  "message": "Do not remove generated fixtures" }
+{ "type": "question_response", "request_id": "question_1",
+  "answers": { "Which format?": "JSON" } }
+```
 
-Archiving broadcasts an `archived` event to that session's WebSocket
-subscribers, and the state is sent again on connect, so a client that was offline
-when another device archived something finds out either way.
+Prompts and shell commands can alternatively be started over REST. All
+subscribers receive the resulting events.
 
-The client half is specified in
-[`docs/archiving_client_handoff.md`](docs/archiving_client_handoff.md).
+### Canonical tool actions
 
-## Data model
+Native tool payloads are never the client rendering contract. New `tool_use`
+events contain exactly a call identity and a canonical action:
 
-### `projects`
+```json
+{
+  "type": "tool_use",
+  "call_id": "toolu_01ABC",
+  "action": {
+    "kind": "command",
+    "command": "git status --short",
+    "description": "Show repository status",
+    "shell": "bash"
+  }
+}
+```
 
-| Column       | Type      | Notes                                                        |
-|--------------|-----------|--------------------------------------------------------------|
-| `id`         | INTEGER PK | Autoincrement — the project's identity, and what sessions reference |
-| `path`       | TEXT UQ   | Absolute working directory, normalised; how the HTTP API addresses a project |
-| `name`       | TEXT      | Display label; defaults to the path's last segment but may differ |
-| `created_at` | TEXT      | ISO 8601 (UTC, `Z`)                                          |
-| `archived_at`| TEXT      | ISO 8601, or `NULL` when live — see [Archiving](#archiving)  |
+If that invocation requires permission, the approval repeats the same action so
+it can render independently and uses the same `call_id`:
 
-Sessions join to a project on `sessions.project_id = projects.id`, a real
-foreign key (`ON DELETE CASCADE`). Identity is the id rather than the path
-precisely so a project's `path` can change later without taking its sessions
-with it.
+```json
+{
+  "type": "approval_request",
+  "request_id": "perm_456",
+  "call_id": "toolu_01ABC",
+  "action": { "kind": "command", "command": "rm -rf build/", "shell": "bash" },
+  "options": [
+    { "id": "allow", "name": "Allow", "kind": "allow_once" },
+    { "id": "deny", "name": "Deny", "kind": "reject_once" }
+  ]
+}
+```
 
-### `worktrees`
+`request_id` identifies the interaction; `call_id` identifies the tool
+invocation. Approval options may be empty, in which case clients should send a
+generic `behavior: "allow"` or `"deny"`.
 
-| Column       | Type       | Notes                                                        |
-|--------------|------------|--------------------------------------------------------------|
-| `id`         | INTEGER PK | Autoincrement — what sessions reference                      |
-| `project_id` | INTEGER FK | References `projects.id` (`ON DELETE CASCADE`), `NOT NULL`   |
-| `path`       | TEXT UQ    | Absolute path of the worktree directory, normalised          |
-| `branch`     | TEXT       | The branch it was cut on; `NULL` for rows created by migration |
-| `created_at` | TEXT       | ISO 8601 (UTC, `Z`)                                          |
+Supported action kinds are:
 
-The row's existence *is* the ownership record: every worktree here was created
-by `POST /worktrees`, so every one is ours to remove. There is no
-`owned` flag, and adopting worktrees that already exist on disk would be what
-adds one.
+| Kind | Main fields | Meaning |
+|---|---|---|
+| `command` | `command`, optional `description`, `timeout_ms`, `shell` | Shell/process command |
+| `read` | `path`, optional `offset`, `limit` | Read a file |
+| `edit` | `path`, `edits[]` | One or more exact-text edits |
+| `write` | `path`, `content` | Replace/write a file |
+| `search` | `mode`, `query`, optional `path`, `glob`, `limit` | Content or path search |
+| `list` | optional `path`, `limit` | Directory listing |
+| `web` | `operation` plus `query` or `url`, optional `prompt` | Web search or fetch |
+| `task` | `description`, optional `prompt`, `agent` | Delegate work |
+| `other` | `name`, `arguments` | Unknown or malformed native tool fallback |
 
-`branch` is a record of what was created, not live state — an agent working in
-the worktree is free to switch branches, and nothing here tracks that. Ask git
-if you need the current branch.
+Recognized actions do not expose the provider's original tool name or argument
+spelling. Unknown tools preserve both under `other`. Tool results are not part
+of this schema.
 
-### `sessions`
+Auto-approval is derived from `action.kind`: `command` uses
+`auto_approve_command`; `edit` and `write` use `auto_approve_write`. There is no
+provider-name table and no `category` field on the wire. An auto-approved
+request carries `"auto_approved": true` and is followed by an
+`approval_response` with `"auto": true`.
 
-| Column              | Type    | Notes                                                       |
-|---------------------|---------|-------------------------------------------------------------|
-| `id`                | INTEGER PK | Autoincrement — never reused, so a stale URL cannot hit a later session |
-| `name`              | TEXT    | Human-readable label                                        |
-| `project_id`        | INTEGER FK | References `projects.id` (`ON DELETE CASCADE`), `NOT NULL` |
-| `worktree_id`       | INTEGER FK | References `worktrees.id` (`ON DELETE RESTRICT`); `NULL` for project-directory and detached sessions |
-| `detached_working_dir` | TEXT | Original worktree path after explicit detachment; otherwise `NULL`; internal |
-| `agent`             | TEXT    | Which adapter to use, either `claude-code` or `pi` |
-| `agent_session_id`  | TEXT    | The agent's own resume id; `NULL` until the first turn completes |
-| `status`            | TEXT    | `idle` \| `running` \| `awaiting_approval`                  |
-| `created_at`        | TEXT    | ISO 8601 (UTC, `Z`)                                         |
-| `last_active_at`    | TEXT    | ISO 8601, bumped on each turn                               |
-| `archived_at`       | TEXT    | ISO 8601, or `NULL` when live — see [Archiving](#archiving) |
-| `archived_with_project` | INTEGER | `0`/`1` — archived by the project's cascade rather than on its own account; internal, never exposed by the API |
-| `auto_approve_write`   | INTEGER | `0`/`1` — auto-approve write/edit tools (default `0`)    |
-| `auto_approve_command` | INTEGER | `0`/`1` — auto-approve shell commands (default `0`)      |
+### Other server events
 
-**There is no `working_dir` column.** Every session response carries one, but it
-is computed as the first non-null value of `worktrees.path`,
-`sessions.detached_working_dir`, and `projects.path`. The detached path is filled
-only when an archived worktree session explicitly severs its foreign-key link;
-while links are live, project and worktree paths still have a single source of
-truth.
+```jsonc
+{ "type": "output", "text": "Streaming agent text" }
+{ "type": "status", "status": "running" } // idle | running | awaiting_approval
+{ "type": "approval_response", "request_id": "perm_1", "behavior": "allow" }
+{ "type": "question", "request_id": "question_1", "questions": [/* ... */] }
+{ "type": "question_response", "request_id": "question_1", "answers": {/* ... */} }
+{ "type": "input", "text": "Echoed prompt" }
+{ "type": "bash_input", "command": "pytest -q" }
+{ "type": "bash_output", "command": "pytest -q", "stdout": "...", "stderr": "",
+  "exit_code": 0, "duration_ms": 821, "timed_out": false, "truncated": false }
+{ "type": "renamed", "name": "new label" }
+{ "type": "settings", "auto_approve_write": true, "auto_approve_command": false }
+{ "type": "archived", "archived_at": "2026-08-26T11:02:00Z" }
+{ "type": "worktree_detached", "worktree_id": null, "working_dir": "/projects/app-fix" }
+{ "type": "done", "session_id": "harness-session-id" }
+{ "type": "error", "message": "Human-readable failure" }
+```
 
-### `scrollback` (append-only)
+Transcript events are persisted; lifecycle snapshots such as `status`,
+`archived`, and `done` are not historical transcript records. SQLite is the
+source of truth for current metadata.
 
-| Column       | Type    | Notes                                                                          |
-|--------------|---------|--------------------------------------------------------------------------------|
-| `id`         | INTEGER | Autoincrement PK                                                               |
-| `session_id` | INTEGER FK | References `sessions.id` (`ON DELETE CASCADE`)                              |
-| `ts`         | TEXT    | ISO 8601                                                                       |
-| `type`       | TEXT    | `input` \| `output` \| `tool_use` \| `approval_request` \| `approval_response` \| `question` \| `question_response` \| `bash_input` \| `bash_output` \| `error` |
-| `payload`    | TEXT    | JSON blob                                                                      |
+A `question` is different from approval: the agent is asking the user to choose
+content, not asking permission to execute a tool. Claude Code provides
+`AskUserQuestion`; the bundled Pi extension supplies an equivalent tool.
 
-SQLite runs in WAL mode with foreign keys on. On startup, any session left in a
-non-`idle` state (from a crash or restart) is reset to `idle`, since no
-subprocess survives a backend restart.
+## File-tree WebSocket
 
-The `ON DELETE CASCADE` from sessions to projects is a backstop only:
-`DELETE /projects` still sweeps its sessions explicitly through
-`teardown_session`, which does much more than delete a row — it stops the agent,
-cancels any bash command and closes subscribers.
+Connect to:
 
-`sessions.worktree_id` is `ON DELETE RESTRICT`, behind the `409` that
-`DELETE /worktrees/{id}` answers when sessions are still attached. It is also
-why `Database.delete_project` deletes sessions explicitly before the project row
-rather than leaving it to the cascade: a cascade that happened to reach
-`worktrees` while a session still pointed at one would abort the whole delete,
-and the order of that is SQLite's business, not ours.
+```text
+/ws/sessions/{session_id}/files
+```
 
-#### Migration
+This server-to-client socket indexes the session's effective working directory.
+It first sends an authoritative `file_tree_snapshot`, then revisioned
+`file_tree_patch` frames. The server shares one inotify-backed tree between
+subscribers watching the same root and enforces watch, path-count, path-byte,
+patch-size, and queue limits.
 
-Databases are rebuilt on open, through as many steps as their age requires.
+Built-in rules omit common VCS metadata, dependency directories, caches, and
+editor junk. A root `.agent-ui-ignore` file adds gitignore-style rules and can
+use negation to override built-ins. Mount-point subtrees and symlinked
+directories are not traversed. Failures are sent as `file_tree_error` when
+possible before the socket closes.
 
-`_migrate_v2` gives projects an `id` and sessions a real `project_id` foreign
-key. SQLite cannot add a `REFERENCES` column with a non-`NULL` default and
-cannot re-key a table, so both tables go through the documented 12-step rebuild
-inside one transaction. Existing rows resolve to a project by *normalised* path
-— `create_session` never normalised it while `create_project` did, so a legacy
-`/p/demo/` joins the existing `/p/demo` rather than minting a duplicate. A
-session whose path matched no project at all (an orphan, invisible in the UI but
-still holding scrollback) is adopted into a project created for it.
+The complete protocol and ignore semantics are in
+[`docs/file_tree_completion_design.md`](docs/file_tree_completion_design.md).
+The implementation is Linux-specific because it uses inotify.
 
-`_migrate_v3` renumbers projects and sessions from uuid strings to integer ids,
-rebuilding `scrollback` along with them. **Ids are not preserved**, so anything
-holding an old uuid stops resolving.
+## Direct shell mode
 
-`_migrate_v4` moves the worktree out of the session and into `worktrees`. Each
-session with `owns_worktree = 1` mints a worktree row at its `working_dir` (one
-row per path, `branch` unknown and left `NULL`) and links to it; every other
-session gets `worktree_id = NULL`, which resolves to the project directory it
-was already running in. Both dropped columns were expressing something the new
-schema says structurally — the cwd is derived from the links, and "we created
-this directory" is a `worktrees` row existing. Session ids are preserved here,
-so unlike v3 this leaves `scrollback` untouched.
+A client conventionally treats input beginning with `!` as a direct shell
+command, strips the prefix, and sends a `bash` WebSocket message. The server
+does not inspect ordinary prompts for `!`.
 
-The archiving columns and `sessions.detached_working_dir` are added by plain
-`ALTER TABLE` on open for any database that does not have them yet. They run
-*after* every rebuild above rather than before: these features postdate all of
-them, and each rebuild copies an explicit column list into a fresh table, so
-columns added first would only be dropped again by whichever rebuild remained.
+Each command is a fresh `bash -lc` process in the session's working directory:
 
-### In-memory state
+- no `cd`, environment variable, or shell function persists to the next command;
+- stdin is closed, so interactive programs receive EOF rather than hanging;
+- timeout terminates the entire process group and escalates to `SIGKILL`;
+- stdout and stderr are drained and truncated to bounded head/tail output;
+- one shell command may run per session, independently of its agent turn;
+- the stop endpoint cancels both the shell command and agent process.
 
-Live process handles, WebSocket subscribers, the running-turn tasks, the
-in-flight bash-mode tasks, and pending approval Futures are held in memory and
-intentionally **not** persisted — they are all empty after a restart. Bash tasks
-are tracked in their own dict, separate from turns, precisely because the two
-are allowed to run at the same time.
+This path deliberately bypasses the agent, context window, tokens, and approval
+system.
 
-## Agent interface
+## Agent adapters
 
-Adapters implement a small interface so other CLIs can be added later:
+Adapters implement the small lifecycle interface in `agent.py`:
 
 ```python
 class AgentAdapter:
-    async def start_turn(session, prompt) -> AsyncIterator[AgentEvent]
+    async def start_turn(session, prompt): ...       # async AgentEvent stream
     async def send_approval(session, request_id, behavior,
-                            *, option_id=None, message=None) -> str  # effective allow/deny
-    async def stop(session) -> None
+                            *, option_id=None, message=None): ...
+    async def send_answer(session, request_id, answers): ...
+    async def stop(session): ...
 ```
 
-`AgentEvent` is a tagged union (`output`, `tool_use`, `approval_request`,
-`done`, `error`). The WebSocket layer and the Android app only ever speak
-`AgentEvent` — they never touch adapter internals. Two adapters ship today:
+| Agent | Native protocol | Resume | Interactive gate |
+|---|---|---|---|
+| Claude Code | `stream-json` over stdio | `--resume <id>` | stdio permission requests |
+| Pi | RPC JSONL over stdio | `--session <id>` | bundled extension dialogs |
 
-| Agent           | Per-turn process                          | Resume                  | Tool approval                                  |
-|-----------------|-------------------------------------------|-------------------------|------------------------------------------------|
-| **Claude Code** | `claude -p --output-format stream-json`   | `--resume <id>`         | `--permission-prompt-tool stdio` via stdin     |
-| **Pi**          | `pi --mode rpc` (JSONL over stdio)        | `--session <id>`        | bundled extension's `tool_call` hook, over Pi's dialog protocol |
+Claude Code runs with `--permission-mode default` and
+`--permission-prompt-tool stdio`. Pi has no native permission system, so
+`pi_extension.ts` gates mutating tools and supplies `AskUserQuestion`. The
+adapter waits for the extension's ready handshake before sending a prompt;
+failure to load the gate fails closed. `--no-extensions` prevents project-local
+Pi extensions from modifying tool input after approval.
 
-Both shipping adapters are **one short-lived subprocess per turn** and surface
-real multiple-choice approvals; they only differ in wire protocol.
+To add another harness:
 
-**Claude Code** speaks Anthropic's `stream-json` over stdio: we write the user
-message to stdin, stream JSON events from stdout, and answer
-`control_request`/`sdk_control_request` permission prompts by writing a
-`control_response` back to stdin.
+1. Implement `AgentAdapter` and give it a user-facing `LABEL`.
+2. Translate native calls into the canonical models in `actions.py`; keep native
+   names and spellings in adapter-specific code.
+3. Preserve call identity between `tool_use` and `approval_request`.
+4. Register the adapter in `main.py`.
+5. Add captured native fixtures and normalization/lifecycle tests.
 
-**Pi** speaks its **RPC mode** — newline-delimited JSON on stdio. Each turn the
-adapter spawns `pi --mode rpc -e <extension> --no-extensions` (plus `--session
-<id>` on resume), waits for the extension's handshake, sends `get_state` to
-learn the session id, then `prompt`, and maps the event stream (`message_update`
-→ `output`, `tool_execution_start` → `tool_use`, `agent_settled` → `done`).
+A client should never branch on the session's agent id to render a recognized
+action.
 
-Unlike the other two, Pi ships **no permission system at all** — its own docs
-say built-in tools "run shell commands with the permissions of the Pi process"
-and recommend containerization instead — and no tool for asking the user a
-question. Both are supplied by the bundled `pi_extension.ts`, which the adapter
-passes with `-e`:
+## Persistence
 
-- A `tool_call` hook gates every mutating tool and returns `{block: true,
-  reason}` on denial. Read-only tools (`read`, `grep`, `find`, `ls`) are allowed
-  without a prompt; anything unrecognized prompts.
-- A registered `AskUserQuestion` tool takes a batch of 1-4 questions, matching
-  Claude Code's shape.
+SQLite runs in WAL mode with foreign keys enabled. It stores:
 
-The extension reaches the adapter over Pi's extension dialog protocol: it calls
-`ctx.ui.select` / `ctx.ui.input`, which Pi serializes as `extension_ui_request`
-lines answered with `extension_ui_response`. Neither call carries structured
-data, so the extension JSON-encodes what the adapter needs into the dialog
-`title`; tool *arguments* are not sent that way but recovered from the
-`tool_execution_start` Pi emits just before. A question batch becomes N
-concurrent dialogs sharing one `toolCallId`, which the adapter reassembles into
-a single `question` event.
+- `projects` — explicit project identity, path, label, archive timestamp
+- `worktrees` — project-owned Git worktree paths and branch records
+- `sessions` — adapter id, harness resume id, state, settings, timestamps, links
+- `scrollback` — append-only persisted transcript events
 
-Because the gate lives in an extension rather than in Pi, a failure to load it
-would leave the agent running unrestricted and silent. The extension therefore
-announces itself on `session_start`, and the adapter **refuses to send the
-prompt** until it does. `--no-extensions` is passed alongside `-e` so a
-project's own `.pi/extensions` cannot join the session and mutate tool input
-after the user has approved it.
+Integer project/session ids are monotonic and are not reused. Startup resets any
+persisted `running` or `awaiting_approval` session to `idle`, because subprocess
+handles, pending interactions, tasks, and subscribers are intentionally
+in-memory and cannot survive a restart.
 
-One deployment note: Pi's launcher is `#!/usr/bin/env node`, so it runs under
-whatever `node` is first on `PATH`. Under too old a Node it fails deep inside
-its own bundle with an unrelated-looking `SyntaxError`, so the adapter promotes
-the Node shipped beside the `pi` binary, when there is one, to the front of the
-child's `PATH`.
-
-Codex remains future work — its approval handling needs a persistent
-`app-server` speaking JSON-RPC, so it does not fit the one-shot shape.
+Older database shapes are migrated on open. Back up `sessions.db` before
+upgrading if its history matters.
 
 ## Development
 
 ```sh
-uv sync                                        # install deps + the project (editable)
-uv run python -m unittest discover -s tests    # run the test suite
-uv build                                       # build a wheel + sdist into dist/
+uv sync
+uv run python -m unittest discover -s tests
+uv build
 ```
 
-The tests import the installed package (`from agent_ui_server import ...`), so
-`uv sync` has to have run at least once.
+Tests use temporary SQLite databases, real short-lived Bash processes, real Git
+repositories/worktrees, simulated WebSockets, captured Claude Code/Pi events,
+and inotify-backed temporary trees. They do not start a real coding-agent
+subprocess or require network access.
 
-The tests cover the SQLite session/scrollback lifecycle, the schema migration
-(built from a hand-written old-shaped database), the `ClaudeCodeAdapter`
-stream-json parsing (assistant text/tool blocks, permission and `can_use_tool`
-normalization, nested `session_id` extraction), bash mode end to end (timeout,
-process-group kill, output truncation, turn independence), and worktrees end to
-end (creation, every `400`, rollback on a failed insert, sessions sharing one,
-and every way removal is refused or succeeds). No *agent* subprocess is spawned in
-tests; the bash-mode tests spawn a real short-lived `/bin/bash`, and the
-worktree tests `git init` a real repository in a temporary directory — neither
-needs the network.
-
-## Dependencies
-
-`fastapi`, `uvicorn[standard]`, `python-dotenv` — plus `sqlite3` and `asyncio`
-from the standard library. No ORM, no task queue, no message broker.
-
-## Roadmap
-
-- `AppServerAdapter` for Codex (persistent `app-server` over JSON-RPC 2.0)
-- Voice input: Android app audio → backend → local `faster-whisper` (`tiny`
-  model, no GPU) → transcription used as a prompt
-- Session forking
-- Per-session tool allowlists
-- Worktrees: attach to an existing branch or commit-ish, an explicit "delete
-  anyway" that passes `--force`, adopting worktrees already on disk, and moving
-  a session between worktrees after it is created
-- Moving a project's path (`projects.id` exists for it; no endpoint yet)
+Runtime dependencies are FastAPI, uvicorn, Pydantic, python-dotenv,
+`inotify-simple`, and `pathspec`, plus Python's `sqlite3` and `asyncio` modules.
