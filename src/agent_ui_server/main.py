@@ -637,6 +637,17 @@ async def stop_session(session_id: int) -> dict[str, str]:
     adapter = adapters.get(session["agent"])
     if adapter is not None:
         await adapter.stop(session)
+
+    # Stopping the provider process does not necessarily finish run_turn. The
+    # provider may already have written another approval request to stdout; the
+    # reader can register it after adapter.stop() cleared the pending requests
+    # and then wait forever for its decision. Cancel and join the owning task so
+    # no buffered provider event can keep the in-memory turn slot occupied.
+    task = running_tasks.pop(session_id, None)
+    if task is not None and task is not asyncio.current_task() and not task.done():
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
     # Stop means everything this session is running, agent or not — otherwise a
     # runaway `!` command would have no kill switch short of the timeout.
     await cancel_bash(session_id)

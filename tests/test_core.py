@@ -3106,6 +3106,88 @@ class _AutoApproveAdapter:
         pass
 
 
+class _LateApprovalOnStopAdapter:
+    """Expose a second approval only after stop clears the visible one."""
+
+    LABEL = "Late approval"
+
+    def __init__(self) -> None:
+        self.first_released = asyncio.Event()
+        self.late_emitted = asyncio.Event()
+        self.cleaned_up = asyncio.Event()
+
+    async def start_turn(self, session, prompt):
+        try:
+            yield {
+                "type": "approval_request",
+                "request_id": "perm_1",
+                "call_id": "call-1",
+                "action": {"kind": "read", "path": "/outside/one"},
+                "options": [],
+            }
+            await self.first_released.wait()
+            yield {
+                "type": "approval_request",
+                "request_id": "perm_2",
+                "call_id": "call-2",
+                "action": {"kind": "read", "path": "/outside/two"},
+                "options": [],
+            }
+            self.late_emitted.set()
+            await asyncio.Event().wait()
+        finally:
+            self.cleaned_up.set()
+
+    async def stop(self, session) -> None:
+        # Model the provider's buffered stdout becoming readable after the
+        # currently visible approval is cleared. Waiting here makes the race
+        # deterministic: stop_session returns from the adapter with run_turn
+        # parked on the newly emitted approval.
+        self.first_released.set()
+        await self.late_emitted.wait()
+
+
+class StopTurnTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stop_cancels_turn_blocked_on_late_buffered_approval(self) -> None:
+        from agent_ui_server import main
+
+        original_db = main.db
+        original_enqueue = main.enqueue_for_subscribers
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Database(Path(tmpdir) / "sessions.db")
+            session = make_session(database, tmpdir, agent="late-approval")
+            adapter = _LateApprovalOnStopAdapter()
+            main.db = database
+            main.adapters["late-approval"] = adapter
+            main.enqueue_for_subscribers = lambda _session_id, _messages: []
+            try:
+                await main.begin_turn(session["id"], "go")
+                turn_task = main.running_tasks[session["id"]]
+                while (
+                    database.require_session(session["id"])["status"]
+                    != "awaiting_approval"
+                ):
+                    await asyncio.sleep(0)
+
+                await asyncio.wait_for(main.stop_session(session["id"]), timeout=1)
+
+                self.assertTrue(turn_task.done())
+                self.assertTrue(adapter.cleaned_up.is_set())
+                self.assertNotIn(session["id"], main.running_tasks)
+                self.assertEqual(
+                    database.require_session(session["id"])["status"], "idle"
+                )
+            finally:
+                task = main.running_tasks.pop(session["id"], None)
+                if task is not None and not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                main.adapters.pop("late-approval", None)
+                main.enqueue_for_subscribers = original_enqueue
+                main.db = original_db
+                database.close()
+
+
 class RunTurnAutoApproveTests(unittest.IsolatedAsyncioTestCase):
     async def _drive(self, *, auto_command: bool, category: str):
         from agent_ui_server import main
