@@ -1,0 +1,185 @@
+{
+  "capture": {
+    "harness": "Claude Code",
+    "version": "2.1.261",
+    "captured_from_real_turns": true,
+    "sanitized": "Temporary paths and generated IDs were replaced with stable values; unrelated message metadata, results, and permission suggestions were omitted.",
+    "observations": [
+      "Assistant tool blocks carry id, name, and input.",
+      "Permission requests correlate through request.tool_use_id.",
+      "The current runtime emits Agent for delegation even when prompted to use the advertised Task tool.",
+      "MultiEdit was not present in the system init tool list; its mapping is retained for historical events."
+    ]
+  },
+  "assistant_events": {
+    "bash": {
+      "type": "assistant",
+      "message": {
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_bash_1",
+            "name": "Bash",
+            "input": {
+              "command": "rm delete-me.txt",
+              "description": "Delete delete-me.txt"
+            },
+            "caller": { "type": "direct" }
+          }
+        ]
+      }
+    },
+    "read": {
+      "type": "assistant",
+      "message": {
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_read_1",
+            "name": "Read",
+            "input": { "file_path": "/workspace/sample.txt" },
+            "caller": { "type": "direct" }
+          }
+        ]
+      }
+    },
+    "edit": {
+      "type": "assistant",
+      "message": {
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_edit_1",
+            "name": "Edit",
+            "input": {
+              "replace_all": false,
+              "file_path": "/workspace/edit.txt",
+              "old_string": "before",
+              "new_string": "after"
+            },
+            "caller": { "type": "direct" }
+          }
+        ]
+      }
+    },
+    "write": {
+      "type": "assistant",
+      "message": {
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_write_1",
+            "name": "Write",
+            "input": {
+              "file_path": "/workspace/written.txt",
+              "content": "written fixture\n"
+            },
+            "caller": { "type": "direct" }
+          }
+        ]
+      }
+    },
+    "grep": {
+      "type": "assistant",
+      "message": {
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_grep_1",
+            "name": "Grep",
+            "input": {
+              "pattern": "marker",
+              "path": "sample.txt",
+              "glob": "*.txt",
+              "output_mode": "content"
+            },
+            "caller": { "type": "direct" }
+          }
+        ]
+      }
+    },
+    "glob": {
+      "type": "assistant",
+      "message": {
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_glob_1",
+            "name": "Glob",
+            "input": {
+              "pattern": "*.txt",
+              "path": "/workspace"
+            },
+            "caller": { "type": "direct" }
+          }
+        ]
+      }
+    },
+    "agent": {
+      "type": "assistant",
+      "message": {
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_agent_1",
+            "name": "Agent",
+            "input": {
+              "description": "Fixture subagent",
+              "prompt": "Reply with fixture-subagent-ok without tools",
+              "subagent_type": "general-purpose",
+              "run_in_background": false
+            },
+            "caller": { "type": "direct" }
+          }
+        ]
+      }
+    },
+    "web_search": {
+      "type": "assistant",
+      "message": {
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_web_search_1",
+            "name": "WebSearch",
+            "input": { "query": "example domain IANA" },
+            "caller": { "type": "direct" }
+          }
+        ]
+      }
+    },
+    "web_fetch": {
+      "type": "assistant",
+      "message": {
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_web_fetch_1",
+            "name": "WebFetch",
+            "input": {
+              "url": "https://example.com",
+              "prompt": "Return the page title"
+            },
+            "caller": { "type": "direct" }
+          }
+        ]
+      }
+    }
+  },
+  "permission_request": {
+    "type": "control_request",
+    "request_id": "permission_request_1",
+    "request": {
+      "subtype": "can_use_tool",
+      "tool_name": "Bash",
+      "display_name": "Bash",
+      "input": {
+        "command": "rm delete-me.txt",
+        "description": "Delete delete-me.txt"
+      },
+      "description": "Delete delete-me.txt",
+      "blocked_path": "/workspace/delete-me.txt",
+      "tool_use_id": "toolu_bash_1"
+    }
+  }
+}

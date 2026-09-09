@@ -1,0 +1,155 @@
+{
+  "capture": {
+    "harness": "Pi",
+    "version": "0.85.1",
+    "captured_from_real_turns": true,
+    "sanitized": "Provider-generated call and dialog IDs were replaced with stable fixture values.",
+    "observations": [
+      "tool_execution_start carries toolCallId, toolName, and prepared args.",
+      "An ls call with no explicit path or limit carries an empty args object.",
+      "The approval extension repeats toolCallId and toolName in its envelope.",
+      "Two sibling Bash calls were requested in one model response. Pi emitted and blocked on the first approval before emitting tool_execution_start for the second, so approval preflight was sequential even though execution can be parallel."
+    ]
+  },
+  "tool_execution_start": {
+    "read": {
+      "type": "tool_execution_start",
+      "toolCallId": "call_read_1",
+      "toolName": "read",
+      "args": {
+        "path": "sample.txt",
+        "offset": 1,
+        "limit": 2
+      }
+    },
+    "grep": {
+      "type": "tool_execution_start",
+      "toolCallId": "call_grep_1",
+      "toolName": "grep",
+      "args": {
+        "pattern": "marker",
+        "path": ".",
+        "glob": "*.txt",
+        "limit": 5
+      }
+    },
+    "find": {
+      "type": "tool_execution_start",
+      "toolCallId": "call_find_1",
+      "toolName": "find",
+      "args": {
+        "pattern": "*.txt",
+        "path": ".",
+        "limit": 5
+      }
+    },
+    "ls": {
+      "type": "tool_execution_start",
+      "toolCallId": "call_ls_1",
+      "toolName": "ls",
+      "args": {
+        "path": ".",
+        "limit": 5
+      }
+    },
+    "ls_default_path": {
+      "type": "tool_execution_start",
+      "toolCallId": "call_ls_2",
+      "toolName": "ls",
+      "args": {}
+    },
+    "bash": {
+      "type": "tool_execution_start",
+      "toolCallId": "call_bash_1",
+      "toolName": "bash",
+      "args": {
+        "command": "printf bash-fixture",
+        "timeout": 10
+      }
+    },
+    "powershell": {
+      "type": "tool_execution_start",
+      "toolCallId": "call_powershell_1",
+      "toolName": "powershell",
+      "args": {
+        "command": "Write-Output powershell-fixture",
+        "timeout": 10
+      }
+    },
+    "edit": {
+      "type": "tool_execution_start",
+      "toolCallId": "call_edit_1",
+      "toolName": "edit",
+      "args": {
+        "path": "sample.txt",
+        "edits": [
+          {
+            "oldText": "alpha",
+            "newText": "ALPHA"
+          },
+          {
+            "oldText": "beta",
+            "newText": "BETA"
+          }
+        ]
+      }
+    },
+    "write": {
+      "type": "tool_execution_start",
+      "toolCallId": "call_write_1",
+      "toolName": "write",
+      "args": {
+        "path": "created.txt",
+        "content": "fixture write\n"
+      }
+    }
+  },
+  "approval_request": {
+    "type": "extension_ui_request",
+    "id": "dialog_bash_1",
+    "method": "select",
+    "title": "{\"agent-ui\":1,\"kind\":\"approval\",\"toolCallId\":\"call_bash_1\",\"toolName\":\"bash\"}",
+    "options": [
+      "Allow",
+      "Deny"
+    ]
+  },
+  "parallel_call_preflight_sequence": [
+    {
+      "type": "tool_execution_start",
+      "toolCallId": "call_parallel_bash_1",
+      "toolName": "bash",
+      "args": {
+        "command": "printf first"
+      }
+    },
+    {
+      "type": "extension_ui_request",
+      "id": "dialog_parallel_bash_1",
+      "method": "select",
+      "title": "{\"agent-ui\":1,\"kind\":\"approval\",\"toolCallId\":\"call_parallel_bash_1\",\"toolName\":\"bash\"}",
+      "options": [
+        "Allow",
+        "Deny"
+      ]
+    },
+    {
+      "type": "tool_execution_start",
+      "toolCallId": "call_parallel_bash_2",
+      "toolName": "bash",
+      "args": {
+        "command": "printf second"
+      }
+    },
+    {
+      "type": "extension_ui_request",
+      "id": "dialog_parallel_bash_2",
+      "method": "select",
+      "title": "{\"agent-ui\":1,\"kind\":\"approval\",\"toolCallId\":\"call_parallel_bash_2\",\"toolName\":\"bash\"}",
+      "options": [
+        "Allow",
+        "Deny"
+      ]
+    }
+  ]
+}
