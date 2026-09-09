@@ -745,6 +745,12 @@ class PiAdapter(AgentAdapter):
     `extension_ui_request` lines that we answer with `extension_ui_response`.
     Neither call has a field for structured data, so the extension JSON-encodes
     what we need into `title`; `_envelope` unpacks it.
+
+    Pi also ships no web access. The vendored `pi_web_search/` extension adds
+    `web_search` and `url_context`, and is passed as a second `-e` for the same
+    reason as the first: `--no-extensions` drops installed extensions, so an
+    explicit path is the only way to load one without also re-admitting the
+    project's own.
     """
 
     LABEL = "Pi"
@@ -754,6 +760,10 @@ class PiAdapter(AgentAdapter):
     PROTOCOL_VERSION = 1
 
     DEFAULT_EXTENSION = str(Path(__file__).resolve().parent / "pi_extension.ts")
+
+    DEFAULT_WEB_EXTENSION = str(
+        Path(__file__).resolve().parent / "pi_web_search" / "index.ts"
+    )
 
     QUESTION_TOOL = "AskUserQuestion"
 
@@ -780,6 +790,7 @@ class PiAdapter(AgentAdapter):
         self,
         executable: str | None = None,
         extension_path: str | None = None,
+        web_extension_path: str | None = None,
     ) -> None:
         self.executable = executable or os.environ.get("PI_BIN", "pi")
         self.extension_path = (
@@ -787,6 +798,15 @@ class PiAdapter(AgentAdapter):
             or os.environ.get("PI_EXTENSION")
             or self.DEFAULT_EXTENSION
         )
+        # Unlike the gate, the web extension is optional: an empty override
+        # (argument or `PI_WEB_SEARCH=`) drops it and leaves Pi without web
+        # access. `or` would read that empty string as "unset" and restore the
+        # default, so resolve the precedence explicitly.
+        if web_extension_path is None:
+            web_extension_path = os.environ.get(
+                "PI_WEB_SEARCH", self.DEFAULT_WEB_EXTENSION
+            )
+        self.web_extension_path = web_extension_path
         self.processes: dict[int, asyncio.subprocess.Process] = {}
         self.pending_approvals: dict[str, asyncio.Future[ApprovalDecision]] = {}
         self.pending_sessions: dict[str, int] = {}
@@ -817,6 +837,8 @@ class PiAdapter(AgentAdapter):
             # arguments the user just approved.
             "--no-extensions",
         ]
+        if self.web_extension_path:
+            command.extend(["-e", self.web_extension_path])
         if session.get("agent_session_id"):
             command.extend(["--session", session["agent_session_id"]])
 

@@ -92,6 +92,7 @@ src/agent_ui_server/
 ├── actions.py        # validated canonical action/event models
 ├── tool_actions.py   # provider-specific action projections
 ├── pi_extension.ts   # Pi approval gate and AskUserQuestion tool
+├── pi_web_search/    # vendored pi-web-search; Pi's web_search and url_context
 ├── db.py             # SQLite schema, migrations, transcript storage
 ├── file_tree.py      # snapshots, patches, ignore rules, inotify lifecycle
 ├── git.py            # bounded Git worktree operations
@@ -193,6 +194,7 @@ to the API must use their paths *inside* the container, such as
 | `CLAUDE_BIN` | `claude` | Claude Code executable |
 | `PI_BIN` | `pi` | Pi executable |
 | `PI_EXTENSION` | bundled `pi_extension.ts` | Pi approval/question extension |
+| `PI_WEB_SEARCH` | bundled `pi_web_search/index.ts` | Pi web extension; empty disables web access |
 | `WEB_ROOT` | unset | Static files mounted at `/` |
 | `BASH_TIMEOUT_SECONDS` | `120` | Timeout for a direct shell command |
 | `BASH_OUTPUT_LIMIT` | `102400` | Bytes retained per stdout/stderr stream |
@@ -374,6 +376,13 @@ Recognized actions do not expose the provider's original tool name or argument
 spelling. Unknown tools preserve both under `other`. Tool results are not part
 of this schema.
 
+A `web` action carries one target. Pi's `url_context` accepts up to twenty URLs
+under a single question, and rendering such a call as a fetch of its first URL
+would misrepresent it, so only the single-URL form becomes a `web` action;
+multi-URL calls fall back to `other`, which shows every URL. Extra `urls` passed
+alongside a `web_search` query are dropped from the action, since a canonical
+search carries a query and forbids a URL.
+
 Auto-approval is derived from `action.kind`: `command` uses
 `auto_approve_command`; `edit` and `write` use `auto_approve_write`. There is no
 provider-name table and no `category` field on the wire. An auto-approved
@@ -474,6 +483,48 @@ Claude Code runs with `--permission-mode default` and
 adapter waits for the extension's ready handshake before sending a prompt;
 failure to load the gate fails closed. `--no-extensions` prevents project-local
 Pi extensions from modifying tool input after approval.
+
+Pi also ships no web access, so the vendored
+[pi-web-search](https://github.com/ttttmr/pi-web-search) extension is loaded as
+a second explicit `-e` and gives Pi `web_search` and `url_context`. Both
+normalize into canonical `web` actions, so a client renders a Pi search exactly
+as it renders Claude Code's `WebSearch`. Because `--no-extensions` drops
+anything Pi discovered from its own settings, an extension must be passed by
+path to survive; vendoring it under `src/agent_ui_server/pi_web_search/` keeps
+that guarantee and ships it in the wheel. Set `PI_WEB_SEARCH` to another path to
+substitute an extension, or to the empty string to leave Pi without web access.
+
+The web tools search through whichever provider backs the session's current
+model, using the credentials Pi already holds — a subscription login is enough,
+and no separate API key is required. They are read-only locally and so bypass
+the approval gate. Claude Code gates its own `WebSearch` and `WebFetch`, so a Pi
+session searches without a prompt where a Claude Code session asks; that
+asymmetry is deliberate, and removing the two names from `READ_ONLY_TOOLS` in
+`pi_extension.ts` restores the prompt. Each call is still network egress and
+spends a full inference request on the provider. `url_context` is Gemini-only
+and hides itself on other models.
+
+Expect a search to take noticeably longer than Claude Code's. Claude Code's
+`WebSearch` returns ranked results for the agent to read, while pi-web-search
+runs a nested inference call that searches, reads, and writes a cited prose
+answer before the tool returns at all. Pointing that nested call at a fast model
+is the main lever: pi-web-search reads `provider` and `model` from
+`web-search.json` in Pi's agent directory — `~/.pi/agent/` unless
+`PI_CODING_AGENT_DIR` moves it, or `PI_WEB_SEARCH_CONFIG` overrides the file
+path outright — and uses that model for `web_search` instead of the
+conversation's:
+
+```json
+{ "provider": "openai-codex", "model": "gpt-5.6-luna" }
+```
+
+`provider` and `model` must match a Pi model registry entry, and that provider
+must be authenticated in Pi; a miss silently leaves web search unavailable
+rather than falling back. Those two keys are the whole schema — there is no
+thinking or effort setting, and the extension deliberately sends no reasoning
+effort so each provider applies its own default. The setting does not affect
+`url_context`, which always uses the conversation model. See [`src/agent_ui_server/pi_web_search/VENDOR.md`](src/agent_ui_server/pi_web_search/VENDOR.md)
+for provenance and update steps.
 
 To add another harness:
 

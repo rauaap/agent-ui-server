@@ -127,6 +127,57 @@ class ProviderNormalizationTests(unittest.TestCase):
             [{"old_text": "x", "new_text": "y"}],
         )
 
+    def test_pi_web_tools_match_claude_web_shapes(self):
+        """The vendored pi-web-search tools normalize like Claude's web tools.
+
+        A client must not be able to tell which harness searched the web, so
+        these assert the shared shape rather than each field in isolation.
+        """
+        self.assertEqual(
+            action_or_other("web_search", {"query": "needle"}, PI_TOOL_TRANSLATORS),
+            action_or_other("WebSearch", {"query": "needle"}, CLAUDE_TOOL_TRANSLATORS),
+        )
+        self.assertEqual(
+            action_or_other(
+                "url_context",
+                {"query": "What is this?", "urls": ["https://example.com"]},
+                PI_TOOL_TRANSLATORS,
+            ),
+            action_or_other(
+                "WebFetch",
+                {"url": "https://example.com", "prompt": "What is this?"},
+                CLAUDE_TOOL_TRANSLATORS,
+            ),
+        )
+
+    def test_pi_web_search_drops_supplementary_urls(self):
+        """`urls` has no home in a canonical search, which forbids `url`."""
+        self.assertEqual(
+            action_or_other(
+                "web_search",
+                {"query": "needle", "urls": ["https://a.example", "https://b.example"]},
+                PI_TOOL_TRANSLATORS,
+            ),
+            {"kind": "web", "operation": "search", "query": "needle"},
+        )
+
+    def test_pi_url_context_falls_back_rather_than_hiding_urls(self):
+        """A multi-URL call renders every URL instead of a misleading first one."""
+        arguments = {"query": "Summarize", "urls": ["https://a.example", "https://b.example"]}
+        action = action_or_other("url_context", arguments, PI_TOOL_TRANSLATORS)
+
+        self.assertEqual(action["kind"], "other")
+        self.assertEqual(action["name"], "url_context")
+        self.assertEqual(action["arguments"], arguments)
+
+    def test_pi_web_tools_are_not_auto_approvable(self):
+        """`web` has no auto-approval setting; the Pi gate allowlists instead."""
+        self.assertIsNone(
+            auto_approval_setting(
+                action_or_other("web_search", {"query": "x"}, PI_TOOL_TRANSLATORS)
+            )
+        )
+
     def test_claude_permission_reuses_session_scoped_cached_action(self):
         adapter = ClaudeCodeAdapter(executable="claude")
         tool = adapter._tool_use_event({

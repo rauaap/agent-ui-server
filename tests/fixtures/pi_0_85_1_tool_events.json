@@ -9,7 +9,8 @@
       "An ls call with no explicit path or limit carries an empty args object.",
       "The approval extension repeats toolCallId and toolName in its envelope.",
       "Two sibling Bash calls were requested in one model response. Pi emitted and blocked on the first approval before emitting tool_execution_start for the second, so approval preflight was sequential even though execution can be parallel."
-    ]
+    ],
+    "schema_derived": "web_search and url_context are not captured turns. Their envelopes follow the captured tool_execution_start shape; their args follow the typebox schemas in src/agent_ui_server/pi_web_search/{web_search,url_context}.ts for vendored pi-web-search 1.5.0. Replace with a real capture when a Pi turn with a configured provider is available."
   },
   "tool_execution_start": {
     "read": {
@@ -101,6 +102,49 @@
       "args": {
         "path": "created.txt",
         "content": "fixture write\n"
+      }
+    },
+    "web_search": {
+      "type": "tool_execution_start",
+      "toolCallId": "call_web_search_1",
+      "toolName": "web_search",
+      "args": {
+        "query": "pi coding agent extension api"
+      }
+    },
+    "web_search_with_urls": {
+      "type": "tool_execution_start",
+      "toolCallId": "call_web_search_2",
+      "toolName": "web_search",
+      "args": {
+        "query": "compare these release notes",
+        "urls": [
+          "https://example.com/v1",
+          "https://example.com/v2"
+        ]
+      }
+    },
+    "url_context": {
+      "type": "tool_execution_start",
+      "toolCallId": "call_url_context_1",
+      "toolName": "url_context",
+      "args": {
+        "query": "What does this page say about rate limits?",
+        "urls": [
+          "https://example.com/docs/limits"
+        ]
+      }
+    },
+    "url_context_multiple": {
+      "type": "tool_execution_start",
+      "toolCallId": "call_url_context_2",
+      "toolName": "url_context",
+      "args": {
+        "query": "Summarize both pages",
+        "urls": [
+          "https://example.com/a",
+          "https://example.com/b"
+        ]
       }
     }
   },

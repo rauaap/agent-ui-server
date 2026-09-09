@@ -258,6 +258,34 @@ def _pi_list(arguments: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def _pi_web_search(arguments: dict[str, Any]) -> dict[str, Any]:
+    # pi-web-search accepts optional `urls` to analyze alongside the query, but
+    # a canonical search forbids `url` and carries only one. The query is the
+    # call's substance, so project that and let the extra URLs go; they reach
+    # the model either way.
+    return canonical_action(
+        "web",
+        operation="search",
+        query=arguments.get("query"),
+    )
+
+
+def _pi_url_context(arguments: dict[str, Any]) -> dict[str, Any]:
+    # `url_context` analyzes up to 20 URLs under one question; a canonical
+    # fetch holds exactly one. Projecting a 20-URL call onto its first URL
+    # would render as a lie, so only the single-URL case becomes a `web`
+    # action and the rest fall back to `other`, which shows every URL.
+    urls = arguments.get("urls")
+    if not isinstance(urls, list) or len(urls) != 1:
+        return other_action("url_context", arguments)
+    return canonical_action(
+        "web",
+        operation="fetch",
+        url=urls[0],
+        **_optional(arguments, "query", "prompt", omit_empty=True),
+    )
+
+
 PI_TOOL_TRANSLATORS: dict[str, ToolTranslator] = {
     "bash": partial(_pi_command, shell="bash"),
     "powershell": partial(_pi_command, shell="powershell"),
@@ -267,4 +295,6 @@ PI_TOOL_TRANSLATORS: dict[str, ToolTranslator] = {
     "grep": _pi_grep,
     "find": _pi_find,
     "ls": _pi_list,
+    "web_search": _pi_web_search,
+    "url_context": _pi_url_context,
 }

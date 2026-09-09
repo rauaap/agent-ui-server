@@ -35,8 +35,23 @@ const MARKER = "agent-ui";
  *
  * Deliberately an allowlist: an unrecognized tool (another extension's, or one
  * added by a future Pi release) prompts rather than slipping through.
+ *
+ * `web_search` and `url_context` come from the vendored pi-web-search
+ * extension. They are listed here because they change nothing on disk, not for
+ * parity with Claude Code: Claude Code does gate WebSearch and WebFetch, so a
+ * Pi session searches without a prompt where a Claude Code session asks. That
+ * asymmetry is deliberate. Note also that these are network egress and each
+ * call spends an inference request on the session's provider — read-only
+ * locally, not free.
  */
-const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls"]);
+const READ_ONLY_TOOLS = new Set([
+	"read",
+	"grep",
+	"find",
+	"ls",
+	"web_search",
+	"url_context",
+]);
 
 const QUESTION_TOOL = "AskUserQuestion";
 

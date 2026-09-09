@@ -2547,6 +2547,48 @@ class PiAdapterParsingTests(unittest.TestCase):
         self.assertIn('pi.on("tool_call"', source)
         self.assertIn("registerTool", source)
 
+    def test_bundled_web_extension_ships_with_the_package(self) -> None:
+        path = Path(PiAdapter.DEFAULT_WEB_EXTENSION)
+        self.assertTrue(path.exists(), f"{path} is missing")
+        source = path.read_text()
+        # The tool names pi_extension.ts allowlists and tool_actions.py
+        # translates. An upstream rename must fail here, not in production.
+        self.assertIn('name: WEB_SEARCH_TOOL', source)
+        self.assertIn('const WEB_SEARCH_TOOL = "web_search"', source)
+        self.assertIn('const URL_CONTEXT_TOOL = "url_context"', source)
+
+    def test_web_tools_bypass_the_approval_gate(self) -> None:
+        # The gate is an allowlist, so an upstream rename would silently start
+        # prompting for every search rather than failing loudly.
+        source = Path(PiAdapter.DEFAULT_EXTENSION).read_text()
+        self.assertIn('"web_search"', source)
+        self.assertIn('"url_context"', source)
+
+    def test_web_extension_is_on_by_default_and_can_be_disabled(self) -> None:
+        import unittest.mock as mock
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PI_WEB_SEARCH", None)
+            self.assertEqual(
+                PiAdapter(executable="pi").web_extension_path,
+                PiAdapter.DEFAULT_WEB_EXTENSION,
+            )
+        self.assertEqual(
+            PiAdapter(executable="pi", web_extension_path="/tmp/other.ts")
+            .web_extension_path,
+            "/tmp/other.ts",
+        )
+        # Empty means "no web access", and must not fall back to the default.
+        self.assertEqual(
+            PiAdapter(executable="pi", web_extension_path="").web_extension_path, ""
+        )
+        with mock.patch.dict(os.environ, {"PI_WEB_SEARCH": ""}):
+            self.assertEqual(PiAdapter(executable="pi").web_extension_path, "")
+        with mock.patch.dict(os.environ, {"PI_WEB_SEARCH": "/tmp/env.ts"}):
+            self.assertEqual(
+                PiAdapter(executable="pi").web_extension_path, "/tmp/env.ts"
+            )
+
     def test_envelope_accepts_our_marker(self) -> None:
         title = json.dumps(
             {"agent-ui": 1, "kind": "approval", "toolCallId": "c1", "toolName": "bash"}
@@ -2653,6 +2695,50 @@ for line in sys.stdin:
                     if task:
                         asyncio.create_task(task)
         return events
+
+    async def test_launch_loads_both_extensions_with_discovery_off(self):
+        """Both `-e` paths survive `--no-extensions`; discovery stays off.
+
+        The gate and the web tools are loaded the same way for the same
+        reason, so a change that drops either flag has to fail here.
+        """
+        adapter = self._adapter({"steps": [{"type": "agent_settled"}]})
+        adapter.web_extension_path = "/tmp/web.ts"
+        captured: list[tuple[str, ...]] = []
+
+        original = asyncio.create_subprocess_exec
+
+        async def capturing_spawn(*args, **kwargs):
+            captured.append(args)
+            return await original(args[0], adapter._script, **kwargs)
+
+        self.spawn = capturing_spawn
+        await self._collect(adapter)
+
+        command = list(captured[0])
+        self.assertIn("--no-extensions", command)
+        self.assertEqual(
+            [command[i + 1] for i, arg in enumerate(command) if arg == "-e"],
+            [adapter.extension_path, "/tmp/web.ts"],
+        )
+
+    async def test_launch_omits_the_web_extension_when_disabled(self):
+        adapter = self._adapter({"steps": [{"type": "agent_settled"}]})
+        adapter.web_extension_path = ""
+        captured: list[tuple[str, ...]] = []
+
+        original = asyncio.create_subprocess_exec
+
+        async def capturing_spawn(*args, **kwargs):
+            captured.append(args)
+            return await original(args[0], adapter._script, **kwargs)
+
+        self.spawn = capturing_spawn
+        await self._collect(adapter)
+
+        command = list(captured[0])
+        self.assertEqual(command.count("-e"), 1)
+        self.assertIn("--no-extensions", command)
 
     async def test_approval_carries_input_captured_from_tool_execution_start(self):
         adapter = self._adapter(
