@@ -2546,6 +2546,9 @@ class PiAdapterParsingTests(unittest.TestCase):
         # The two features the adapter's whole protocol depends on.
         self.assertIn('pi.on("tool_call"', source)
         self.assertIn("registerTool", source)
+        # The block reason is the model-facing tool result. Keep the denial
+        # explicit rather than exposing only the user's free-form explanation.
+        self.assertIn("Tool execution was denied by the user.", source)
 
     def test_bundled_web_extension_ships_with_the_package(self) -> None:
         path = Path(PiAdapter.DEFAULT_WEB_EXTENSION)

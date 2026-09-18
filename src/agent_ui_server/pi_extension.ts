@@ -215,7 +215,13 @@ export default function (pi: ExtensionAPI) {
 			{ signal: ctx.signal },
 		);
 
-		return { block: true, reason: reason?.trim() || "Denied by user" };
+		const denialReason = reason?.trim();
+		return {
+			block: true,
+			reason: denialReason
+				? `Tool execution was denied by the user. Reason: ${denialReason}`
+				: "Tool execution was denied by the user.",
+		};
 	});
 
 	/**
