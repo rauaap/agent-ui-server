@@ -43,7 +43,7 @@ The API can also be exercised directly with tools such as `curl` and
 - Multi-user accounts
 - Application-level authentication
 - A terminal emulator or persistent interactive shell
-- A sandbox or filesystem security boundary
+- A hardened multi-tenant or network security boundary
 
 ## Architecture
 
@@ -192,6 +192,7 @@ to the API must use their paths *inside* the container, such as
 | `PORT` | `8000` | HTTP/WebSocket port |
 | `SESSION_DB` | `sessions.db` | SQLite database path |
 | `CLAUDE_BIN` | `claude` | Claude Code executable |
+| `CLAUDE_CONFIG_DIR` | `~/.claude` in sandbox | Claude configuration, credentials, and session directory |
 | `PI_BIN` | `pi` | Pi executable |
 | `PI_EXTENSION` | bundled `pi_extension.ts` | Pi approval/question extension |
 | `PI_WEB_SEARCH` | bundled `pi_web_search/index.ts` | Pi web extension; empty disables web access |
@@ -223,7 +224,7 @@ FastAPI also exposes generated OpenAPI documentation at `/docs`.
 | `DELETE` | `/worktrees/{id}` | Remove a clean, unused worktree |
 | `GET` | `/sessions` | List sessions and current metadata |
 | `POST` | `/sessions` | Create a session for a registered project |
-| `PATCH` | `/sessions/{id}` | Rename, archive, or change auto-approval settings |
+| `PATCH` | `/sessions/{id}` | Rename, archive, or change auto-approval/sandbox settings |
 | `POST` | `/sessions/{id}/detach-worktree` | Detach an archived session while preserving its cwd |
 | `POST` | `/sessions/{id}/turn` | Start an agent turn |
 | `POST` | `/sessions/{id}/bash` | Start a direct one-shot shell command |
@@ -261,6 +262,82 @@ alias for `project_path`.
 Only one agent turn may run per session. A direct shell command has a separate
 slot and may run while the agent is running or awaiting approval. Starting new
 work in an archived session or project is rejected.
+
+### Session sandbox
+
+Client integration: [sandbox client handoff](docs/sandbox_client_handoff.md).
+
+Sessions expose a boolean `sandbox`, defaulting to `true` for both new and
+existing sessions. Set it on `POST /sessions` or change it between turns:
+
+```sh
+curl -X PATCH http://127.0.0.1:8000/sessions/1 \
+  -H 'content-type: application/json' -d '{"sandbox":false}'
+```
+
+A PATCH containing `sandbox` returns `409` while a turn is running, awaiting
+approval/answers, or still shutting down. Successful changes emit a `settings`
+WebSocket event and apply to the next turn. **Both Pi and Claude Code implement
+sandboxing.** Direct user shell commands (`!` or `POST /sessions/{id}/bash`) are
+not sandboxed.
+
+Sandboxed turns require Linux, `bwrap` (Bubblewrap), and permission to create its
+namespaces. Install Bubblewrap with your OS package manager (the container image
+includes it). `PI_BIN` should point to the installer's `<runtime>/bin/pi` beside
+`bin/node`, or a system installation under `/usr`. `CLAUDE_BIN` supports native
+Claude binaries and npm Node launchers; only their runtime resources are exposed
+read-only. Claude auto-updates are disabled inside the sandbox. A setup failure
+fails the turn; it never silently runs unsandboxed.
+
+The sandbox uses the reference policy:
+
+- Writable host bind mounts: the working directory, the agent's configuration
+  directory (`~/.pi` for Pi, `~/.claude` or `CLAUDE_CONFIG_DIR` for Claude), and shared
+  `/tmp/agent-sandbox-<uid>` mounted as `/tmp`. Scratch persists across turns
+  and agents. Its storage follows the host filesystem (including host tmpfs).
+- Linked worktrees additionally mount their Git metadata read/write at its
+  original path (normally the main repository's `.git`). This allows index
+  updates, commits, and shared objects/refs without exposing the main checkout's
+  source files. Shared Git metadata is not isolated between worktrees.
+- The home directory is hidden except for these explicit mounts and the agent's
+  read-only runtime. Home itself cannot be the sandboxed working directory.
+- System programs/libraries, HTTPS/DNS configuration, and server-supplied Pi
+  extensions are read-only. Synthetic root/parents, `/dev`, and `/proc` are
+  read-only; standard devices remain usable.
+- Host networking is retained, including localhost and Tailscale. This is not
+  network isolation or isolation between agents sharing scratch/config.
+- Inherited environment variables are cleared. The common environment restores
+  only `HOME`, `USER`, `PATH`, `TERM`, `LANG`, `TMPDIR`, and `XDG_CACHE_HOME`.
+  Claude additionally gets `CLAUDE_CONFIG_DIR` and `DISABLE_AUTOUPDATER=1`.
+  Authenticate using Pi's `~/.pi/agent/auth.json` or Claude's configuration
+  directory; environment-only credentials, SSH agents, and home dotfiles are
+  not carried into the sandbox.
+
+Claude normally stores global state in `~/.claude.json`, whose atomic updates
+would require a writable home directory. Sandboxed turns instead set
+`CLAUDE_CONFIG_DIR`, placing global state inside the writable config directory.
+For the default profile, the server imports `~/.claude.json` once into
+`~/.claude/.claude.json` if neither that file nor legacy `.config.json` exists.
+The import is private (0600) and never overwrites existing profile state.
+Credentials and sessions stay in the existing `~/.claude` directory. The imported
+global-state file is independent afterward: unsandboxed/default CLI runs still
+use `~/.claude.json`. To use the same profile in both modes and for login, set
+an absolute `CLAUDE_CONFIG_DIR` explicitly for the server and your CLI. Explicit
+profiles are not seeded from the default home file. For example:
+
+```sh
+CLAUDE_CONFIG_DIR="$HOME/.claude" claude auth login
+```
+
+Pi's config-directory environment overrides are still cleared in sandbox mode.
+Do not put secrets in API-key environment variables and expect them to cross
+the boundary; neither adapter forwards them.
+
+The bundled gate is mounted as a file; the web extension's directory is mounted
+read-only for its sibling imports. Custom extension dependencies must be within
+these mounts or the runtime. Paths outside the mounts remain unavailable; Git
+worktree metadata is discovered from the working directory's `.git` file and
+its `commondir` pointer, not by mounting the entire parent project.
 
 ### Projects and worktrees
 
@@ -402,7 +479,8 @@ request carries `"auto_approved": true` and is followed by an
 { "type": "bash_output", "command": "pytest -q", "stdout": "...", "stderr": "",
   "exit_code": 0, "duration_ms": 821, "timed_out": false, "truncated": false }
 { "type": "renamed", "name": "new label" }
-{ "type": "settings", "auto_approve_write": true, "auto_approve_command": false }
+{ "type": "settings", "auto_approve_write": true, "auto_approve_command": false,
+  "sandbox": true }
 { "type": "archived", "archived_at": "2026-08-26T11:02:00Z" }
 { "type": "worktree_detached", "worktree_id": null, "working_dir": "/projects/app-fix" }
 { "type": "done", "session_id": "harness-session-id" }

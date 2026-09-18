@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .actions import approval_request_event, tool_use_event
+from .sandbox import claude_sandbox_command, pi_sandbox_command
 from .tool_actions import (
     CLAUDE_TOOL_TRANSLATORS,
     PI_TOOL_TRANSLATORS,
@@ -274,10 +275,15 @@ class ClaudeCodeAdapter(AgentAdapter):
             command.extend(["--resume", session["agent_session_id"]])
 
         try:
+            if session.get("sandbox", True):
+                command = claude_sandbox_command(command, session["working_dir"])
+                env = {}
+            else:
+                env = self._build_env()
             process = await asyncio.create_subprocess_exec(
                 *command,
                 cwd=session["working_dir"],
-                env=self._build_env(),
+                env=env,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -288,6 +294,9 @@ class ClaudeCodeAdapter(AgentAdapter):
             return
         except NotADirectoryError as exc:
             yield {"type": "error", "message": f"Invalid working directory: {exc}"}
+            return
+        except (OSError, ValueError) as exc:
+            yield {"type": "error", "message": f"Unable to start Claude Code: {exc}"}
             return
 
         self.processes[session_id] = process
@@ -843,10 +852,16 @@ class PiAdapter(AgentAdapter):
             command.extend(["--session", session["agent_session_id"]])
 
         try:
+            if session.get("sandbox", True):
+                command = pi_sandbox_command(command, session["working_dir"])
+                # Clear bwrap's own environment too, not just its child's.
+                env = {}
+            else:
+                env = self._build_env()
             process = await asyncio.create_subprocess_exec(
                 *command,
                 cwd=session["working_dir"],
-                env=self._build_env(),
+                env=env,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -857,6 +872,9 @@ class PiAdapter(AgentAdapter):
             return
         except NotADirectoryError as exc:
             yield {"type": "error", "message": f"Invalid working directory: {exc}"}
+            return
+        except (OSError, ValueError) as exc:
+            yield {"type": "error", "message": f"Unable to start Pi: {exc}"}
             return
 
         self.processes[session_id] = process

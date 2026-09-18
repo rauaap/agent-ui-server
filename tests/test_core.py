@@ -2682,7 +2682,10 @@ for line in sys.stdin:
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.session = {"id": 7, "working_dir": self.tmp.name, "agent_session_id": None}
+        self.session = {
+            "id": 7, "working_dir": self.tmp.name,
+            "agent_session_id": None, "sandbox": False,
+        }
 
     async def _collect(self, adapter, answerer=None) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []

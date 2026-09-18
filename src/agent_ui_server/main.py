@@ -112,6 +112,7 @@ class CreateSessionRequest(BaseModel):
     project_path: str = Field(min_length=1)
     agent: str = "claude-code"
     worktree_id: int | None = None
+    sandbox: bool = True
 
     @model_validator(mode="before")
     @classmethod
@@ -131,7 +132,7 @@ class CreateSessionRequest(BaseModel):
 
 
 class UpdateSessionRequest(BaseModel):
-    """Partial update of a session: rename, auto-approve toggles, archive flag.
+    """Partial update: name, auto-approve toggles, sandbox, archive flag.
 
     Every field is optional; only the ones supplied are applied. `name` keeps
     the old rename contract (non-empty, trimmed) when present.
@@ -140,6 +141,7 @@ class UpdateSessionRequest(BaseModel):
     name: str | None = Field(default=None, max_length=120)
     auto_approve_write: bool | None = None
     auto_approve_command: bool | None = None
+    sandbox: bool | None = None
     archived: bool | None = None
 
     @field_validator("name")
@@ -410,6 +412,7 @@ async def create_session(payload: CreateSessionRequest) -> dict[str, Any]:
         project_id=project["id"],
         agent=payload.agent,
         worktree_id=payload.worktree_id,
+        sandbox=payload.sandbox,
     )
 
 
@@ -570,7 +573,25 @@ async def delete_worktree(worktree_id: int) -> dict[str, Any]:
 async def update_session(
     session_id: int, payload: UpdateSessionRequest
 ) -> dict[str, Any]:
-    require_session_or_404(session_id)
+    # Serialize with begin_turn: no turn can capture the old setting while
+    # this request is waiting to commit its change (or vice versa).
+    async with turn_lock:
+        return await _update_session(session_id, payload)
+
+
+async def _update_session(
+    session_id: int, payload: UpdateSessionRequest
+) -> dict[str, Any]:
+    current = require_session_or_404(session_id)
+    task = running_tasks.get(session_id)
+    if payload.sandbox is not None and (
+        current["status"] != "idle" or (task is not None and not task.done())
+    ):
+        # Check before applying any other fields in a mixed PATCH.
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot change sandbox while a turn is in progress",
+        )
     session: dict[str, Any] | None = None
 
     if payload.name is not None:
@@ -580,19 +601,30 @@ async def update_session(
             lambda _session: [{"type": "renamed", "name": payload.name}],
         )
 
-    if payload.auto_approve_write is not None or payload.auto_approve_command is not None:
-        session = await commit_stream(
-            session_id,
-            lambda: db.set_auto_approve(
+    if any(
+        value is not None
+        for value in (
+            payload.auto_approve_write, payload.auto_approve_command, payload.sandbox
+        )
+    ):
+        def update_settings() -> dict[str, Any]:
+            if payload.sandbox is not None:
+                db.set_sandbox(session_id, payload.sandbox)
+            return db.set_auto_approve(
                 session_id,
                 write=payload.auto_approve_write,
                 command=payload.auto_approve_command,
-            ),
+            )
+
+        session = await commit_stream(
+            session_id,
+            update_settings,
             lambda updated: [
                 {
                     "type": "settings",
                     "auto_approve_write": updated["auto_approve_write"],
                     "auto_approve_command": updated["auto_approve_command"],
+                    "sandbox": updated["sandbox"],
                 }
             ],
         )
