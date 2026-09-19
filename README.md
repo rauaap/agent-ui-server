@@ -215,9 +215,11 @@ FastAPI also exposes generated OpenAPI documentation at `/docs`.
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/agents` | List registered agent adapters for a picker |
+| `GET` | `/sandbox-paths` | Read server-wide sandbox path defaults |
+| `PATCH` | `/sandbox-paths` | Replace server-wide sandbox path defaults |
 | `GET` | `/projects` | List projects and live/archive session aggregates |
 | `POST` | `/projects` | Register/create a project directory |
-| `PATCH` | `/projects` | Archive or unarchive a project and cascade sessions |
+| `PATCH` | `/projects` | Update project sandbox paths or archive/unarchive with session cascade |
 | `DELETE` | `/projects` | Forget a project, sessions, and managed worktrees |
 | `GET` | `/worktrees` | List worktrees; optionally filter by `project_path` |
 | `POST` | `/worktrees` | Create a worktree on a new branch from project HEAD |
@@ -262,6 +264,56 @@ alias for `project_path`.
 Only one agent turn may run per session. A direct shell command has a separate
 slot and may run while the agent is running or awaiting approval. Starting new
 work in an archived session or project is rejected.
+
+### Additional sandbox paths
+
+`GET /sandbox-paths` returns `{"sandbox_paths": []}` by default. Configure host files
+or directories available to all sandboxed agents with `PATCH /sandbox-paths`:
+
+```json
+{
+  "sandbox_paths": [
+    {"path": "~/.config/my-tool"},
+    {"path": "$HOME/.local/share/my-tool", "write": true}
+  ]
+}
+```
+
+Read access is implicit; `write` defaults to `false`. Files/directories must exist.
+Paths expand using the server user's home/environment (`~`, `$VAR`, `${VAR}`),
+without shell execution, and must be absolute after expansion. Undefined variables
+retain Python's literal expansion behavior. Symlink targets are mounted at the
+expanded path the program expects. Configuration files may contain credentials;
+read-only access still exposes them. Writable access modifies real host data.
+
+Projects expose their own `sandbox_paths` list in project responses. Set it on
+`POST /projects` or update it with `PATCH /projects`:
+
+```json
+{
+  "path": "/path/to/project",
+  "sandbox_paths": [{"path": "~/.config/my-tool", "write": true}]
+}
+```
+
+Project entries merge with server defaults by expanded, normalized destination
+path. The project `write` value wins for matching paths, including when omitted
+(default `false`). Other server paths remain inherited. Each supplied list replaces
+that scope's entire list; omission leaves it unchanged. `[]` clears server defaults
+or resets a project to inheritance. There is no per-session list and no mechanism
+to remove an inherited path, only to override its write permission.
+
+Paths persist as individual rows in the `sandbox_paths` table (`project_id IS NULL`
+for server defaults), not JSON columns. Changes affect future sandboxed turns, including worktree
+sessions. Running turns retain their existing mounts. Updates are allowed during
+turns. Paths conflicting with protected/system mounts or exposing the entire home
+are rejected, as are duplicate/nested paths in one list. Cross-scope conflicts
+and conflicts with session-specific built-in mounts fail turn preparation; no
+requested mount is silently skipped. Sandbox-disabled turns and direct user shell
+commands are unaffected. Validation errors on updates return `400`; malformed
+request shapes return FastAPI's usual `422`.
+
+See [the design](docs/sandbox_paths_design.md) for mount rules and lifecycle details.
 
 ### Session sandbox
 

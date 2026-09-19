@@ -22,6 +22,7 @@ from .file_tree import (
     normalize_root,
     receive_disconnect,
 )
+from .sandbox_paths import merge_paths, validate_paths
 
 SCROLLBACK_REPLAY_LIMIT = 200
 WEBSOCKET_LIVE_QUEUE_CAPACITY = 256
@@ -58,6 +59,24 @@ bash_tasks: dict[int, asyncio.Task[None]] = {}
 turn_lock = asyncio.Lock()
 
 
+class SandboxPathRequest(BaseModel):
+    path: str = Field(min_length=1)
+    write: bool = False
+
+
+class UpdateSandboxPathsRequest(BaseModel):
+    sandbox_paths: list[SandboxPathRequest] | None = None
+
+
+def checked_sandbox_paths(entries: list[SandboxPathRequest]) -> list[dict[str, Any]]:
+    paths = [entry.model_dump() for entry in entries]
+    try:
+        validate_paths(paths)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return paths
+
+
 class CreateProjectRequest(BaseModel):
     """A project's directory, and optionally a label that differs from it.
 
@@ -67,6 +86,7 @@ class CreateProjectRequest(BaseModel):
 
     path: str = Field(min_length=1)
     name: str | None = Field(default=None, max_length=120)
+    sandbox_paths: list[SandboxPathRequest] = Field(default_factory=list)
 
     @field_validator("name")
     @classmethod
@@ -82,10 +102,11 @@ class DeleteProjectRequest(BaseModel):
 
 
 class UpdateProjectRequest(BaseModel):
-    """Archive or unarchive a project, addressed by path like the delete does."""
+    """Update paths or archive state, addressing the project by its path."""
 
     path: str = Field(min_length=1)
-    archived: bool
+    archived: bool | None = None
+    sandbox_paths: list[SandboxPathRequest] | None = None
 
 
 class CreateWorktreeRequest(BaseModel):
@@ -203,6 +224,18 @@ async def list_agents() -> list[dict[str, Any]]:
     ]
 
 
+@app.get("/sandbox-paths")
+async def get_sandbox_paths() -> dict[str, Any]:
+    return {"sandbox_paths": db.get_sandbox_paths()}
+
+
+@app.patch("/sandbox-paths")
+async def update_sandbox_paths(payload: UpdateSandboxPathsRequest) -> dict[str, Any]:
+    if payload.sandbox_paths is not None:
+        db.set_sandbox_paths(checked_sandbox_paths(payload.sandbox_paths))
+    return {"sandbox_paths": db.get_sandbox_paths()}
+
+
 @app.get("/projects")
 async def list_projects() -> list[dict[str, Any]]:
     return [with_existence(project) for project in db.list_projects()]
@@ -216,6 +249,7 @@ async def create_project(payload: CreateProjectRequest) -> dict[str, Any]:
     project lists from the moment it is created rather than only once its first
     session exists. Creating one that already exists is a no-op.
     """
+    paths = checked_sandbox_paths(payload.sandbox_paths)
     path = normalize_project_path(payload.path)
     target = Path(path)
 
@@ -240,12 +274,14 @@ async def create_project(payload: CreateProjectRequest) -> dict[str, Any]:
         )
 
     name = payload.name or PurePosixPath(path).name
-    return with_existence(db.create_project(path=path, name=name))
+    return with_existence(db.create_project(path=path, name=name, sandbox_paths=paths))
 
 
 @app.patch("/projects")
 async def update_project(payload: UpdateProjectRequest) -> dict[str, Any]:
-    """Archive or unarchive a project, taking its sessions with it.
+    """Update sandbox paths or archive/unarchive a project and its sessions.
+
+    Sandbox paths affect future turns, without changing running sessions.
 
     Archiving cascades: an archived project must not leave sessions showing in
     the main list, so every live session under it is archived too. A session
@@ -262,8 +298,13 @@ async def update_project(payload: UpdateProjectRequest) -> dict[str, Any]:
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
 
+    paths = (
+        checked_sandbox_paths(payload.sandbox_paths)
+        if payload.sandbox_paths is not None else None
+    )
     sessions = db.list_sessions_for_project(project["id"])
-    if payload.archived:
+    affected = 0
+    if payload.archived is True:
         busy = [session for session in sessions if session_is_busy(session)]
         if busy:
             raise HTTPException(
@@ -274,7 +315,7 @@ async def update_project(payload: UpdateProjectRequest) -> dict[str, Any]:
                 ),
             )
         affected = db.archive_project(project["id"])
-    else:
+    elif payload.archived is False:
         restoring = db.list_sessions_archived_with_project(project["id"])
         missing = [
             session for session in restoring
@@ -293,15 +334,19 @@ async def update_project(payload: UpdateProjectRequest) -> dict[str, Any]:
             )
         affected = db.unarchive_project(project["id"])
 
+    if paths is not None:
+        db.set_sandbox_paths(paths, project["id"])
+
     # The clients holding one of these sessions open are the reason this moved
     # server-side; tell them rather than making them refetch to find out. Only
     # the ones somebody is actually watching are worth re-reading.
-    for session in sessions:
-        if session["id"] not in subscribers:
-            continue
-        updated = db.get_session(session["id"])
-        if updated is not None:
-            await broadcast_archived(updated)
+    if payload.archived is not None:
+        for session in sessions:
+            if session["id"] not in subscribers:
+                continue
+            updated = db.get_session(session["id"])
+            if updated is not None:
+                await broadcast_archived(updated)
 
     return {
         **with_existence(db.get_project(path) or project),
@@ -1014,6 +1059,9 @@ async def run_turn(session_id: int, prompt: str) -> None:
     adapter = adapters[session["agent"]]
 
     try:
+        if session.get("sandbox", True):
+            defaults, project_paths = db.sandbox_paths_snapshot(session["project_id"])
+            session["sandbox_paths"] = merge_paths(defaults, project_paths)
         async for event in adapter.start_turn(session, prompt):
             event_type = event.get("type")
 

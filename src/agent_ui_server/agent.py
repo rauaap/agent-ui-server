@@ -276,7 +276,10 @@ class ClaudeCodeAdapter(AgentAdapter):
 
         try:
             if session.get("sandbox", True):
-                command = claude_sandbox_command(command, session["working_dir"])
+                command = claude_sandbox_command(
+                    command, session["working_dir"],
+                    **({"sandbox_paths": session["sandbox_paths"]} if session.get("sandbox_paths") else {}),
+                )
                 env = {}
             else:
                 env = self._build_env()
@@ -853,7 +856,10 @@ class PiAdapter(AgentAdapter):
 
         try:
             if session.get("sandbox", True):
-                command = pi_sandbox_command(command, session["working_dir"])
+                command = pi_sandbox_command(
+                    command, session["working_dir"],
+                    **({"sandbox_paths": session["sandbox_paths"]} if session.get("sandbox_paths") else {}),
+                )
                 # Clear bwrap's own environment too, not just its child's.
                 env = {}
             else:

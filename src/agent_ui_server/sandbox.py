@@ -11,6 +11,9 @@ import shutil
 import stat
 import tempfile
 from pathlib import Path
+from typing import Any
+
+from .sandbox_paths import overlaps, validate_paths
 
 
 def prepare_scratch() -> Path:
@@ -87,6 +90,7 @@ def sandbox_command(
     read_only: list[tuple[Path, str]],
     writable: list[Path],
     environment: dict[str, str],
+    sandbox_paths: list[dict[str, Any]] | None = None,
 ) -> list[str]:
     """Common filesystem, namespace, scratch, Git, and environment policy.
 
@@ -106,6 +110,14 @@ def sandbox_command(
         if home.is_relative_to(source.resolve()):
             raise ValueError("Sandbox mount must not expose the home directory")
 
+    metadata = git_metadata_directories(cwd, home)
+    extra_mounts = validate_paths(sandbox_paths or [])
+    builtins = [(p.resolve(), p) for p in [*writable, cwd, *metadata]]
+    builtins.extend((source.resolve(), Path(target)) for source, target in read_only)
+    for mount in extra_mounts:
+        for source, target in builtins:
+            if overlaps(mount.source, source) or overlaps(mount.destination, target):
+                raise ValueError(f"Sandbox path {mount.destination} overlaps built-in mount {target}")
     scratch = prepare_scratch()
     args = [
         bwrap,
@@ -128,10 +140,13 @@ def sandbox_command(
     args.extend(["--bind", str(cwd), str(cwd), "--chdir", str(cwd)])
     # Linked worktrees keep their index/HEAD and common objects/refs outside
     # cwd. Expose that metadata, not the main checkout or its other files.
-    for directory in git_metadata_directories(cwd, home):
+    for directory in metadata:
         args.extend(["--bind", str(directory), str(directory)])
     for source, target in read_only:
         args.extend(["--ro-bind", str(source), target])
+    for mount in extra_mounts:
+        args.extend(["--bind" if mount.write else "--ro-bind",
+                     str(mount.source), str(mount.destination)])
     args.extend(["--remount-ro", "/", "--clearenv"])
     try:
         user = pwd.getpwuid(os.getuid()).pw_name
@@ -163,7 +178,8 @@ def _executable(name: str) -> Path:
     return path.parent.resolve() / path.name
 
 
-def pi_sandbox_command(command: list[str], working_dir: str) -> list[str]:
+def pi_sandbox_command(command: list[str], working_dir: str, *,
+                       sandbox_paths: list[dict[str, Any]] | None = None) -> list[str]:
     """Pi installer/system runtime, config and explicit server extensions."""
     executable = _executable(command[0])
     bin_dir = executable.parent
@@ -202,6 +218,7 @@ def pi_sandbox_command(command: list[str], working_dir: str) -> list[str]:
     return sandbox_command(
         inner, working_dir, read_only=read_only, writable=[config],
         environment={"PATH": f"{bin_dir}:/usr/bin:/bin"},
+        sandbox_paths=sandbox_paths,
     )
 
 
@@ -238,7 +255,8 @@ def _claude_config() -> Path:
     return config
 
 
-def claude_sandbox_command(command: list[str], working_dir: str) -> list[str]:
+def claude_sandbox_command(command: list[str], working_dir: str, *,
+                           sandbox_paths: list[dict[str, Any]] | None = None) -> list[str]:
     """Claude native binary or npm Node launcher, with persistent config."""
     launcher = _executable(command[0])
     executable = launcher.resolve(strict=True)
@@ -272,6 +290,7 @@ def claude_sandbox_command(command: list[str], working_dir: str) -> list[str]:
     return sandbox_command(
         [str(executable), *command[1:]], working_dir,
         read_only=read_only, writable=[config],
+        sandbox_paths=sandbox_paths,
         environment={
             "PATH": path,
             "CLAUDE_CONFIG_DIR": str(config),

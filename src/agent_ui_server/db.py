@@ -53,7 +53,9 @@ _SESSION_QUERY = """
 # for the ride so unarchiving the project can restore exactly those and leave
 # the ones archived on their own account alone.
 _POST_MIGRATION_COLUMNS = {
-    "projects": {"archived_at": "TEXT"},
+    "projects": {
+        "archived_at": "TEXT",
+    },
     "sessions": {
         "archived_at": "TEXT",
         "archived_with_project": "INTEGER NOT NULL DEFAULT 0",
@@ -211,6 +213,22 @@ class Database:
             # copies an explicit column list into a fresh table — so additions
             # have to happen here or an older database would immediately lose
             # them while being upgraded on this same open.
+            self._conn.execute("""
+                CREATE TABLE IF NOT EXISTS sandbox_paths (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+                    path TEXT NOT NULL CHECK (length(path) > 0),
+                    writable INTEGER NOT NULL DEFAULT 0 CHECK (writable IN (0, 1))
+                )
+            """)
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS sandbox_paths_server_path "
+                "ON sandbox_paths(path) WHERE project_id IS NULL"
+            )
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS sandbox_paths_project_path "
+                "ON sandbox_paths(project_id, path) WHERE project_id IS NOT NULL"
+            )
             for table, columns in _POST_MIGRATION_COLUMNS.items():
                 self._add_missing_columns(table, columns)
 
@@ -793,12 +811,54 @@ class Database:
         ORDER BY last_active_at DESC, p.path ASC
     """
 
+    def get_sandbox_paths(self, project_id: int | None = None) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT path, writable FROM sandbox_paths WHERE project_id IS ? ORDER BY id",
+                (project_id,),
+            ).fetchall()
+        return [{"path": row["path"], "write": bool(row["writable"])} for row in rows]
+
+    def _insert_sandbox_paths(self, paths: list[dict[str, Any]], project_id: int | None) -> None:
+        """Caller holds the lock and transaction."""
+        self._conn.executemany(
+            "INSERT INTO sandbox_paths (project_id, path, writable) VALUES (?, ?, ?)",
+            [(project_id, entry["path"], int(entry.get("write", False))) for entry in paths],
+        )
+
+    def set_sandbox_paths(
+        self, paths: list[dict[str, Any]], project_id: int | None = None,
+    ) -> None:
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM sandbox_paths WHERE project_id IS ?", (project_id,))
+            self._insert_sandbox_paths(paths, project_id)
+
+    def sandbox_paths_snapshot(
+        self, project_id: int,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Read both scopes in one SQLite snapshot, including concurrent writers."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT project_id, path, writable FROM sandbox_paths "
+                "WHERE project_id IS NULL OR project_id = ? ORDER BY id", (project_id,),
+            ).fetchall()
+        defaults, project = [], []
+        for row in rows:
+            target = defaults if row["project_id"] is None else project
+            target.append({"path": row["path"], "write": bool(row["writable"])})
+        return defaults, project
+
+    def _project_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        result["sandbox_paths"] = self.get_sandbox_paths(row["id"])
+        return result
+
     def list_projects(self) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(
                 self._PROJECT_QUERY.format(where="")
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [self._project_dict(row) for row in rows]
 
     def get_project(self, path: str) -> dict[str, Any] | None:
         """Look a project up by path — how the HTTP API addresses one."""
@@ -807,7 +867,7 @@ class Database:
                 self._PROJECT_QUERY.format(where="WHERE p.path = ?"),
                 (path,),
             ).fetchone()
-        return dict(row) if row else None
+        return self._project_dict(row) if row else None
 
     def get_project_by_id(self, project_id: int) -> dict[str, Any] | None:
         """Look a project up by id — how sessions refer to one."""
@@ -816,7 +876,7 @@ class Database:
                 self._PROJECT_QUERY.format(where="WHERE p.id = ?"),
                 (project_id,),
             ).fetchone()
-        return dict(row) if row else None
+        return self._project_dict(row) if row else None
 
     def delete_project(self, path: str) -> bool:
         """Forget a project, its worktrees and any sessions still on it.
@@ -840,18 +900,21 @@ class Database:
             )
         return cursor.rowcount > 0
 
-    def create_project(self, path: str, name: str) -> dict[str, Any]:
+    def create_project(
+        self, path: str, name: str, sandbox_paths: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         """Register a project. Creating one that exists is a no-op, not an error.
 
         Returns the project either way, so a repeat create reports the real
         session aggregates rather than claiming the project is empty.
         """
         with self._lock, self._conn:
-            self._conn.execute(
-                "INSERT OR IGNORE INTO projects (path, name, created_at) "
-                "VALUES (?, ?, ?)",
+            cursor = self._conn.execute(
+                "INSERT OR IGNORE INTO projects (path, name, created_at) VALUES (?, ?, ?)",
                 (path, name, utc_now()),
             )
+            if cursor.rowcount:
+                self._insert_sandbox_paths(sandbox_paths or [], cursor.lastrowid)
         project = self.get_project(path)
         if project is None:
             raise KeyError(f"Unknown project: {path}")
