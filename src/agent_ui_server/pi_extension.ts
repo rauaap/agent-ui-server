@@ -29,18 +29,16 @@ const PROTOCOL_VERSION = 1;
 const MARKER = "agent-ui";
 
 /**
- * Tools that never reach the gate. Claude Code auto-allows reads upstream, so
- * its adapter only sees mutating calls; Pi has no
- * such filter and hands us every call, so the equivalent list lives here.
+ * Tools that never reach the gate. Claude Code's adapter auto-approves its
+ * equivalent read-only allowlist; Pi hands us every call, so its list lives here.
  *
  * Deliberately an allowlist: an unrecognized tool (another extension's, or one
  * added by a future Pi release) prompts rather than slipping through.
  *
  * `web_search` and `url_context` come from the vendored pi-web-search
- * extension. They are listed here because they change nothing on disk, not for
- * parity with Claude Code: Claude Code does gate WebSearch and WebFetch, so a
- * Pi session searches without a prompt where a Claude Code session asks. That
- * asymmetry is deliberate. Note also that these are network egress and each
+ * extension. They are listed here because they change nothing on disk, matching
+ * the Claude adapter's auto-approval of WebSearch and WebFetch.
+ * Note also that these are network egress and each
  * call spends an inference request on the session's provider — read-only
  * locally, not free.
  */

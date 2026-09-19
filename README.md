@@ -607,8 +607,31 @@ class AgentAdapter:
 | Claude Code | `stream-json` over stdio | `--resume <id>` | stdio permission requests |
 | Pi | RPC JSONL over stdio | `--session <id>` | bundled extension dialogs |
 
-Claude Code runs with `--permission-mode default` and
-`--permission-prompt-tool stdio`. Pi has no native permission system, so
+Claude Code runs with `--permission-mode default`,
+`--permission-prompt-tool stdio`, and inline `--settings` setting
+`permissions.ask` to `["*"]` and `sandbox.autoAllowBashIfSandboxed` to `false`.
+The adapter's explicit `AUTO_APPROVE_TOOLS` allowlist skips UI prompts for:
+
+- Reads/web/code intelligence: `Read`, `Glob`, `Grep`, `WebSearch`, `WebFetch`, `LSP`.
+- Discovery: `ToolSearch`, `ListMcpResourcesTool`, `ReadMcpResourceTool`,
+  `WaitForMcpServers`, `ListAgents`, `CronList`.
+- Task bookkeeping: `TaskGet`, `TaskList`, `TaskOutput`, `TaskCreate`,
+  `TaskUpdate`, `TodoWrite` (task metadata, not project-file writes).
+- Planning/reporting: `EnterPlanMode`, `ReportFindings`.
+
+`ToolSearch` loads tool definitions; invoking a discovered tool is still gated
+independently. MCP resource reads are allowed, but arbitrary `mcp__...` tool
+calls are not. `AskUserQuestion` uses the question flow. All other tools,
+including unknown tools, request approval, subject to the server's per-session
+write/command auto-approve toggles. This includes commands, file writes,
+agent/skill/workflow execution, stopping tasks, scheduling, messaging/uploads,
+worktree changes, and `ExitPlanMode` (plan approval). Inherited deny rules still
+apply upstream. Tool classifications follow the
+[Claude tools reference](https://code.claude.com/docs/en/tools-reference), not
+its default permission column: some normally unprompted tools launch work or
+have external side effects.
+
+Pi has no native permission system, so
 `pi_extension.ts` gates mutating tools and supplies `AskUserQuestion`. The
 adapter waits for the extension's ready handshake before sending a prompt;
 failure to load the gate fails closed. `--no-extensions` prevents project-local
@@ -627,10 +650,9 @@ substitute an extension, or to the empty string to leave Pi without web access.
 The web tools search through whichever provider backs the session's current
 model, using the credentials Pi already holds — a subscription login is enough,
 and no separate API key is required. They are read-only locally and so bypass
-the approval gate. Claude Code gates its own `WebSearch` and `WebFetch`, so a Pi
-session searches without a prompt where a Claude Code session asks; that
-asymmetry is deliberate, and removing the two names from `READ_ONLY_TOOLS` in
-`pi_extension.ts` restores the prompt. Each call is still network egress and
+the approval gate. Claude Code's adapter likewise auto-approves `WebSearch`
+and `WebFetch`. Removing web tool names from the corresponding adapter/extension
+auto-approval allowlist restores the prompt. Each call is still network egress and
 spends a full inference request on the provider. `url_context` is Gemini-only
 and hides itself on other models.
 

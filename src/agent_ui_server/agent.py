@@ -236,6 +236,22 @@ class ClaudeCodeAdapter(AgentAdapter):
     # the user's pick into updatedInput.answers.
     QUESTION_TOOL = "AskUserQuestion"
 
+    # With ask:["*"], Claude forwards tool permissions here. Exempt known
+    # reads, discovery, and session bookkeeping, not arbitrary tool prefixes.
+    # ToolSearch only loads definitions: discovered tool calls are gated anew.
+    # TaskCreate/TaskUpdate/TodoWrite mutate Claude's task metadata, not project
+    # files. Agent launches, task stopping, scheduling, messaging, worktree
+    # changes, and ExitPlanMode still require approval.
+    # Reference: https://code.claude.com/docs/en/tools-reference
+    AUTO_APPROVE_TOOLS = frozenset({
+        "Read", "Glob", "Grep", "WebSearch", "WebFetch", "LSP",
+        "ToolSearch", "ListMcpResourcesTool", "ReadMcpResourceTool",
+        "WaitForMcpServers", "ListAgents", "CronList",
+        "TaskGet", "TaskList", "TaskOutput",
+        "TaskCreate", "TaskUpdate", "TodoWrite",
+        "EnterPlanMode", "ReportFindings",
+    })
+
     def __init__(self, executable: str | None = None) -> None:
         self.executable = executable or os.environ.get("CLAUDE_BIN", "claude")
         self.processes: dict[int, asyncio.subprocess.Process] = {}
@@ -269,6 +285,11 @@ class ClaudeCodeAdapter(AgentAdapter):
             "stdio",
             "--permission-mode",
             "default",
+            "--settings",
+            json.dumps({
+                "permissions": {"ask": ["*"]},
+                "sandbox": {"autoAllowBashIfSandboxed": False},
+            }),
             "--verbose",
         ]
         if session.get("agent_session_id"):
@@ -427,6 +448,15 @@ class ClaudeCodeAdapter(AgentAdapter):
             if native is None:
                 return
             request_id, tool, tool_input, _call_id = native
+
+            if tool in self.AUTO_APPROVE_TOOLS:
+                try:
+                    await self._write_approval_response(
+                        process, request_id, ApprovalDecision(behavior="allow"), tool_input
+                    )
+                except Exception as exc:
+                    yield {"type": "error", "message": str(exc)}
+                return
 
             # AskUserQuestion is a question for the user, not a run/deny gate:
             # surface it as a `question` event and answer it by writing the
