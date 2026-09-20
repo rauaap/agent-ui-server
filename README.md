@@ -315,6 +315,63 @@ request shapes return FastAPI's usual `422`.
 
 See [the design](docs/sandbox_paths_design.md) for mount rules and lifecycle details.
 
+### Experimental sandbox-bypass tools
+
+Enable either or both tools in the server environment:
+
+| Setting | Tool in sandboxed sessions |
+| --- | --- |
+| `CLAUDE_HOST_EXEC=1` | Claude: `mcp__agent_ui__bypass_sandbox(command, reason)` |
+| `PI_HOST_EXEC=1` | Pi: `bypass_sandbox(command, reason)` |
+
+Both settings default to disabled. Non-sandboxed sessions receive neither tool
+nor its system-prompt guidance.
+
+Pi registers its tool in the bundled extension and forwards requests/results over
+the existing extension UI RPC bridge. There is no MCP layer. Registration is
+checked during the startup handshake, and the server independently enforces
+approval, even if an extension attempts to skip its normal tool gate.
+Pi gets the same generated mount description with Pi-specific usage guidance.
+
+Claude uses SDK MCP control messages over the existing stdin/stdout pipes:
+no MCP package, HTTP endpoint, or helper process. Its tool uses normal deferred
+discovery; no `alwaysLoad` override is set. For sandboxed turns with this feature enabled, the server appends a
+system prompt listing the actual resolved working directory and writable and
+read-only mounts. The prompt and Bubblewrap arguments are generated from the
+same mount plan, including runtime/config paths, worktree Git metadata, merged
+server/project extra paths, and the sandbox `/tmp` backing directory. Synthetic
+and optional mounts are labeled; mount permissions do not override ordinary
+filesystem permissions.
+
+Claude's prompt also explains why `dangerouslyDisableSandbox` cannot escape
+Bubblewrap and when to discover and use `mcp__agent_ui__bypass_sandbox` through
+ToolSearch. The mount plan is rebuilt for every turn, including resumed sessions.
+
+The agent remains sandboxed. Each host-tool invocation asks the user to
+**Execute outside sandbox**, showing the exact command, reason, and session
+working directory. Ordinary command auto-approval does not bypass this gate;
+only a per-invocation approval permits execution. Denial is returned to the agent
+as a tool error. Both adapters permit dispatch through the ordinary tool gate to
+this server-owned approval gate, avoiding duplicate prompts.
+
+Approved commands use the same server-side shell runner as user `!` commands:
+`bash -lc`, server environment, session working directory, no interactive stdin,
+and the existing `BASH_TIMEOUT_SECONDS` / `BASH_OUTPUT_LIMIT` limits. Output and
+exit status are returned when execution finishes (not streamed). Cancellation
+or turn termination cancels active host commands. Containerized deployments
+execute inside the server container, not outside that container. Sandbox `/tmp`
+and the server's `/tmp` are different; use project paths for shared files.
+
+This grants the approved command and everything it invokes the server account's
+access, including its environment. It does not change the trusted-user deployment
+model.
+
+Smoke test: enable the corresponding flag, start a sandboxed turn, and ask it to use
+`bypass_sandbox` for `printf 'host execution works\\n'`. Check both denial and approval,
+then test Podman in your deployment. The automated tests use a simulated Claude
+peer; they do not establish compatibility with a real Claude version. Pi tests
+also load the real extension and exercise its callback without making model calls.
+
 ### Session sandbox
 
 Client integration: [sandbox client handoff](docs/sandbox_client_handoff.md).

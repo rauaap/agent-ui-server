@@ -190,6 +190,30 @@ class SandboxCommandTests(unittest.TestCase):
         self.assertIn("--no-extensions", inner)
         self.assertTrue(all(inner[i + 1].startswith("/opt/agent-ui/") for i, arg in enumerate(inner) if arg == "-e"))
 
+    def test_pi_host_prompt_uses_resolved_mount_plan(self):
+        from agent_ui_server.host_tools import pi_sandbox_guidance
+
+        extra = self.home / "additional-settings"
+        extra.write_text("settings")
+        with mock.patch("agent_ui_server.sandbox.shutil.which", side_effect=lambda p: "/usr/bin/bwrap" if p == "bwrap" else p):
+            command = pi_sandbox_command(
+                self.command, str(self.cwd), sandbox_paths=[{"path": str(extra)}],
+                system_prompt=pi_sandbox_guidance,
+            )
+        prompt = command[command.index("--append-system-prompt") + 1]
+        writable, readonly = prompt.split("Read-only mounts:", 1)
+        for index, arg in enumerate(command):
+            if arg in {"--bind", "--ro-bind", "--ro-bind-try"}:
+                destination = command[index + 2]
+                self.assertIn(json.dumps(destination), writable if arg == "--bind" else readonly)
+        self.assertIn(json.dumps(str(self.cwd)), writable)
+        self.assertIn(json.dumps(str(self.home / ".pi")), writable)
+        self.assertIn(json.dumps(str(extra)), readonly)
+        self.assertIn("/opt/agent-ui/extension-", readonly)
+        self.assertIn("bypass_sandbox(command, reason)", prompt)
+        self.assertNotIn("mcp__", prompt)
+        self.assertNotIn("ToolSearch", prompt)
+
     def test_missing_bwrap_fails_closed(self):
         with mock.patch("agent_ui_server.sandbox.shutil.which", side_effect=lambda p: None if p == "bwrap" else p):
             with self.assertRaisesRegex(FileNotFoundError, "Bubblewrap"):

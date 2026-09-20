@@ -13,6 +13,10 @@ from typing import Any
 
 from .actions import approval_request_event, tool_use_event
 from .sandbox import claude_sandbox_command, pi_sandbox_command
+from .host_tools import (
+    HostTools, TOOL_NAME, execute_host_command, pi_sandbox_guidance, sandbox_guidance,
+    validate_host_arguments,
+)
 from .tool_actions import (
     CLAUDE_TOOL_TRANSLATORS,
     PI_TOOL_TRANSLATORS,
@@ -263,6 +267,7 @@ class ClaudeCodeAdapter(AgentAdapter):
         self.pending_questions: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self.pending_question_specs: dict[str, list[dict[str, Any]]] = {}
         self.tool_actions: dict[tuple[int, str], dict[str, Any]] = {}
+        self.host_tools: dict[int, HostTools] = {}
 
     async def start_turn(
         self,
@@ -292,6 +297,14 @@ class ClaudeCodeAdapter(AgentAdapter):
             }),
             "--verbose",
         ]
+        host_enabled = (
+            os.environ.get("CLAUDE_HOST_EXEC") == "1"
+            and session.get("sandbox", True)
+        )
+        if host_enabled:
+            command.extend(["--mcp-config", json.dumps({
+                "mcpServers": {"agent_ui": {"type": "sdk", "name": "agent_ui"}}
+            })])
         if session.get("agent_session_id"):
             command.extend(["--resume", session["agent_session_id"]])
 
@@ -299,6 +312,7 @@ class ClaudeCodeAdapter(AgentAdapter):
             if session.get("sandbox", True):
                 command = claude_sandbox_command(
                     command, session["working_dir"],
+                    **({"system_prompt": sandbox_guidance} if host_enabled else {}),
                     **({"sandbox_paths": session["sandbox_paths"]} if session.get("sandbox_paths") else {}),
                 )
                 env = {}
@@ -326,12 +340,22 @@ class ClaudeCodeAdapter(AgentAdapter):
         self.processes[session_id] = process
         stderr_task = asyncio.create_task(self._collect_stderr(process.stderr))
         result_seen = False
+        host = None
+        if host_enabled:
+            host = HostTools(process, session["working_dir"],
+                             lambda args: self._approve_host(session_id, args))
+            self.host_tools[session_id] = host
 
         try:
+            if host is not None:
+                await host.start()
             await self._write_user_message(process, prompt)
             assert process.stdout is not None
             while True:
-                raw_line = await process.stdout.readline()
+                raw_line = await host.events.get() if host is not None else await process.stdout.readline()
+                if isinstance(raw_line, dict):
+                    yield raw_line
+                    continue
                 if not raw_line:
                     break
 
@@ -366,6 +390,16 @@ class ClaudeCodeAdapter(AgentAdapter):
                     "session_id": session.get("agent_session_id"),
                 }
         finally:
+            if host is not None:
+                await host.close()
+                self.host_tools.pop(session_id, None)
+                if process.returncode is None:
+                    process.terminate()
+                    try:
+                        await asyncio.wait_for(process.wait(), timeout=3)
+                    except asyncio.TimeoutError:
+                        process.kill()
+                        await process.wait()
             self.processes.pop(session_id, None)
             await self._clear_session_approvals(session_id, "Session ended")
             self._clear_tool_actions(session_id)
@@ -407,8 +441,30 @@ class ClaudeCodeAdapter(AgentAdapter):
             future.set_result(validated)
         return validated
 
+    async def _approve_host(self, session_id: int, args: dict[str, str]) -> ApprovalDecision:
+        host = self.host_tools[session_id]
+        request_id = "host_" + uuid.uuid4().hex
+        future = asyncio.get_running_loop().create_future()
+        self.pending_approvals[request_id] = future
+        self.pending_sessions[request_id] = session_id
+        self.pending_options[request_id] = self.OPTIONS
+        # 'other' deliberately never inherits normal command auto-approval.
+        action = {"kind": "other", "name": "Execute outside sandbox",
+                  "arguments": {**args, "cwd": host.cwd}}
+        try:
+            await host.events.put(approval_request_event(
+                request_id, request_id, action, _event_options(self.OPTIONS)))
+            return await future
+        finally:
+            self.pending_approvals.pop(request_id, None)
+            self.pending_sessions.pop(request_id, None)
+            self.pending_options.pop(request_id, None)
+
     async def stop(self, session: dict[str, Any]) -> None:
         session_id = session["id"]
+        host = self.host_tools.get(session_id)
+        if host is not None:
+            await host.close()
         await self._clear_session_approvals(session_id, "Session stopped")
         self._clear_tool_actions(session_id)
 
@@ -449,7 +505,10 @@ class ClaudeCodeAdapter(AgentAdapter):
                 return
             request_id, tool, tool_input, _call_id = native
 
-            if tool in self.AUTO_APPROVE_TOOLS:
+            # Allow transport dispatch only; the host executor asks independently.
+            if tool in self.AUTO_APPROVE_TOOLS or (
+                tool == TOOL_NAME and session_id in self.host_tools
+            ):
                 try:
                     await self._write_approval_response(
                         process, request_id, ApprovalDecision(behavior="allow"), tool_input
@@ -849,6 +908,7 @@ class PiAdapter(AgentAdapter):
                 "PI_WEB_SEARCH", self.DEFAULT_WEB_EXTENSION
             )
         self.web_extension_path = web_extension_path
+        self.host_calls: dict[int, dict[str, asyncio.Task[None]]] = {}
         self.processes: dict[int, asyncio.subprocess.Process] = {}
         self.pending_approvals: dict[str, asyncio.Future[ApprovalDecision]] = {}
         self.pending_sessions: dict[str, int] = {}
@@ -879,6 +939,9 @@ class PiAdapter(AgentAdapter):
             # arguments the user just approved.
             "--no-extensions",
         ]
+        host_enabled = os.environ.get("PI_HOST_EXEC") == "1" and session.get("sandbox", True)
+        if host_enabled:
+            command.append("--agent-ui-host-exec")
         if self.web_extension_path:
             command.extend(["-e", self.web_extension_path])
         if session.get("agent_session_id"):
@@ -888,6 +951,7 @@ class PiAdapter(AgentAdapter):
             if session.get("sandbox", True):
                 command = pi_sandbox_command(
                     command, session["working_dir"],
+                    **({"system_prompt": pi_sandbox_guidance} if host_enabled else {}),
                     **({"sandbox_paths": session["sandbox_paths"]} if session.get("sandbox_paths") else {}),
                 )
                 # Clear bwrap's own environment too, not just its child's.
@@ -920,6 +984,9 @@ class PiAdapter(AgentAdapter):
         queue: asyncio.Queue[AgentEvent | None] = asyncio.Queue()
         ready: asyncio.Future[None] = loop.create_future()
         resolvers: set[asyncio.Task[None]] = set()
+        host_calls: dict[str, asyncio.Task[None]] = {}
+        self.host_calls[session_id] = host_calls
+        host_lock = asyncio.Lock()
 
         # Per-turn correlation state.
         #  tool_args   toolCallId -> arguments, captured from
@@ -1007,6 +1074,41 @@ class PiAdapter(AgentAdapter):
                 self.pending_approvals.pop(request_id, None)
                 self.pending_sessions.pop(request_id, None)
                 self.pending_options.pop(request_id, None)
+
+        async def approve_host(args: dict[str, str], tool_call_id: str) -> ApprovalDecision:
+            request_id = "host_" + uuid.uuid4().hex
+            future = loop.create_future()
+            self.pending_approvals[request_id] = future
+            self.pending_sessions[request_id] = session_id
+            self.pending_options[request_id] = self.OPTIONS
+            try:
+                await flush_text()
+                await queue.put(approval_request_event(
+                    request_id, tool_call_id,
+                    {"kind": "other", "name": "Execute outside sandbox", "arguments": {
+                        **args, "cwd": session["working_dir"],
+                    }}, _event_options(self.OPTIONS),
+                ))
+                return await future
+            finally:
+                self.pending_approvals.pop(request_id, None)
+                self.pending_sessions.pop(request_id, None)
+                self.pending_options.pop(request_id, None)
+
+        async def resolve_host(dialog_id: Any, tool_call_id: str, args: dict[str, str]) -> None:
+            try:
+                async with host_lock:
+                    result = await execute_host_command(
+                        args, session["working_dir"], lambda values: approve_host(values, tool_call_id),
+                    )
+                await answer_dialog(dialog_id, json.dumps(result))
+            except asyncio.CancelledError:
+                await answer_dialog(dialog_id, None)
+                raise
+            except Exception as exc:
+                await answer_dialog(dialog_id, json.dumps({
+                    "isError": True, "content": [{"type": "text", "text": str(exc)}],
+                }))
 
         async def resolve_question(
             request_id: str,
@@ -1097,7 +1199,35 @@ class PiAdapter(AgentAdapter):
 
             if kind == "ready":
                 if not ready.done():
-                    ready.set_result(None)
+                    if host_enabled and envelope.get("hostTool") != "bypass_sandbox":
+                        ready.set_exception(RuntimeError("Pi extension did not register bypass_sandbox"))
+                    else:
+                        ready.set_result(None)
+                return
+
+            if kind == "host_cancel":
+                call_id = envelope.get("toolCallId")
+                if isinstance(call_id, str) and call_id in host_calls:
+                    host_calls[call_id].cancel()
+                return
+
+            if kind == "host_exec":
+                try:
+                    if (not host_enabled or method != "input"
+                            or self.processes.get(session_id) is not process):
+                        raise ValueError("Host execution is not enabled for this session")
+                    call_id = envelope.get("toolCallId")
+                    if not isinstance(call_id, str) or not call_id or call_id in host_calls:
+                        raise ValueError("Invalid or duplicate host tool call id")
+                    args = validate_host_arguments(envelope.get("arguments"))
+                except ValueError as exc:
+                    await answer_dialog(dialog_id, json.dumps({
+                        "isError": True, "content": [{"type": "text", "text": str(exc)}],
+                    }))
+                    return
+                task = asyncio.create_task(resolve_host(dialog_id, call_id, args))
+                host_calls[call_id] = task
+                task.add_done_callback(lambda _, key=call_id: host_calls.pop(key, None))
                 return
 
             if kind == "approval":
@@ -1286,15 +1416,20 @@ class PiAdapter(AgentAdapter):
         except Exception as exc:
             yield {"type": "error", "message": f"Pi RPC error: {exc}"}
         finally:
+            # Stop reading before cancelling host calls, so no new work can arrive.
+            reader_task.cancel()
+            await asyncio.gather(reader_task, return_exceptions=True)
+            await self._cancel_host_calls(session_id)
+            self.host_calls.pop(session_id, None)
             self.processes.pop(session_id, None)
             await self._clear_session_approvals(session_id, "Session ended")
             await self._terminate(process)
-            for task in list(resolvers):
+            tasks = list(resolvers)
+            for task in tasks:
                 task.cancel()
-            if not reader_task.done():
-                reader_task.cancel()
             if not stderr_task.done():
                 stderr_task.cancel()
+            await asyncio.gather(*tasks, stderr_task, return_exceptions=True)
 
     async def send_approval(
         self,
@@ -1331,13 +1466,20 @@ class PiAdapter(AgentAdapter):
             future.set_result(validated)
         return validated
 
+    async def _cancel_host_calls(self, session_id: int) -> None:
+        tasks = list(self.host_calls.get(session_id, {}).values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
     async def stop(self, session: dict[str, Any]) -> None:
         session_id = session["id"]
+        # Revoke dispatch before cancelling so buffered requests cannot start work.
+        process = self.processes.pop(session_id, None)
+        await self._cancel_host_calls(session_id)
         await self._clear_session_approvals(session_id, "Session stopped")
-        process = self.processes.get(session_id)
         if process is not None:
             await self._terminate(process)
-        self.processes.pop(session_id, None)
 
     @classmethod
     def _envelope(cls, carrier: Any) -> dict[str, Any] | None:

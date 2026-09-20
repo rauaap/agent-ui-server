@@ -1,5 +1,5 @@
 /**
- * agent-ui-server's Pi extension — approval gate + AskUserQuestion.
+ * agent-ui-server's Pi extension — approval gate, AskUserQuestion, sandbox bypass.
  *
  * Pi ships no permission system by design ("built-in tools can read files,
  * write files, edit files, and run shell commands with the permissions of the
@@ -12,7 +12,8 @@
  * and resolve when the client answers with `extension_ui_response` on stdin.
  * The client is PiAdapter, which relays to the phone. Neither call has a field
  * for structured data, so everything the adapter needs to build its wire event
- * is JSON-encoded into `title`; see `envelope`.
+ * is JSON-encoded into `title`; see `envelope`. The optional bypass_sandbox
+ * tool uses the same input/response channel for server-approved host execution.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -52,6 +53,7 @@ const READ_ONLY_TOOLS = new Set([
 ]);
 
 const QUESTION_TOOL = "AskUserQuestion";
+const HOST_TOOL = "bypass_sandbox";
 
 const ALLOW = "Allow";
 const DENY = "Deny";
@@ -162,6 +164,52 @@ const QUESTION_SCHEMA = Type.Object({
 });
 
 export default function (pi: ExtensionAPI) {
+	pi.registerFlag("agent-ui-host-exec", {
+		description: "Enable server-approved execution outside Bubblewrap (agent-ui RPC only)",
+		type: "boolean",
+		default: false,
+	});
+	let hostEnabled = false;
+	function registerHostTool() {
+		pi.registerTool({
+			name: HOST_TOOL,
+			label: "Execute outside sandbox",
+			description:
+				"Run one non-interactive shell command outside Bubblewrap after explicit user approval. " +
+				"Runs in the session working directory with the server environment. " +
+				"Use when sandbox visibility, permissions, or container execution block normal tools. " +
+				"Does not disable sandboxing for the session. Output is bounded by server limits; " +
+				"timeouts and truncation are reported in the result.",
+			promptSnippet: "Run a command outside the sandbox with user approval",
+			promptGuidelines: [
+				"Use bypass_sandbox when Bubblewrap hides needed paths or blocks commands such as Podman.",
+				"A file missing inside the sandbox is not proof that it is missing on the server.",
+			],
+			parameters: Type.Object({
+				command: Type.String({ minLength: 1 }),
+				reason: Type.String({ minLength: 1 }),
+			}, { additionalProperties: false }),
+			async execute(toolCallId, params, signal, _onUpdate, ctx) {
+				if (ctx.mode !== "rpc") throw new Error("Host execution requires the agent-ui RPC server.");
+				if (signal?.aborted) throw new Error("Host execution cancelled.");
+				const cancel = () => ctx.ui.notify(envelope("host_cancel", { toolCallId }), "info");
+				signal?.addEventListener("abort", cancel, { once: true });
+				try {
+					// This input dialog is an RPC request, not a prompt shown to the user.
+					// The server owns approval and returns the bounded command result as JSON.
+					const response = await ctx.ui.input(
+						envelope("host_exec", { toolCallId, arguments: params }), undefined, { signal },
+					);
+					if (!response) throw new Error("Host execution cancelled or unavailable.");
+					const result = JSON.parse(response);
+					if (result.isError) throw new Error(result.content.map((part: { text: string }) => part.text).join("\n"));
+					return { content: result.content, details: {} };
+				} finally {
+					signal?.removeEventListener("abort", cancel);
+				}
+			},
+		});
+	}
 	/**
 	 * Startup handshake.
 	 *
@@ -171,7 +219,11 @@ export default function (pi: ExtensionAPI) {
 	 * prompt, turning that into a startup error.
 	 */
 	pi.on("session_start", (_event, ctx) => {
-		ctx.ui.notify(envelope("ready", { questionTool: QUESTION_TOOL }), "info");
+		hostEnabled = pi.getFlag("agent-ui-host-exec") === true;
+		if (hostEnabled) registerHostTool();
+		ctx.ui.notify(envelope("ready", {
+			questionTool: QUESTION_TOOL, hostTool: hostEnabled ? HOST_TOOL : undefined,
+		}), "info");
 	});
 
 	/**
@@ -185,6 +237,8 @@ export default function (pi: ExtensionAPI) {
 	pi.on("tool_call", async (event, ctx) => {
 		// Asking permission to ask the user a question would be circular.
 		if (event.toolName === QUESTION_TOOL) return;
+		// Host execution has a mandatory server-side gate, not this normal tool gate.
+		if (hostEnabled && event.toolName === HOST_TOOL) return;
 		if (READ_ONLY_TOOLS.has(event.toolName)) return;
 
 		// No dialog transport (print/json mode) means nobody can approve, so

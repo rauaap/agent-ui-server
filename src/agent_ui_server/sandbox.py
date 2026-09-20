@@ -5,11 +5,14 @@ callers must also clear the environment of the Bubblewrap process itself.
 """
 from __future__ import annotations
 
+import json
 import os
 import pwd
 import shutil
 import stat
 import tempfile
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -83,6 +86,53 @@ def git_metadata_directories(cwd: Path, home: Path) -> list[Path]:
     return directories
 
 
+@dataclass(frozen=True)
+class SandboxMount:
+    option: str
+    source: str | None
+    destination: str
+
+    def argv(self) -> list[str]:
+        if self.source is None:
+            return [self.option, self.destination, "--remount-ro", self.destination]
+        return [self.option, self.source, self.destination]
+
+
+@dataclass(frozen=True)
+class SandboxFilesystem:
+    cwd: Path
+    mounts: list[SandboxMount]
+
+    def describe(self) -> str:
+        """Describe the exact mount plan, not a second filesystem discovery pass."""
+        lines = [
+            "Bubblewrap filesystem view for this turn (paths are JSON-quoted):",
+            f"Working directory: {json.dumps(str(self.cwd))}",
+        ]
+        for writable, heading in ((True, "Writable mounts:"), (False, "Read-only mounts:")):
+            lines.append(heading)
+            for mount in self.mounts:
+                if (mount.option == "--bind") != writable:
+                    continue
+                detail = ""
+                if mount.source is None:
+                    detail = " (synthetic filesystem, not the host's contents)"
+                elif mount.option.endswith("-try"):
+                    detail = " (only if present on the server)"
+                if mount.source is not None and mount.source != mount.destination:
+                    detail += f" (server source: {json.dumps(mount.source)})"
+                lines.append(f"- {json.dumps(mount.destination)}{detail}")
+        lines.extend([
+            "The synthetic root and parent directories are read-only. More-specific mounts "
+            "override parent mounts. These are mount permissions, not guarantees of access; "
+            "ordinary filesystem permissions still apply.",
+            "Unlisted host paths may be hidden or read-only. Directory listings describe "
+            "this sandbox view, not the server filesystem. Sandbox /tmp is backed by the "
+            "server source listed above, not the server's /tmp directory.",
+        ])
+        return "\n".join(lines)
+
+
 def sandbox_command(
     command: list[str],
     working_dir: str,
@@ -91,6 +141,7 @@ def sandbox_command(
     writable: list[Path],
     environment: dict[str, str],
     sandbox_paths: list[dict[str, Any]] | None = None,
+    command_suffix: Callable[[SandboxFilesystem], list[str]] | None = None,
 ) -> list[str]:
     """Common filesystem, namespace, scratch, Git, and environment policy.
 
@@ -119,35 +170,33 @@ def sandbox_command(
             if overlaps(mount.source, source) or overlaps(mount.destination, target):
                 raise ValueError(f"Sandbox path {mount.destination} overlaps built-in mount {target}")
     scratch = prepare_scratch()
+    mounts = [
+        SandboxMount("--ro-bind", "/usr", "/usr"),
+        SandboxMount("--ro-bind", "/bin", "/bin"),
+        SandboxMount("--ro-bind", "/lib", "/lib"),
+        SandboxMount("--ro-bind-try", "/lib64", "/lib64"),
+        SandboxMount("--ro-bind", "/etc/ssl/certs", "/etc/ssl/certs"),
+        SandboxMount("--ro-bind", str(Path("/etc/resolv.conf").resolve()), "/etc/resolv.conf"),
+        SandboxMount("--ro-bind", "/etc/hosts", "/etc/hosts"),
+        SandboxMount("--ro-bind", "/etc/nsswitch.conf", "/etc/nsswitch.conf"),
+        SandboxMount("--dev", None, "/dev"),
+        SandboxMount("--proc", None, "/proc"),
+        SandboxMount("--bind", str(scratch), "/tmp"),
+    ]
+    # Linked worktrees expose Git metadata, not the main checkout's files.
+    mounts.extend(SandboxMount("--bind", str(p), str(p)) for p in [*writable, cwd, *metadata])
+    mounts.extend(SandboxMount("--ro-bind", str(source), target) for source, target in read_only)
+    mounts.extend(SandboxMount("--bind" if m.write else "--ro-bind",
+                               str(m.source), str(m.destination)) for m in extra_mounts)
+    filesystem = SandboxFilesystem(cwd, mounts)
     args = [
         bwrap,
         "--unshare-all", "--share-net", "--die-with-parent", "--new-session",
         "--cap-drop", "ALL",
-        "--ro-bind", "/usr", "/usr",
-        "--ro-bind", "/bin", "/bin",
-        "--ro-bind", "/lib", "/lib",
-        "--ro-bind-try", "/lib64", "/lib64",
-        "--ro-bind", "/etc/ssl/certs", "/etc/ssl/certs",
-        "--ro-bind", str(Path("/etc/resolv.conf").resolve()), "/etc/resolv.conf",
-        "--ro-bind", "/etc/hosts", "/etc/hosts",
-        "--ro-bind", "/etc/nsswitch.conf", "/etc/nsswitch.conf",
-        "--dev", "/dev", "--proc", "/proc",
-        "--remount-ro", "/dev", "--remount-ro", "/proc",
-        "--bind", str(scratch), "/tmp",
     ]
-    for directory in writable:
-        args.extend(["--bind", str(directory), str(directory)])
-    args.extend(["--bind", str(cwd), str(cwd), "--chdir", str(cwd)])
-    # Linked worktrees keep their index/HEAD and common objects/refs outside
-    # cwd. Expose that metadata, not the main checkout or its other files.
-    for directory in metadata:
-        args.extend(["--bind", str(directory), str(directory)])
-    for source, target in read_only:
-        args.extend(["--ro-bind", str(source), target])
-    for mount in extra_mounts:
-        args.extend(["--bind" if mount.write else "--ro-bind",
-                     str(mount.source), str(mount.destination)])
-    args.extend(["--remount-ro", "/", "--clearenv"])
+    for mount in filesystem.mounts:
+        args.extend(mount.argv())
+    args.extend(["--chdir", str(filesystem.cwd), "--remount-ro", "/", "--clearenv"])
     try:
         user = pwd.getpwuid(os.getuid()).pw_name
     except KeyError:
@@ -166,7 +215,8 @@ def sandbox_command(
     }
     for name, value in env.items():
         args.extend(["--setenv", name, value])
-    return [*args, "--", *command]
+    suffix = command_suffix(filesystem) if command_suffix is not None else []
+    return [*args, "--", *command, *suffix]
 
 
 def _executable(name: str) -> Path:
@@ -179,7 +229,8 @@ def _executable(name: str) -> Path:
 
 
 def pi_sandbox_command(command: list[str], working_dir: str, *,
-                       sandbox_paths: list[dict[str, Any]] | None = None) -> list[str]:
+                       sandbox_paths: list[dict[str, Any]] | None = None,
+                       system_prompt: Callable[[SandboxFilesystem], str] | None = None) -> list[str]:
     """Pi installer/system runtime, config and explicit server extensions."""
     executable = _executable(command[0])
     bin_dir = executable.parent
@@ -219,6 +270,7 @@ def pi_sandbox_command(command: list[str], working_dir: str, *,
         inner, working_dir, read_only=read_only, writable=[config],
         environment={"PATH": f"{bin_dir}:/usr/bin:/bin"},
         sandbox_paths=sandbox_paths,
+        command_suffix=(lambda fs: ["--append-system-prompt", system_prompt(fs)]) if system_prompt else None,
     )
 
 
@@ -256,7 +308,8 @@ def _claude_config() -> Path:
 
 
 def claude_sandbox_command(command: list[str], working_dir: str, *,
-                           sandbox_paths: list[dict[str, Any]] | None = None) -> list[str]:
+                           sandbox_paths: list[dict[str, Any]] | None = None,
+                           system_prompt: Callable[[SandboxFilesystem], str] | None = None) -> list[str]:
     """Claude native binary or npm Node launcher, with persistent config."""
     launcher = _executable(command[0])
     executable = launcher.resolve(strict=True)
@@ -291,6 +344,7 @@ def claude_sandbox_command(command: list[str], working_dir: str, *,
         [str(executable), *command[1:]], working_dir,
         read_only=read_only, writable=[config],
         sandbox_paths=sandbox_paths,
+        command_suffix=(lambda fs: ["--append-system-prompt", system_prompt(fs)]) if system_prompt else None,
         environment={
             "PATH": path,
             "CLAUDE_CONFIG_DIR": str(config),

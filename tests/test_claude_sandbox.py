@@ -11,6 +11,8 @@ from pathlib import Path
 from unittest import mock
 
 from agent_ui_server.agent import ClaudeCodeAdapter
+from agent_ui_server.host_tools import sandbox_guidance
+from agent_ui_server.sandbox_paths import merge_paths
 from agent_ui_server.sandbox import claude_sandbox_command
 from test_sandbox import bubblewrap_unavailable
 
@@ -69,6 +71,72 @@ class ClaudeSandboxTests(unittest.TestCase):
         self.assertNotIn("UNRELATED_SECRET", env)
         self.assertIn("--clearenv", command)
         self.assertIn("--die-with-parent", command)
+
+    def test_prompt_uses_the_same_resolved_mounts_as_bubblewrap(self):
+        readonly = self.home / 'settings"\nfile'
+        readonly.write_text("settings")
+        alias = self.home / "settings-link"
+        alias.symlink_to(readonly)
+        writable = self.home / "shared-data"
+        writable.mkdir()
+        profile = self.home / "custom-claude-profile"
+        # A linked worktree exposes metadata, not the main checkout itself.
+        common = self.home / "main-checkout/.git"
+        gitdir = common / "worktrees/linked"
+        gitdir.mkdir(parents=True)
+        (gitdir / "HEAD").write_text("ref: refs/heads/test\n")
+        (gitdir / "commondir").write_text("../..\n")
+        (common / "objects").mkdir()
+        (common / "refs").mkdir()
+        linked = self.home / "linked-worktree"
+        linked.mkdir()
+        (linked / ".git").write_text(f"gitdir: {gitdir}\n")
+        cwd_alias = self.home / "worktree-alias"
+        cwd_alias.symlink_to(linked, target_is_directory=True)
+
+        for cwd in (self.cwd, cwd_alias):
+            for write in (False, True):
+                paths = merge_paths(
+                    [{"path": str(alias)}, {"path": str(writable)}],
+                    [{"path": str(writable), "write": write}],
+                )
+                seen = []
+
+                def prompt(filesystem):
+                    seen.append(filesystem)
+                    return sandbox_guidance(filesystem)
+
+                with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(profile)}), mock.patch(
+                    "agent_ui_server.sandbox.shutil.which",
+                    side_effect=lambda p: "/usr/bin/bwrap" if p == "bwrap" else p,
+                ):
+                    command = claude_sandbox_command(
+                        [str(self.launcher), "-p"], str(cwd),
+                        sandbox_paths=paths, system_prompt=prompt,
+                    )
+                self.assertEqual(len(seen), 1)
+                filesystem = seen[0]
+                self.assertEqual(filesystem.cwd, cwd.resolve())
+                text = command[command.index("--append-system-prompt") + 1]
+                self.assertEqual(text, sandbox_guidance(filesystem))
+                self.assertIn(f"Working directory: {json.dumps(str(cwd.resolve()))}", text)
+                writable_text, readonly_text = text.split("Read-only mounts:", 1)
+                for mount in filesystem.mounts:
+                    # Each planned mount supplies both argv and the matching prompt section.
+                    argv = mount.argv()
+                    self.assertTrue(any(command[i:i + len(argv)] == argv for i in range(len(command))))
+                    section = writable_text if mount.option == "--bind" else readonly_text
+                    self.assertIn(f"- {json.dumps(mount.destination)}", section)
+                self.assertIn(f"- {json.dumps(str(profile))}", writable_text)
+                self.assertIn(f"- {json.dumps(str(self.binary))}", readonly_text)
+                self.assertIn(f"server source: {json.dumps(str(readonly))}", readonly_text)
+                self.assertIn(f"server source: {json.dumps(str(self.scratch))}", writable_text)
+                self.assertIn("only if present on the server", readonly_text)
+                self.assertIn("ordinary filesystem permissions still apply", text)
+                if cwd == cwd_alias:
+                    self.assertIn(f"- {json.dumps(str(common))}", writable_text)
+                    self.assertNotIn(f"- {json.dumps(str(common.parent))}\n", text)
+                    self.assertNotIn(f"- {json.dumps(str(self.cwd))}\n", text)
 
     def test_default_global_config_import_is_private_and_not_repeated(self):
         original = self.home / ".claude.json"
