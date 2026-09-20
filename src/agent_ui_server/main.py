@@ -23,6 +23,7 @@ from .file_tree import (
     receive_disconnect,
 )
 from .sandbox_paths import merge_paths, validate_paths
+from .usage import collect_usage
 
 SCROLLBACK_REPLAY_LIMIT = 200
 WEBSOCKET_LIVE_QUEUE_CAPACITY = 256
@@ -222,6 +223,17 @@ async def list_agents() -> list[dict[str, Any]]:
         }
         for agent_id, adapter in adapters.items()
     ]
+
+
+@app.get("/usage")
+async def get_usage() -> dict[str, Any]:
+    """Five-hour and weekly consumption for each subscription, as percentages.
+
+    Subscriptions are reported independently: one that is unauthenticated or
+    unreachable carries an `error` and null windows rather than failing the
+    request, so a user who has only authenticated one of them still sees it.
+    """
+    return await collect_usage()
 
 
 @app.get("/sandbox-paths")

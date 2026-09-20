@@ -93,6 +93,7 @@ src/agent_ui_server/
 ├── tool_actions.py   # provider-specific action projections
 ├── pi_extension.ts   # Pi approval gate and AskUserQuestion tool
 ├── pi_web_search/    # vendored pi-web-search; Pi's web_search and url_context
+├── usage.py          # subscription usage percentages from Claude and Codex
 ├── db.py             # SQLite schema, migrations, transcript storage
 ├── file_tree.py      # snapshots, patches, ignore rules, inotify lifecycle
 ├── git.py            # bounded Git worktree operations
@@ -215,6 +216,7 @@ FastAPI also exposes generated OpenAPI documentation at `/docs`.
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/agents` | List registered agent adapters for a picker |
+| `GET` | `/usage` | Five-hour and weekly consumption for each subscription |
 | `GET` | `/sandbox-paths` | Read server-wide sandbox path defaults |
 | `PATCH` | `/sandbox-paths` | Replace server-wide sandbox path defaults |
 | `GET` | `/projects` | List projects and live/archive session aggregates |
@@ -264,6 +266,47 @@ alias for `project_path`.
 Only one agent turn may run per session. A direct shell command has a separate
 slot and may run while the agent is running or awaiting approval. Starting new
 work in an archived session or project is rejected.
+
+### Subscription usage
+
+`GET /usage` reports how much of each plan's five-hour and weekly quota has
+been consumed. A subscription is not a harness — the Codex plan is read from
+Pi's credential file here, but the same plan can back any client — so the two
+keys name plans rather than adapters:
+
+```json
+{
+  "claude_code": {
+    "five_hour": {"used_percent": 23.0, "reset_at": 1789933800},
+    "weekly": {"used_percent": 12.0, "reset_at": 1790218800},
+    "error": null
+  },
+  "codex": {
+    "five_hour": {"used_percent": 6.0, "reset_at": 1789936104},
+    "weekly": {"used_percent": 51.0, "reset_at": 1790415517},
+    "error": null
+  }
+}
+```
+
+`used_percent` is the share of the window already spent, and `reset_at` is Unix
+seconds — Anthropic reports an ISO-8601 instant and OpenAI a Unix timestamp, so
+the former is converted. Codex's five-hour window is rolling: until the first
+request of a window its reset is simply five hours out, and it firms up once
+usage starts.
+
+Both keys are always present. A plan that is unauthenticated or unreachable
+reports null windows and a reason in `error` instead of failing the request, so
+authenticating only one of the two still yields a useful response:
+
+```json
+{"codex": {"five_hour": null, "weekly": null, "error": "not authenticated"}}
+```
+
+Access tokens are read from `~/.claude/.credentials.json` and
+`~/.pi/agent/auth.json` and used as they are. The server never refreshes them:
+Claude Code rewrites its own credential file when it refreshes, and a second
+writer would race it. An expired token surfaces as `"error": "HTTP 401"`.
 
 ### Additional sandbox paths
 
