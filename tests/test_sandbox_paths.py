@@ -234,12 +234,14 @@ class SandboxPathsAPITests(PathFixture, unittest.IsolatedAsyncioTestCase):
     async def test_adapter_forwarding_and_disabled_bypass(self):
         for adapter, wrapper in ((PiAdapter(executable="pi"), "pi_sandbox_command"),
                                  (ClaudeCodeAdapter(executable="claude"), "claude_sandbox_command")):
-            session = {"id": 123, "working_dir": str(self.work), "sandbox_paths": [self.entry()]}
+            session = {"id": 123, "working_dir": str(self.work), "sandbox_paths": [self.entry()],
+                       "git_repository": str(self.work)}
             with mock.patch(f"agent_ui_server.agent.{wrapper}", side_effect=ValueError("unsafe")) as wrap, mock.patch(
                 "agent_ui_server.agent.asyncio.create_subprocess_exec", side_effect=FileNotFoundError("fixture")
             ) as spawn:
                 events = [event async for event in adapter.start_turn(session, "test")]
                 self.assertEqual(wrap.call_args.kwargs["sandbox_paths"], [self.entry()])
+                self.assertEqual(wrap.call_args.kwargs["git_repository"], str(self.work))
                 spawn.assert_not_called()
                 self.assertIn("unsafe", events[0]["message"])
                 wrap.reset_mock()
@@ -269,11 +271,12 @@ class SandboxPathsAPITests(PathFixture, unittest.IsolatedAsyncioTestCase):
         await self.project_settings(sandbox_paths=[self.entry()])
         session = self.database.create_session("test", self.project["id"], agent="pi")
         started, release = asyncio.Event(), asyncio.Event()
-        snapshots = []
+        snapshots, repositories = [], []
 
         class Adapter:
             async def start_turn(adapter, session, prompt):
                 snapshots.append(session["sandbox_paths"])
+                repositories.append(session["git_repository"])
                 started.set()
                 await release.wait()
                 if False:
@@ -290,6 +293,8 @@ class SandboxPathsAPITests(PathFixture, unittest.IsolatedAsyncioTestCase):
                 await task
             await self.main.run_turn(session["id"], "second")
         self.assertEqual(snapshots, [[self.entry()], [self.entry(True)]])
+        # Taken from the project row, not from anything in the working tree.
+        self.assertEqual(repositories, [str(self.work)] * 2)
         other = self.database.create_project(str(self.root / "other"), "other")
         await self.project_settings(sandbox_paths=[self.entry()])
         self.assertEqual(self.database.sandbox_paths_snapshot(other["id"]), ([self.entry(True)], []))

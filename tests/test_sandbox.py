@@ -189,6 +189,7 @@ class SandboxCommandTests(unittest.TestCase):
         self.web.write_text("// web")
         self.scratch = self.root / "scratch"
         self.scratch.mkdir()
+        self.repository = None
         self.command = [str(self.bin / "pi"), "--mode", "rpc", "-e", str(self.gate),
                         "--no-extensions", "-e", str(self.web), "--session", "resume-id"]
         for patch in (
@@ -200,7 +201,7 @@ class SandboxCommandTests(unittest.TestCase):
             self.addCleanup(patch.stop)
 
     def build(self):
-        return pi_sandbox_command(self.command, str(self.cwd))
+        return pi_sandbox_command(self.command, str(self.cwd), git_repository=self.repository)
 
     def test_mounts_environment_and_resume_argv(self):
         with mock.patch("agent_ui_server.sandbox.shutil.which", side_effect=lambda p: "/usr/bin/bwrap" if p == "bwrap" else p):
@@ -367,6 +368,7 @@ Local:
         self.git("-C", str(repo), "commit", "-m", "initial")
         self.git("-C", str(repo), "worktree", "add", "-b", "sandbox-test", str(self.cwd))
         (repo / "private-source").write_text("not available to the worktree")
+        self.repository = str(repo)
         return repo
 
     def git(self, *args):
@@ -402,43 +404,87 @@ Local:
     @unittest.skipUnless(shutil.which("git"), "Git not installed")
     def test_ordinary_repository_needs_no_extra_mount(self):
         self.git("init", str(self.cwd))
-        self.assertEqual(git_metadata_directories(self.cwd, self.home), [])
+        self.assertEqual(git_metadata_directories(self.cwd, self.home, self.cwd), [])
+
+    def fake_repository(self, root):
+        """A minimal .git directory Git would accept as a common dir."""
+        (root / ".git" / "objects").mkdir(parents=True)
+        (root / ".git" / "refs").mkdir()
+        (root / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+        return root
+
+    def link_worktree(self, repo, name="wt"):
+        git_dir = repo / ".git" / "worktrees" / name
+        git_dir.mkdir(parents=True)
+        (git_dir / "HEAD").write_text("ref: refs/heads/main\n")
+        (git_dir / "commondir").write_text("../..\n")
+        (self.cwd / ".git").write_text(f"gitdir: {git_dir}\n")
+        return git_dir
+
+    def test_project_worktree_mounts_common_metadata(self):
+        repo = self.fake_repository(self.root / "repo")
+        self.link_worktree(repo)
+        self.assertEqual(
+            git_metadata_directories(self.cwd, self.home, repo), [repo / ".git"]
+        )
 
     def test_invalid_gitfile_and_missing_metadata_fail_closed(self):
+        repo = self.fake_repository(self.root / "repo")
         for contents in ("not a gitfile\n", "gitdir: \n", "gitdir: /missing/repo\n"):
             with self.subTest(contents=contents):
                 (self.cwd / ".git").write_text(contents)
                 with self.assertRaises(ValueError):
-                    git_metadata_directories(self.cwd, self.home)
+                    git_metadata_directories(self.cwd, self.home, repo)
 
-    def test_separate_worktree_and_common_metadata_are_both_mounted(self):
-        git_dir = self.home / "worktree-metadata"
-        common_dir = self.home / "common-metadata"
-        git_dir.mkdir()
-        (git_dir / "HEAD").write_text("ref: refs/heads/main\n")
-        (git_dir / "commondir").write_text("../common-metadata\n")
-        (common_dir / "objects").mkdir(parents=True)
-        (common_dir / "refs").mkdir()
-        (self.cwd / ".git").write_text("gitdir: ../worktree-metadata\n")
-        self.assertEqual(
-            git_metadata_directories(self.cwd, self.home), [common_dir, git_dir]
-        )
-        (git_dir / "commondir").write_text("")
-        with self.assertRaisesRegex(ValueError, "Invalid Git metadata pointer"):
-            git_metadata_directories(self.cwd, self.home)
+    def test_gitfile_cannot_redirect_to_another_repository(self):
+        repo = self.fake_repository(self.root / "repo")
+        other = self.fake_repository(self.root / "other")
+        # The agent swaps the gitfile for one naming a fake gitdir it created
+        # in its own tree, whose commondir names another repository's .git.
+        fake = self.cwd / "fake-gitdir"
+        fake.mkdir()
+        (fake / "HEAD").write_text("ref: refs/heads/main\n")
+        (fake / "commondir").write_text(f"{other / '.git'}\n")
+        (self.cwd / ".git").write_text(f"gitdir: {fake}\n")
+        with self.assertRaisesRegex(ValueError, "not the project's repository"):
+            git_metadata_directories(self.cwd, self.home, repo)
+        # Pointing straight at another repository's worktree fails the same way.
+        (self.cwd / ".git").unlink()
+        self.link_worktree(other)
+        with self.assertRaisesRegex(ValueError, "not the project's repository"):
+            git_metadata_directories(self.cwd, self.home, repo)
+
+    def test_gitdir_must_be_a_worktree_of_the_project(self):
+        repo = self.fake_repository(self.root / "repo")
+        # The project's own .git is a valid gitdir, but not a linked worktree's.
+        (self.cwd / ".git").write_text(f"gitdir: {repo / '.git'}\n")
+        with self.assertRaisesRegex(ValueError, "not the project's repository"):
+            git_metadata_directories(self.cwd, self.home, repo)
+
+    def test_no_trusted_repository_mounts_nothing(self):
+        other = self.fake_repository(self.root / "other")
+        self.link_worktree(other)
+        self.assertEqual(git_metadata_directories(self.cwd, self.home, None), [])
+        # A project that is itself a linked worktree has no .git directory.
+        linked = self.root / "linked"
+        linked.mkdir()
+        (linked / ".git").write_text("gitdir: elsewhere\n")
+        self.assertEqual(git_metadata_directories(self.cwd, self.home, linked), [])
 
     def test_oversized_git_pointer_is_rejected(self):
+        repo = self.fake_repository(self.root / "repo")
         (self.cwd / ".git").write_text("gitdir: " + "a" * 8192)
         with self.assertRaisesRegex(ValueError, "Invalid Git metadata pointer"):
-            git_metadata_directories(self.cwd, self.home)
+            git_metadata_directories(self.cwd, self.home, repo)
 
     def test_git_metadata_cannot_expose_home(self):
+        repo = self.fake_repository(self.root / "repo")
         (self.home / "HEAD").write_text("ref: refs/heads/main\n")
         (self.home / "objects").mkdir()
         (self.home / "refs").mkdir()
         (self.cwd / ".git").write_text(f"gitdir: {self.home}\n")
-        with self.assertRaisesRegex(ValueError, "must not expose home"):
-            git_metadata_directories(self.cwd, self.home)
+        with self.assertRaises(ValueError):
+            git_metadata_directories(self.cwd, self.home, repo)
 
     @unittest.skipUnless(shutil.which("git") and shutil.which("bwrap"), "Git/Bubblewrap not installed")
     def test_real_sandbox_worktree_can_commit_without_exposing_main_checkout(self):

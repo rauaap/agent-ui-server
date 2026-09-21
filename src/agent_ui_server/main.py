@@ -1080,6 +1080,11 @@ async def run_turn(session_id: int, prompt: str) -> None:
         if session.get("sandbox", True):
             defaults, project_paths = db.sandbox_paths_snapshot(session["project_id"])
             session["sandbox_paths"] = merge_paths(defaults, project_paths)
+            # The worktree's gitfile is agent-writable, so the repository its
+            # metadata may come from is taken from the database instead.
+            project = db.get_project_by_id(session["project_id"])
+            if project is not None:
+                session["git_repository"] = project["path"]
         async for event in adapter.start_turn(session, prompt):
             event_type = event.get("type")
 

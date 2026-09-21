@@ -154,18 +154,28 @@ def prepare_scratch() -> Path:
     return scratch
 
 
-def git_metadata_directories(cwd: Path, home: Path) -> list[Path]:
+def git_metadata_directories(cwd: Path, home: Path, repository: Path | None) -> list[Path]:
     """Extra mounts for a worktree's gitfile and shared repository metadata.
 
     Read Git's gitfile/commondir pointers rather than running Git on the host:
     discovery must not inherit GIT_DIR overrides or execute project code. Keep
     the original absolute paths (including symlink spellings), since the
     gitfile inside the sandbox still points at those paths.
+
+    The pointers are files an earlier turn could have rewritten, so they may
+    only lead to `repository`'s own .git, where `repository` is the session's
+    project as recorded by the server. Anything else would let the agent name
+    any repository on the host and have it mounted writable.
     """
     gitfile = cwd / ".git"
     if not gitfile.is_file():
         # Ordinary repositories already have their .git directory inside cwd.
         return []
+    if repository is None or not (repository / ".git").is_dir():
+        # A project that is itself a linked worktree or submodule has no .git
+        # directory to check the pointers against, so nothing is mounted.
+        return []
+    expected = (repository / ".git").resolve(strict=True)
 
     def read_path(path: Path, prefix: str = "") -> Path:
         # These are project-controlled files, not arbitrary-size text inputs.
@@ -185,6 +195,9 @@ def git_metadata_directories(cwd: Path, home: Path) -> list[Path]:
         and (common_dir / "refs").is_dir()
     ):
         raise ValueError(f"Invalid Git metadata directory: {git_dir}")
+    # A linked worktree's gitdir is always <common>/worktrees/<name>.
+    if common_dir.resolve() != expected or git_dir.resolve().parent != expected / "worktrees":
+        raise ValueError(f"Git metadata for {cwd} is not the project's repository")
 
     directories: list[Path] = []
     for directory in (common_dir, git_dir):
@@ -264,11 +277,14 @@ def sandbox_command(
     environment: dict[str, str],
     sandbox_paths: list[dict[str, Any]] | None = None,
     command_suffix: Callable[[SandboxFilesystem], list[str]] | None = None,
+    git_repository: str | None = None,
 ) -> list[str]:
     """Common filesystem, namespace, scratch, Git, and environment policy.
 
     Adapters supply only their runtime/resources, config directories, and
     explicit environment additions. No inherited environment is forwarded.
+    `git_repository` is the session's project path, the only repository whose
+    shared metadata a linked worktree may mount.
     """
     bwrap = shutil.which("bwrap")
     if not bwrap:
@@ -283,7 +299,9 @@ def sandbox_command(
         if home.is_relative_to(source.resolve()):
             raise ValueError("Sandbox mount must not expose the home directory")
 
-    metadata = git_metadata_directories(cwd, home)
+    metadata = git_metadata_directories(
+        cwd, home, Path(git_repository) if git_repository else None
+    )
     extra_mounts = validate_paths(sandbox_paths or [])
     builtins = [(p.resolve(), p) for p in [*writable, cwd, *metadata]]
     builtins.extend((source.resolve(), Path(target)) for source, target in read_only)
@@ -355,6 +373,7 @@ def _executable(name: str) -> Path:
 
 def pi_sandbox_command(command: list[str], working_dir: str, *,
                        sandbox_paths: list[dict[str, Any]] | None = None,
+                       git_repository: str | None = None,
                        system_prompt: Callable[[SandboxFilesystem], str] | None = None) -> list[str]:
     """Pi installer/system runtime, config and explicit server extensions."""
     executable = _executable(command[0])
@@ -394,7 +413,7 @@ def pi_sandbox_command(command: list[str], working_dir: str, *,
     return sandbox_command(
         inner, working_dir, read_only=read_only, writable=[config],
         environment={"PATH": f"{bin_dir}:/usr/bin:/bin"},
-        sandbox_paths=sandbox_paths,
+        sandbox_paths=sandbox_paths, git_repository=git_repository,
         command_suffix=(lambda fs: ["--append-system-prompt", system_prompt(fs)]) if system_prompt else None,
     )
 
@@ -434,6 +453,7 @@ def _claude_config() -> Path:
 
 def claude_sandbox_command(command: list[str], working_dir: str, *,
                            sandbox_paths: list[dict[str, Any]] | None = None,
+                           git_repository: str | None = None,
                            system_prompt: Callable[[SandboxFilesystem], str] | None = None) -> list[str]:
     """Claude native binary or npm Node launcher, with persistent config."""
     launcher = _executable(command[0])
@@ -468,7 +488,7 @@ def claude_sandbox_command(command: list[str], working_dir: str, *,
     return sandbox_command(
         [str(executable), *command[1:]], working_dir,
         read_only=read_only, writable=[config],
-        sandbox_paths=sandbox_paths,
+        sandbox_paths=sandbox_paths, git_repository=git_repository,
         command_suffix=(lambda fs: ["--append-system-prompt", system_prompt(fs)]) if system_prompt else None,
         environment={
             "PATH": path,

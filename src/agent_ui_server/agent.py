@@ -346,6 +346,7 @@ class ClaudeCodeAdapter(AgentAdapter):
                     command, session["working_dir"],
                     **({"system_prompt": sandbox_guidance} if host_enabled else {}),
                     **({"sandbox_paths": session["sandbox_paths"]} if session.get("sandbox_paths") else {}),
+                    **({"git_repository": session["git_repository"]} if session.get("git_repository") else {}),
                 )
                 env = {}
             else:
@@ -984,6 +985,7 @@ class PiAdapter(AgentAdapter):
                     command, session["working_dir"],
                     **({"system_prompt": pi_sandbox_guidance} if host_enabled else {}),
                     **({"sandbox_paths": session["sandbox_paths"]} if session.get("sandbox_paths") else {}),
+                    **({"git_repository": session["git_repository"]} if session.get("git_repository") else {}),
                 )
                 # Clear bwrap's own environment too, not just its child's.
                 env = {}

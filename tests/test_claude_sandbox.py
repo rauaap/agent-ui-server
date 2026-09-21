@@ -116,6 +116,7 @@ class ClaudeSandboxTests(unittest.TestCase):
                     command = claude_sandbox_command(
                         [str(self.launcher), "-p"], str(cwd),
                         sandbox_paths=paths, system_prompt=prompt,
+                        git_repository=str(common.parent),
                     )
                 self.assertEqual(len(seen), 1)
                 filesystem = seen[0]
