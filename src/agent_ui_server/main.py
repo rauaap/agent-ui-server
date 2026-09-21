@@ -59,17 +59,22 @@ def load_auth_token() -> None:
         )
 
 
+WEB_ROOT_MOUNT = "web"
+
+
 def is_web_root_request(scope: Scope) -> bool:
-    """Whether no API route claims this request, leaving it to the web root.
+    """Whether the router would serve this request from the web root.
 
     The desktop client's files must load before it can ask for the token, and
-    they are the client's public source, not data, so they need none.
+    they are the client's public source, not data, so they need none. This
+    mirrors Starlette's dispatch, where the first full match wins, so only the
+    web root's own requests are exempt: never another route or mount, and
+    nothing at all without WEB_ROOT.
     """
-    return not any(
-        route.matches(scope)[0] is not Match.NONE
-        for route in app.router.routes
-        if not isinstance(route, Mount)
-    )
+    for route in app.router.routes:
+        if route.matches(scope)[0] is Match.FULL:
+            return isinstance(route, Mount) and route.name == WEB_ROOT_MOUNT
+    return False
 
 
 app.add_middleware(
@@ -1662,7 +1667,7 @@ def mount_web_root(app: FastAPI) -> None:
     if not os.path.isdir(web_root):
         # A typo here would otherwise surface as 404s on every page load.
         raise RuntimeError(f"WEB_ROOT is not a directory: {web_root}")
-    app.mount("/", StaticFiles(directory=web_root, html=True), name="web")
+    app.mount("/", StaticFiles(directory=web_root, html=True), name=WEB_ROOT_MOUNT)
 
 
 mount_web_root(app)

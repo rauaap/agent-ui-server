@@ -366,17 +366,35 @@ class AppWiringTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(sent, REFUSED)
 
-    async def test_api_routes_need_a_token_and_the_web_root_does_not(self) -> None:
+    async def test_only_the_web_root_mount_is_public(self) -> None:
+        from starlette.routing import Mount
+
         from agent_ui_server import main
 
-        for path, public in (
-            ("/agents", False),
-            ("/sessions/1/bash", False),
-            ("/docs", False),
-            ("/", True),
-            ("/assets/app.js", True),
-        ):
-            with self.subTest(path=path):
-                self.assertEqual(
-                    main.is_web_root_request(scope("http", {}, path=path)), public
-                )
+        def public(path: str) -> bool:
+            return main.is_web_root_request(scope("http", {}, path=path))
+
+        # Without WEB_ROOT nothing is public, not even unknown paths.
+        for path in ("/", "/index.html", "/agents", "/docs"):
+            with self.subTest(web_root=False, path=path):
+                self.assertFalse(public(path))
+
+        # Another mount, registered before the web root as main.py would.
+        other = Mount("/admin", app=_noop, name="admin")
+        web = Mount("/", app=_noop, name=main.WEB_ROOT_MOUNT)
+        routes = [*main.app.router.routes, other, web]
+        with mock.patch.object(main.app.router, "routes", routes):
+            for path, expected in (
+                ("/", True),
+                ("/js/app.js", True),
+                ("/agents", False),
+                ("/docs", False),
+                ("/admin/", False),
+                ("/admin/secrets", False),
+                # Starlette gives a method mismatch (only PATCH/DELETE exist
+                # here) to a later full match, so the web root serves it: a
+                # static 404 that never reaches the API.
+                ("/sessions/1", True),
+            ):
+                with self.subTest(web_root=True, path=path):
+                    self.assertEqual(public(path), expected)
