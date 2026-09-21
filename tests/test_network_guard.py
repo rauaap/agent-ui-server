@@ -66,6 +66,10 @@ async def run(
 REFUSED = [{"type": "websocket.close", "code": 1008}]
 
 
+async def _noop() -> None:
+    pass
+
+
 class WebSocketOriginTests(unittest.IsolatedAsyncioTestCase):
     async def assert_websocket(self, headers: dict[str, str], allowed: bool) -> None:
         reached, sent = await run("websocket", {**AUTH, **headers})
@@ -205,6 +209,27 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         reached, sent = await run("http", {"host": "10.0.0.1:8000"}, query=f"token={TOKEN}")
         self.assertIsNone(reached)
         self.assertEqual(sent[0]["status"], 401)
+
+    async def test_query_token_is_stripped_from_every_request(self) -> None:
+        # uvicorn logs the query string of refused and accepted requests alike.
+        for headers, public in (
+            ({"host": "10.0.0.1:8000"}, False),  # refused with 401
+            ({"host": "attacker.example"}, False),  # refused with 400
+            ({**AUTH, "host": "10.0.0.1:8000"}, False),  # accepted
+            ({"host": "10.0.0.1:8000"}, True),  # static file
+        ):
+            with self.subTest(headers=headers, public=public):
+                request = scope("http", headers, query=f"a=1&token={TOKEN}")
+                guard = NetworkGuardMiddleware(
+                    lambda scope, receive, send: _noop(), allowed_hosts=ALLOWED,
+                    port=8000, token=lambda: TOKEN, is_public=lambda scope: public,
+                )
+
+                async def send(message: dict) -> None:
+                    pass
+
+                await guard(request, None, send)
+                self.assertEqual(request["query_string"], b"a=1")
 
     async def test_public_request_needs_no_token_but_still_a_valid_host(self) -> None:
         reached, _ = await run("http", {"host": "10.0.0.1:8000"}, public=True)

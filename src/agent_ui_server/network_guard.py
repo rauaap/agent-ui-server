@@ -9,8 +9,8 @@ checks cover that:
   in a file the server generates on first start (see `token_path`), as
   `Authorization: Bearer <token>`. Browsers cannot set headers on a
   WebSocket, so a handshake may pass it as `?token=` instead; it is removed
-  from the query string before anything downstream (including the access log)
-  sees it. Only the desktop client's static files are served without it, so
+  from the query string of every request, WebSocket or not, before anything
+  downstream (including the access log) sees it. Only the desktop client's static files are served without it, so
   the client can load and ask for the token.
 
 - Host: a DNS-rebinding page reaches this server under the attacker's
@@ -135,7 +135,7 @@ def split_netloc(netloc: str) -> tuple[str | None, int | None]:
 
 
 def take_query_token(scope: Scope) -> str | None:
-    """Remove the token from a WebSocket's query string and return it.
+    """Remove the token from a request's query string and return it.
 
     The scope is edited in place so neither the endpoint nor uvicorn's access
     log, which prints the path with its query string, ever sees the token.
@@ -191,14 +191,13 @@ class NetworkGuardMiddleware:
             and port == self.port
         )
 
-    def authorized(self, scope: Scope, headers: Headers) -> bool:
+    def authorized(self, scope: Scope, headers: Headers, query_token: str | None) -> bool:
         presented = None
         scheme, _, value = headers.get("authorization", "").partition(" ")
         if scheme.lower() == "bearer" and value.strip():
             presented = value.strip()
+        # Only browsers' WebSockets need the query form; REST must use the header.
         if scope["type"] == "websocket":
-            # Always strip it, even when a header was also sent.
-            query_token = take_query_token(scope)
             presented = presented or query_token
         token = self.token()
         if token is None or presented is None:
@@ -210,13 +209,16 @@ class NetworkGuardMiddleware:
             await self.app(scope, receive, send)
             return
 
+        # Strip a query token before any check can refuse and log the request,
+        # including a REST request that wrongly sends it there.
+        query_token = take_query_token(scope)
         headers = Headers(scope=scope)
         if scope["type"] == "http":
             if not self.host_allowed(headers):
                 response = PlainTextResponse("Invalid host header", status_code=400)
                 await response(scope, receive, send)
                 return
-            if not self.is_public(scope) and not self.authorized(scope, headers):
+            if not self.is_public(scope) and not self.authorized(scope, headers, query_token):
                 response = PlainTextResponse(
                     "Missing or invalid token",
                     status_code=401,
@@ -224,12 +226,10 @@ class NetworkGuardMiddleware:
                 )
                 await response(scope, receive, send)
                 return
-        # Authorize first: it strips a query token, which must happen even
-        # when another check refuses the handshake and it is logged.
         elif not (
-            self.authorized(scope, headers)
-            and self.host_allowed(headers)
+            self.host_allowed(headers)
             and self.origin_allowed(headers)
+            and self.authorized(scope, headers, query_token)
         ):
             # Closing before accept makes the server refuse the handshake with
             # HTTP 403, so the endpoint never runs.
