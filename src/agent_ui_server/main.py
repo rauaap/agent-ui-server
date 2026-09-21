@@ -11,17 +11,24 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator, model_validator
+from starlette.routing import Match, Mount
+from starlette.types import Scope
 
 from . import git, shell
 from .actions import auto_approval_setting
 from .agent import AgentAdapter, ClaudeCodeAdapter, PiAdapter
 from .db import Database
-from .network_guard import NetworkGuardMiddleware, allowed_hosts_from_env
 from .file_tree import (
     FileTreeError,
     file_tree_manager,
     normalize_root,
     receive_disconnect,
+)
+from .network_guard import (
+    NetworkGuardMiddleware,
+    allowed_hosts_from_env,
+    load_or_create_token,
+    token_path,
 )
 from .sandbox_paths import merge_paths, validate_paths
 from .usage import collect_usage
@@ -32,10 +39,45 @@ WEBSOCKET_SEND_TIMEOUT_SECONDS = 30.0
 WEBSOCKET_CLOSE_TIMEOUT_SECONDS = 5.0
 
 app = FastAPI(title="agent-ui-server")
+# Loaded at startup; until then every authenticated request is refused.
+auth_token: str | None = None
+
+
+def load_auth_token() -> None:
+    """Read the token file, generating it on first start. Idempotent."""
+    global auth_token
+    if auth_token is not None:
+        return
+    path = token_path()
+    auth_token, created = load_or_create_token(path)
+    if created:
+        # The path, never the token: this output may end up in a journal.
+        print(
+            f"Generated a new auth token in {path}. "
+            f"Enter it in each client's settings; `cat {path}` shows it.",
+            flush=True,
+        )
+
+
+def is_web_root_request(scope: Scope) -> bool:
+    """Whether no API route claims this request, leaving it to the web root.
+
+    The desktop client's files must load before it can ask for the token, and
+    they are the client's public source, not data, so they need none.
+    """
+    return not any(
+        route.matches(scope)[0] is not Match.NONE
+        for route in app.router.routes
+        if not isinstance(route, Mount)
+    )
+
+
 app.add_middleware(
     NetworkGuardMiddleware,
     allowed_hosts=allowed_hosts_from_env(),
     port=int(os.environ.get("PORT", "8000")),
+    token=lambda: auth_token,
+    is_public=is_web_root_request,
 )
 db = Database(os.environ.get("SESSION_DB", "sessions.db"))
 adapters: dict[str, AgentAdapter] = {
@@ -193,6 +235,8 @@ class BashRequest(BaseModel):
 
 @app.on_event("startup")
 async def startup() -> None:
+    # Also covers launches that bypass main(), such as `uvicorn ...:app`.
+    load_auth_token()
     db.reset_active_sessions()
 
 
@@ -1627,6 +1671,10 @@ mount_web_root(app)
 def main() -> None:
     import uvicorn
 
+    try:
+        load_auth_token()
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"Cannot load the auth token: {exc}") from None
     # The service binds to the WireGuard interface in every deployment.
     uvicorn.run(
         app,

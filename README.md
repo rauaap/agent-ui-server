@@ -40,8 +40,7 @@ The API can also be exercised directly with tools such as `curl` and
 
 ### Non-goals
 
-- Multi-user accounts
-- Application-level authentication
+- Multi-user accounts, or authentication beyond one shared token
 - A terminal emulator or persistent interactive shell
 - A hardened multi-tenant or network security boundary
 
@@ -97,7 +96,7 @@ src/agent_ui_server/
 ├── db.py             # SQLite schema, migrations, transcript storage
 ├── file_tree.py      # snapshots, patches, ignore rules, inotify lifecycle
 ├── git.py            # bounded Git worktree operations
-├── network_guard.py  # Host and WebSocket Origin checks against web pages
+├── network_guard.py  # shared-token auth, Host and WebSocket Origin checks
 └── shell.py          # bounded one-shot bash execution
 
 tests/
@@ -109,15 +108,37 @@ tests/
 
 ## Security model
 
-There is **no application-level authentication**. The intended deployment binds
-uvicorn to a WireGuard interface and permits only trusted peers to reach it:
+The intended deployment binds uvicorn to a WireGuard interface and permits
+only trusted peers to reach it. On top of that, every client must present a
+shared token. The server generates it on first start in
+`~/.config/agent-ui-server/token` (mode `0600`; `AUTH_TOKEN_FILE` overrides the
+path) and prints where it is, never the token itself:
 
 ```sh
 WIREGUARD_IP=10.0.0.1 PORT=8000 uv run agent-ui-server
+cat ~/.config/agent-ui-server/token   # enter this in each client
 ```
 
-A browser on a peer device carries that network access into every page it
-opens, so the server also refuses requests a web page could forge:
+The token is a file rather than an environment variable because the server's
+environment is inherited by `!` commands, unsandboxed agents, and git, any of
+which could print it into a transcript. Sandboxed agents can't read the file,
+since no sandbox mount includes it. Don't add `~/.config` itself as a sandbox
+path. Unsandboxed agents and `!` commands run as the server user and can read
+it like any other file.
+
+The server refuses to start if the file is a symlink, belongs to another user,
+is readable by other users, or holds fewer than 32 characters.
+
+Clients send the token as `Authorization: Bearer <token>`. Browsers can't set
+headers on a WebSocket, so WebSockets also accept `?token=<token>`, which the
+server strips before the endpoint or access log sees it. Only the static web client
+under `WEB_ROOT` loads without the token. Enter the token once in each
+client's settings; see [docs/auth_client_handoff.md](docs/auth_client_handoff.md).
+To rotate it, delete the file, restart, and enter the new token in each
+client.
+
+A browser on a peer device carries the peer's network access into every page
+it opens, so the server also refuses requests a web page could forge:
 
 - Any request whose `Host` is not the bind address or a name in
   `ALLOWED_HOSTS` gets a 400. This blocks DNS rebinding.
@@ -128,8 +149,7 @@ opens, so the server also refuses requests a web page could forge:
   accepted.
 
 If you open the server by a hostname rather than its IP, add that name to
-`ALLOWED_HOSTS` or browsers will get 400/403. These checks keep web pages out;
-they do not authenticate peers.
+`ALLOWED_HOSTS` or browsers will get 400/403.
 
 Do not expose this service directly to the internet. In particular,
 `POST /sessions/{id}/bash` is intentional arbitrary command execution as the
@@ -165,6 +185,9 @@ uv sync
 WIREGUARD_IP=127.0.0.1 PORT=8000 uv run agent-ui-server
 ```
 
+On first start the server generates the client token; see
+[Security model](#security-model).
+
 You only need to install the agent CLI(s) you intend to use. For example, a
 Claude Code-only deployment does not need Pi installed. Note that `/agents`
 lists the adapters built into the server; it does not check whether each CLI is
@@ -177,7 +200,11 @@ The package also exposes `python -m agent_ui_server` and can be installed with
 
 ```sh
 docker compose up -d --build
+docker compose exec agent-ui-server cat /home/agent/.config/agent-ui-server/token
 ```
+
+The token file lives in the persistent `claude-auth` home volume, so it
+survives rebuilds.
 
 Authenticate the bundled agent CLIs after the first deployment:
 
@@ -207,6 +234,7 @@ to the API must use their paths *inside* the container, such as
 |---|---|---|
 | `WIREGUARD_IP` | `127.0.0.1` | Address uvicorn binds to |
 | `PORT` | `8000` | HTTP/WebSocket port |
+| `AUTH_TOKEN_FILE` | `~/.config/agent-ui-server/token` | Client token file, generated on first start |
 | `ALLOWED_HOSTS` | unset | Extra hostnames, comma-separated, accepted in `Host`/`Origin` besides `WIREGUARD_IP` |
 | `SESSION_DB` | `sessions.db` | SQLite database path |
 | `CLAUDE_BIN` | `claude` | Claude Code executable |
@@ -263,14 +291,21 @@ FastAPI also exposes generated OpenAPI documentation at `/docs`.
 ]
 ```
 
-Create a project before creating a session:
+Create a project before creating a session. Every request needs the token
+(see [Security model](#security-model)):
+
+```sh
+AUTH_TOKEN="$(cat ~/.config/agent-ui-server/token)"
+```
 
 ```sh
 curl -X POST http://127.0.0.1:8000/projects \
+  -H "authorization: Bearer $AUTH_TOKEN" \
   -H 'content-type: application/json' \
   -d '{"path":"/absolute/path/to/project","name":"my project"}'
 
 curl -X POST http://127.0.0.1:8000/sessions \
+  -H "authorization: Bearer $AUTH_TOKEN" \
   -H 'content-type: application/json' \
   -d '{"name":"refactor","project_path":"/absolute/path/to/project","agent":"pi"}'
 ```
@@ -440,7 +475,7 @@ Sessions expose a boolean `sandbox`, defaulting to `true` for both new and
 existing sessions. Set it on `POST /sessions` or change it between turns:
 
 ```sh
-curl -X PATCH http://127.0.0.1:8000/sessions/1 \
+curl -X PATCH http://127.0.0.1:8000/sessions/1 -H "authorization: Bearer $AUTH_TOKEN" \
   -H 'content-type: application/json' -d '{"sandbox":false}'
 ```
 
