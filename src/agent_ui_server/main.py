@@ -16,6 +16,7 @@ from . import git, shell
 from .actions import auto_approval_setting
 from .agent import AgentAdapter, ClaudeCodeAdapter, PiAdapter
 from .db import Database
+from .network_guard import NetworkGuardMiddleware, allowed_hosts_from_env
 from .file_tree import (
     FileTreeError,
     file_tree_manager,
@@ -31,7 +32,12 @@ WEBSOCKET_SEND_TIMEOUT_SECONDS = 30.0
 WEBSOCKET_CLOSE_TIMEOUT_SECONDS = 5.0
 
 app = FastAPI(title="agent-ui-server")
-db = Database(os.environ.get("SESSION_DB", "sessions.db"))
+app.add_middleware(
+    NetworkGuardMiddleware,
+    allowed_hosts=allowed_hosts_from_env(),
+    port=int(os.environ.get("PORT", "8000")),
+)
+db =Database(os.environ.get("SESSION_DB", "sessions.db"))
 adapters: dict[str, AgentAdapter] = {
     "claude-code": ClaudeCodeAdapter(),
     "pi": PiAdapter(),

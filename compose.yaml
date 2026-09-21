@@ -16,6 +16,7 @@ services:
     environment:
       - WIREGUARD_IP=${WIREGUARD_IP:-10.0.0.1}
       - PORT=${PORT:-8000}
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS:-}
       - WEB_ROOT=/web
     restart: unless-stopped
 

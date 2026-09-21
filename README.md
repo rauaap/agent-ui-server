@@ -97,6 +97,7 @@ src/agent_ui_server/
 ├── db.py             # SQLite schema, migrations, transcript storage
 ├── file_tree.py      # snapshots, patches, ignore rules, inotify lifecycle
 ├── git.py            # bounded Git worktree operations
+├── network_guard.py  # Host and WebSocket Origin checks against web pages
 └── shell.py          # bounded one-shot bash execution
 
 tests/
@@ -114,6 +115,21 @@ uvicorn to a WireGuard interface and permits only trusted peers to reach it:
 ```sh
 WIREGUARD_IP=10.0.0.1 PORT=8000 uv run agent-ui-server
 ```
+
+A browser on a peer device carries that network access into every page it
+opens, so the server also refuses requests a web page could forge:
+
+- Any request whose `Host` is not the bind address or a name in
+  `ALLOWED_HOSTS` gets a 400. This blocks DNS rebinding.
+- A WebSocket handshake whose `Origin` is present and is not
+  `http://<allowed host>:<PORT>` is refused with 403. WebSockets are exempt
+  from CORS, so without this any page could drive a session. Handshakes with
+  no `Origin` come from non-browser clients such as the Android app and are
+  accepted.
+
+If you open the server by a hostname rather than its IP, add that name to
+`ALLOWED_HOSTS` or browsers will get 400/403. These checks keep web pages out;
+they do not authenticate peers.
 
 Do not expose this service directly to the internet. In particular,
 `POST /sessions/{id}/bash` is intentional arbitrary command execution as the
@@ -191,6 +207,7 @@ to the API must use their paths *inside* the container, such as
 |---|---|---|
 | `WIREGUARD_IP` | `127.0.0.1` | Address uvicorn binds to |
 | `PORT` | `8000` | HTTP/WebSocket port |
+| `ALLOWED_HOSTS` | unset | Extra hostnames, comma-separated, accepted in `Host`/`Origin` besides `WIREGUARD_IP` |
 | `SESSION_DB` | `sessions.db` | SQLite database path |
 | `CLAUDE_BIN` | `claude` | Claude Code executable |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` in sandbox | Claude configuration, credentials, and session directory |
