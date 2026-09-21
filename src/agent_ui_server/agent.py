@@ -340,6 +340,7 @@ class ClaudeCodeAdapter(AgentAdapter):
         self.processes[session_id] = process
         stderr_task = asyncio.create_task(self._collect_stderr(process.stderr))
         result_seen = False
+        error_seen = False
         host = None
         if host_enabled:
             host = HostTools(process, session["working_dir"],
@@ -374,6 +375,8 @@ class ClaudeCodeAdapter(AgentAdapter):
                     process,
                     event,
                 ):
+                    if agent_event["type"] == "error":
+                        error_seen = True
                     if agent_event["type"] == "done":
                         result_seen = True
                         self._close_stdin(process)
@@ -381,13 +384,13 @@ class ClaudeCodeAdapter(AgentAdapter):
 
             returncode = await process.wait()
             stderr = await stderr_task
-            if returncode != 0:
+            if returncode != 0 and not error_seen:
                 detail = stderr.strip() or f"Claude Code exited with {returncode}"
                 yield {"type": "error", "message": detail}
-            elif not result_seen:
+            elif not result_seen and not error_seen:
                 yield {
-                    "type": "done",
-                    "session_id": session.get("agent_session_id"),
+                    "type": "error",
+                    "message": "Claude Code exited without a result event.",
                 }
         finally:
             if host is not None:
@@ -575,6 +578,13 @@ class ClaudeCodeAdapter(AgentAdapter):
             return
 
         if event_type == "result":
+            subtype = str(event.get("subtype") or "")
+            if event.get("is_error") or subtype.startswith("error"):
+                errors = event.get("errors")
+                detail = "\n".join(str(item) for item in errors if item) if isinstance(errors, list) else ""
+                detail = detail or event.get("result") or event.get("error") or subtype or "Unknown error"
+                yield {"type": "error", "message": f"Claude Code failed: {detail}"}
+            # done also carries the resume id and closes stdin on failed results.
             yield {
                 "type": "done",
                 "session_id": self._extract_session_id(event),
@@ -1005,6 +1015,7 @@ class PiAdapter(AgentAdapter):
         batches: dict[str, dict[str, Any]] = {}
         text_buf: list[str] = []
         current_sid: str | None = session.get("agent_session_id")
+        pending_error: str | None = None
 
         assert process.stdin is not None
         assert process.stdout is not None
@@ -1274,8 +1285,31 @@ class PiAdapter(AgentAdapter):
                 await collect_question(envelope, dialog_id)
 
         async def handle_message(message: dict[str, Any]) -> None:
-            nonlocal current_sid
+            nonlocal current_sid, pending_error
             kind = message.get("type")
+
+            if kind == "message_end":
+                completed = message.get("message")
+                if isinstance(completed, dict) and completed.get("role") == "assistant":
+                    # A later successful assistant message supersedes an error
+                    # recovered through retry or context compaction.
+                    reason = completed.get("stopReason")
+                    if reason in {"error", "aborted"}:
+                        pending_error = str(completed.get("errorMessage") or f"Pi assistant {reason}")
+                    else:
+                        pending_error = None
+                return
+
+            if kind == "auto_retry_end":
+                if message.get("success"):
+                    pending_error = None
+                else:
+                    pending_error = str(message.get("finalError") or pending_error or "Pi retries exhausted")
+                return
+
+            if kind == "compaction_end" and message.get("errorMessage"):
+                pending_error = str(message["errorMessage"])
+                return
 
             if kind == "message_update":
                 event = message.get("assistantMessageEvent") or {}
@@ -1319,6 +1353,8 @@ class PiAdapter(AgentAdapter):
                 # Terminal: agent_end can still be followed by a retry, settled
                 # cannot.
                 await flush_text()
+                if pending_error:
+                    await queue.put({"type": "error", "message": pending_error})
                 await queue.put({"type": "done", "session_id": current_sid})
                 await queue.put(None)
                 return

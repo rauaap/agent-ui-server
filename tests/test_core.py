@@ -2702,6 +2702,56 @@ for line in sys.stdin:
                         asyncio.create_task(task)
         return events
 
+    async def test_terminal_provider_errors_survive_settlement(self):
+        for tail in [
+            [{"type": "message_end", "message": {"role": "assistant",
+              "stopReason": "error", "errorMessage": "429 quota exceeded"}}],
+            [{"type": "auto_retry_end", "success": False,
+              "finalError": "429 quota exceeded"}],
+            [{"type": "compaction_end", "errorMessage": "429 quota exceeded"}],
+        ]:
+            with self.subTest(tail=tail):
+                adapter = self._adapter({"steps": tail + [{"type": "agent_settled"}]})
+                events = await self._collect(adapter)
+                self.assertEqual([e["message"] for e in events if e["type"] == "error"],
+                                 ["429 quota exceeded"])
+                self.assertEqual(events[-1], {"type": "done", "session_id": "sess-abc"})
+
+    async def test_exhausted_retries_report_once_after_partial_output(self):
+        failed = {"type": "message_end", "message": {"role": "assistant",
+                  "stopReason": "error", "errorMessage": "quota exceeded"}}
+        adapter = self._adapter({"steps": [
+            {"type": "message_update", "assistantMessageEvent": {
+                "type": "text_delta", "delta": "partial"}},
+            failed,
+            {"type": "auto_retry_start", "attempt": 1},
+            {"type": "auto_retry_end", "success": False, "finalError": "quota exceeded"},
+            failed,
+            {"type": "message_end", "message": {"role": "toolResult", "isError": False}},
+            {"type": "agent_end", "willRetry": False},
+            {"type": "agent_settled"},
+        ]})
+        events = await self._collect(adapter)
+        self.assertEqual(events, [
+            {"type": "output", "text": "partial"},
+            {"type": "error", "message": "quota exceeded"},
+            {"type": "done", "session_id": "sess-abc"},
+        ])
+
+    async def test_recovered_provider_error_is_not_reported(self):
+        adapter = self._adapter({"steps": [
+            {"type": "message_end", "message": {"role": "assistant",
+             "stopReason": "error", "errorMessage": "overloaded"}},
+            {"type": "agent_end", "willRetry": True},
+            {"type": "auto_retry_start", "attempt": 1},
+            {"type": "message_end", "message": {"role": "assistant", "stopReason": "stop"}},
+            {"type": "auto_retry_end", "success": True},
+            {"type": "agent_settled"},
+        ]})
+        events = await self._collect(adapter)
+        self.assertFalse(any(e["type"] == "error" for e in events))
+        self.assertEqual(events[-1]["type"], "done")
+
     async def test_launch_loads_both_extensions_with_discovery_off(self):
         """Both `-e` paths survive `--no-extensions`; discovery stays off.
 
