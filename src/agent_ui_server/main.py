@@ -37,7 +37,7 @@ app.add_middleware(
     allowed_hosts=allowed_hosts_from_env(),
     port=int(os.environ.get("PORT", "8000")),
 )
-db =Database(os.environ.get("SESSION_DB", "sessions.db"))
+db = Database(os.environ.get("SESSION_DB", "sessions.db"))
 adapters: dict[str, AgentAdapter] = {
     "claude-code": ClaudeCodeAdapter(),
     "pi": PiAdapter(),
