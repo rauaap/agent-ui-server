@@ -14,7 +14,7 @@ from agent_ui_server.agent import ClaudeCodeAdapter
 from agent_ui_server.host_tools import sandbox_guidance
 from agent_ui_server.sandbox_paths import merge_paths
 from agent_ui_server.sandbox import claude_sandbox_command
-from test_sandbox import bubblewrap_unavailable
+from test_sandbox import bubblewrap_unavailable, inner_start, require_sandbox
 
 
 class ClaudeSandboxTests(unittest.TestCase):
@@ -37,9 +37,12 @@ class ClaudeSandboxTests(unittest.TestCase):
         os.environ.pop("CLAUDE_CONFIG_DIR", None)
         self.scratch = Path(self.tmp.name) / "scratch"
         self.scratch.mkdir()
-        patch = mock.patch("agent_ui_server.sandbox.prepare_scratch", return_value=self.scratch)
-        patch.start()
-        self.addCleanup(patch.stop)
+        for patch in (
+            mock.patch("agent_ui_server.sandbox.prepare_scratch", return_value=self.scratch),
+            mock.patch("agent_ui_server.sandbox.verify_network_namespace"),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
 
     def build(self):
         return claude_sandbox_command(
@@ -64,7 +67,7 @@ class ClaudeSandboxTests(unittest.TestCase):
         ])
         self.assertIn([str(self.binary)] * 2, self.mounts(command, "--ro-bind"))
         self.assertNotIn(str(self.home / ".local"), command)
-        self.assertEqual(command[command.index("--") + 1:], [str(self.binary), "-p", "--permission-prompt-tool", "stdio", "--resume", "resume-id"])
+        self.assertEqual(command[inner_start(command):], [str(self.binary), "-p", "--permission-prompt-tool", "stdio", "--resume", "resume-id"])
         env = self.env(command)
         self.assertEqual(env["CLAUDE_CONFIG_DIR"], str(self.home / ".claude"))
         self.assertEqual(env["DISABLE_AUTOUPDATER"], "1")
@@ -190,6 +193,7 @@ class ClaudeSandboxTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("bwrap"), "Bubblewrap not installed")
     def test_real_config_atomic_writes_credentials_and_home_isolation(self):
+        require_sandbox(self)
         config = self.home / ".claude"
         config.mkdir()
         (config / ".credentials.json").write_text('{"fixture": true}')
@@ -208,7 +212,7 @@ pending.replace(config / '.claude.json')
 (config / 'projects').mkdir(exist_ok=True)
 (config / 'projects' / 'resume.jsonl').write_text('session fixture')
 '''
-        command = command[:command.index("--") + 1] + ["/usr/bin/python3", "-c", probe]
+        command = command[:inner_start(command)] + ["/usr/bin/python3", "-c", probe]
         result = subprocess.run(command, env={}, capture_output=True, text=True, timeout=10)
         if result.returncode and bubblewrap_unavailable(result.stderr):
             self.skipTest(result.stderr.strip())

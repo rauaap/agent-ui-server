@@ -16,7 +16,7 @@ from agent_ui_server.db import Database
 from agent_ui_server.sandbox import claude_sandbox_command, pi_sandbox_command
 from agent_ui_server.sandbox import sandbox_command
 from agent_ui_server.sandbox_paths import destination, merge_paths, validate_paths
-from test_sandbox import bubblewrap_unavailable
+from test_sandbox import bubblewrap_unavailable, require_sandbox
 
 
 class PathFixture:
@@ -37,6 +37,13 @@ class PathFixture:
 
 
 class SandboxPathTests(PathFixture, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        # Argv tests use a fake launcher; the real test checks it can start.
+        patch = mock.patch("agent_ui_server.sandbox.verify_network_namespace")
+        patch.start()
+        self.addCleanup(patch.stop)
+
     def test_expansion_and_relative_rejection(self):
         with mock.patch.dict(os.environ, {"HOME": str(self.root), "CONFIG_TEST": str(self.config)}):
             for value in ("~/config with spaces", "$HOME/config with spaces",
@@ -126,6 +133,7 @@ class SandboxPathTests(PathFixture, unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("bwrap"), "Bubblewrap not installed")
     def test_real_read_write_and_sibling_isolation(self):
+        require_sandbox(self)
         sibling = self.root / "secret"
         sibling.write_text("hidden")
         link = self.root / "link"

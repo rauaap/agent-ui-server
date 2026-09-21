@@ -1,15 +1,21 @@
 """Shared Bubblewrap policy with adapter-specific runtime/config profiles.
 
-No shell script and no unsandboxed fallback. Profile builders return argv;
-callers must also clear the environment of the Bubblewrap process itself.
+No unsandboxed fallback. Profile builders return argv; callers must also
+clear the environment of the launcher process itself. Bubblewrap runs inside
+a pasta network namespace, so a sandbox reaches the internet but never the
+server or anything else listening on this host, the tailnet or the LAN.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import pwd
+import shlex
 import shutil
+import signal
 import stat
+import subprocess
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -17,6 +23,119 @@ from pathlib import Path
 from typing import Any
 
 from .sandbox_paths import overlaps, validate_paths
+
+# pasta forwards DNS sent to this address to the host's resolver; the
+# sandbox's resolv.conf names it, since the host resolver may be blocked.
+SANDBOX_DNS = "169.254.0.53"
+SANDBOX_RESOLV_CONF = Path(__file__).resolve().parent / "sandbox_resolv.conf"
+SANDBOX_INTERFACE = "agent0"
+# Never routable from a sandbox, in addition to every address of this host:
+# the tailnet (CGNAT), private LANs, link-local (cloud metadata included),
+# benchmarking, multicast and reserved space.
+BLOCKED_NETWORKS = (
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "169.254.0.0/16",
+    "172.16.0.0/12", "192.168.0.0/16", "198.18.0.0/15", "224.0.0.0/4",
+    "240.0.0.0/4",
+)
+
+
+def host_addresses() -> list[str]:
+    """Every IPv4 address local to this host, from the kernel's FIB.
+
+    Read afresh per launch so an interface that came up since start is still
+    blocked. Loopback needs no route: inside the namespace it is its own.
+    """
+    lines = Path("/proc/net/fib_trie").read_text().splitlines()
+    addresses = {
+        lines[index - 1].split()[-1]
+        for index, line in enumerate(lines)
+        if index and line.strip() == "/32 host LOCAL"
+    }
+    return sorted(
+        (a for a in addresses if not ipaddress.IPv4Address(a).is_loopback),
+        key=ipaddress.IPv4Address,
+    )
+
+
+_working_launchers: set[str] = set()
+
+
+def verify_network_namespace(pasta: str) -> None:
+    """Fail closed, once per launcher, when pasta cannot build a namespace.
+
+    A pasta that fails setup (no /dev/net/tun, no user namespaces) exits but
+    leaves a helper behind, holding the caller's pipes, so a turn would hang
+    rather than report the failure. Probe with files, never pipes, in a
+    session of its own whose leftovers are then killed.
+    """
+    if pasta in _working_launchers:
+        return
+    with tempfile.TemporaryFile() as stderr:
+        probe = subprocess.Popen(
+            [pasta, "--config-net", "--foreground", "--quiet", "--", "/bin/true"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=stderr,
+            env={}, start_new_session=True,
+        )
+        try:
+            failed = probe.wait(timeout=10) != 0
+        except subprocess.TimeoutExpired:
+            failed = True
+        finally:
+            try:
+                os.killpg(probe.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            probe.wait()
+        if failed:
+            stderr.seek(0)
+            detail = stderr.read().decode(errors="replace").strip().splitlines()
+            raise OSError(
+                "pasta cannot create a sandbox network namespace"
+                + (f": {detail[-1]}" if detail else "")
+            )
+    _working_launchers.add(pasta)
+
+
+def network_command(command: list[str]) -> list[str]:
+    """Run `command` in a pasta namespace with internet-only IPv4 routing.
+
+    pasta translates the namespace's traffic to ordinary host sockets, so on
+    its own a connection to a host address would reach the server. Every
+    port forward and the gateway-to-host-loopback mapping are disabled, and
+    blackhole routes cover the host's addresses and non-internet ranges.
+    The routes are set as namespace root before Bubblewrap drops every
+    capability, so nothing inside the sandbox can change them.
+    """
+    pasta = shutil.which("pasta")
+    if not pasta:
+        raise FileNotFoundError("pasta (passt) is required for sandbox network isolation")
+    ip = shutil.which("ip")
+    if not ip:
+        raise FileNotFoundError("iproute2 (ip) is required for sandbox network isolation")
+    verify_network_namespace(pasta)
+    ip = shlex.quote(ip)
+    blocked = [*BLOCKED_NETWORKS, *(f"{address}/32" for address in host_addresses())]
+    script = "\n".join([
+        "set -e",
+        # Drop pasta's copy of the host's subnet and gateway routes: an
+        # on-link subnet would outrank the blackholes below. pasta answers
+        # ARP for every address, so a device default route needs no gateway.
+        f"{ip} route flush table main",
+        f"{ip} route add default dev {SANDBOX_INTERFACE}",
+        *(f"{ip} route add blackhole {network}" for network in blocked),
+        f"{ip} route add {SANDBOX_DNS}/32 dev {SANDBOX_INTERFACE}",
+        # pasta ignores SIGPIPE and its command inherits that; restore the
+        # default so `producer | head` in the agent's shell ends quietly.
+        'exec /usr/bin/env --default-signal=PIPE "$@"',
+    ])
+    return [
+        pasta, "--config-net", "--foreground", "--quiet", "--ipv4-only",
+        "--ns-ifname", SANDBOX_INTERFACE, "--no-map-gw",
+        "--tcp-ports", "none", "--udp-ports", "none",
+        "--tcp-ns", "none", "--udp-ns", "none",
+        "--dns-forward", SANDBOX_DNS,
+        "--", "/bin/sh", "-c", script, "sh", *command,
+    ]
 
 
 def prepare_scratch() -> Path:
@@ -129,6 +248,9 @@ class SandboxFilesystem:
             "Unlisted host paths may be hidden or read-only. Directory listings describe "
             "this sandbox view, not the server filesystem. Sandbox /tmp is backed by the "
             "server source listed above, not the server's /tmp directory.",
+            "Network: outbound IPv4 internet only. This server and every other service "
+            "on its host, the tailnet, private LAN ranges and link-local addresses are "
+            "unreachable, and 127.0.0.1 is the sandbox's own loopback.",
         ])
         return "\n".join(lines)
 
@@ -176,7 +298,7 @@ def sandbox_command(
         SandboxMount("--ro-bind", "/lib", "/lib"),
         SandboxMount("--ro-bind-try", "/lib64", "/lib64"),
         SandboxMount("--ro-bind", "/etc/ssl/certs", "/etc/ssl/certs"),
-        SandboxMount("--ro-bind", str(Path("/etc/resolv.conf").resolve()), "/etc/resolv.conf"),
+        SandboxMount("--ro-bind", str(SANDBOX_RESOLV_CONF), "/etc/resolv.conf"),
         SandboxMount("--ro-bind", "/etc/hosts", "/etc/hosts"),
         SandboxMount("--ro-bind", "/etc/nsswitch.conf", "/etc/nsswitch.conf"),
         SandboxMount("--dev", None, "/dev"),
@@ -189,10 +311,13 @@ def sandbox_command(
     mounts.extend(SandboxMount("--bind" if m.write else "--ro-bind",
                                str(m.source), str(m.destination)) for m in extra_mounts)
     filesystem = SandboxFilesystem(cwd, mounts)
+    # --share-net shares pasta's namespace, not the host's. pasta runs this
+    # as root of its own user namespace, so map back to the real ids.
     args = [
         bwrap,
-        "--unshare-all", "--share-net", "--die-with-parent", "--new-session",
-        "--cap-drop", "ALL",
+        "--unshare-all", "--share-net", "--unshare-user",
+        "--uid", str(os.getuid()), "--gid", str(os.getgid()),
+        "--die-with-parent", "--new-session", "--cap-drop", "ALL",
     ]
     for mount in filesystem.mounts:
         args.extend(mount.argv())
@@ -216,7 +341,7 @@ def sandbox_command(
     for name, value in env.items():
         args.extend(["--setenv", name, value])
     suffix = command_suffix(filesystem) if command_suffix is not None else []
-    return [*args, "--", *command, *suffix]
+    return network_command([*args, "--", *command, *suffix])
 
 
 def _executable(name: str) -> Path:

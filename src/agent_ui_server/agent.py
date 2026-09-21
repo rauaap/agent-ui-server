@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import shutil
+import signal
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -176,6 +177,37 @@ def _validate_answers(
 STREAM_LIMIT = 64 * 1024 * 1024  # 64 MiB
 
 
+def _signal_group(process: asyncio.subprocess.Process, sig: int) -> None:
+    # Agents start their own session, so the group id is the spawned pid, and
+    # it stays valid for the survivors after that leader has exited.
+    try:
+        os.killpg(process.pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+async def stop_process(process: asyncio.subprocess.Process) -> int | None:
+    """SIGTERM the agent's process group, then SIGKILL whatever remains.
+
+    A sandboxed agent is spawned as pasta, which exits on SIGTERM without
+    taking Bubblewrap along: Bubblewrap is init of pasta's PID namespace, so
+    only SIGKILL reaches it from here. Once the leader has exited, the group
+    is killed at once, and Bubblewrap's --die-with-parent ends the sandbox.
+    """
+    if process.returncode is not None:
+        return process.returncode
+    _signal_group(process, signal.SIGTERM)
+    # Poll the exit status rather than awaiting wait(): that also waits for
+    # the pipes to close, which the still-running sandbox holds open.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 3
+    while process.returncode is None and loop.time() < deadline:
+        await asyncio.sleep(0.05)
+    _signal_group(process, signal.SIGKILL)
+    await process.wait()
+    return process.returncode
+
+
 class AgentAdapter(abc.ABC):
     # Human-readable name for an agent picker, surfaced by `GET /agents`. It
     # lives on the adapter so the id, the label and the implementation cannot
@@ -326,6 +358,8 @@ class ClaudeCodeAdapter(AgentAdapter):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 limit=STREAM_LIMIT,
+                # Its own group, which stop_process() signals as a whole.
+                start_new_session=True,
             )
         except FileNotFoundError as exc:
             yield {"type": "error", "message": f"Unable to start Claude Code: {exc}"}
@@ -396,13 +430,7 @@ class ClaudeCodeAdapter(AgentAdapter):
             if host is not None:
                 await host.close()
                 self.host_tools.pop(session_id, None)
-                if process.returncode is None:
-                    process.terminate()
-                    try:
-                        await asyncio.wait_for(process.wait(), timeout=3)
-                    except asyncio.TimeoutError:
-                        process.kill()
-                        await process.wait()
+                await stop_process(process)
             self.processes.pop(session_id, None)
             await self._clear_session_approvals(session_id, "Session ended")
             self._clear_tool_actions(session_id)
@@ -475,14 +503,7 @@ class ClaudeCodeAdapter(AgentAdapter):
         if process is None:
             return
 
-        if process.returncode is None:
-            process.terminate()
-            try:
-                await asyncio.wait_for(process.wait(), timeout=3)
-            except asyncio.TimeoutError:
-                process.kill()
-                await process.wait()
-
+        await stop_process(process)
         self.processes.pop(session_id, None)
 
     async def _events_from_json(
@@ -976,6 +997,8 @@ class PiAdapter(AgentAdapter):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 limit=STREAM_LIMIT,
+                # Its own group, which stop_process() signals as a whole.
+                start_new_session=True,
             )
         except FileNotFoundError as exc:
             yield {"type": "error", "message": f"Unable to start Pi: {exc}"}
@@ -1562,17 +1585,7 @@ class PiAdapter(AgentAdapter):
         return str(directory) if (directory / "node").exists() else None
 
     async def _terminate(self, process: asyncio.subprocess.Process) -> int | None:
-        if process.returncode is None:
-            try:
-                process.terminate()
-            except ProcessLookupError:
-                return process.returncode
-            try:
-                await asyncio.wait_for(process.wait(), timeout=3)
-            except asyncio.TimeoutError:
-                process.kill()
-                await process.wait()
-        return process.returncode
+        return await stop_process(process)
 
     async def _clear_session_approvals(self, session_id: int, reason: str) -> None:
         request_ids = [
