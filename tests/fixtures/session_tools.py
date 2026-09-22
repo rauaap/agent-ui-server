@@ -27,6 +27,8 @@ if pi:
         if request["type"] == "get_state":
             write({"type": "response", "command": "get_state", "id": request["id"],
                    "success": True, "data": {"sessionId": "test-session"}})
+    write({"type": "tool_execution_start", "toolCallId": "call",
+           "toolName": config["name"], "args": config["arguments"]})
     write({"type": "extension_ui_request", "method": "input", "id": "call", "title": json.dumps({
         "agent-ui": 1, "kind": "session_tool", "toolCallId": "call",
         "name": config["name"], "arguments": config["arguments"],
@@ -62,7 +64,11 @@ else:
         "input": config["arguments"],
     }})
     assert read()["response"]["response"]["behavior"] == "allow"
-    mcp("call", "tools/call", **config)
+    write({"type": "assistant", "message": {"content": [{
+        "type": "tool_use", "id": "toolu_call", "name": "mcp__agent_ui__" + config["name"],
+        "input": config["arguments"],
+    }]}})
+    mcp("call", "tools/call", **config, _meta={"claudecode/toolUseId": "toolu_call"})
     response = read()
     if response.get("type") == "test_cancel":
         write({"type": "control_cancel_request", "request_id": "call"})

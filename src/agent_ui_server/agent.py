@@ -382,11 +382,11 @@ class ClaudeCodeAdapter(AgentAdapter):
         host = None
         if host_enabled or self.session_operation is not None:
             host = HostTools(process, session["working_dir"],
-                             lambda args: self._approve_host(session_id, args),
+                             lambda args, call_id: self._approve_host(session_id, args, call_id),
                              host_enabled=host_enabled,
-                             session_call=(lambda name, args: execute_session_tool(
+                             session_call=(lambda name, args, call_id: execute_session_tool(
                                  name, args, session_id, self.session_operation,
-                                 lambda action: self._approve_server_action(session_id, action),
+                                 lambda action: self._approve_server_action(session_id, action, call_id),
                              )) if self.session_operation is not None else None)
             self.host_tools[session_id] = host
 
@@ -481,14 +481,18 @@ class ClaudeCodeAdapter(AgentAdapter):
             future.set_result(validated)
         return validated
 
-    async def _approve_host(self, session_id: int, args: dict[str, str]) -> ApprovalDecision:
+    async def _approve_host(
+        self, session_id: int, args: dict[str, str], call_id: str | None = None,
+    ) -> ApprovalDecision:
         host = self.host_tools[session_id]
         return await self._approve_server_action(session_id, {
             "kind": "other", "name": "Execute outside sandbox",
             "arguments": {**args, "cwd": host.cwd},
-        })
+        }, call_id)
 
-    async def _approve_server_action(self, session_id: int, action: dict[str, Any]) -> ApprovalDecision:
+    async def _approve_server_action(
+        self, session_id: int, action: dict[str, Any], call_id: str | None = None,
+    ) -> ApprovalDecision:
         host = self.host_tools[session_id]
         request_id = "host_" + uuid.uuid4().hex
         future = asyncio.get_running_loop().create_future()
@@ -498,7 +502,7 @@ class ClaudeCodeAdapter(AgentAdapter):
         # 'other' deliberately never inherits normal command auto-approval.
         try:
             await host.events.put(approval_request_event(
-                request_id, request_id, action, _event_options(self.OPTIONS)))
+                request_id, call_id or request_id, action, _event_options(self.OPTIONS)))
             return await future
         finally:
             self.pending_approvals.pop(request_id, None)

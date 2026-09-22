@@ -27,7 +27,7 @@ class HostToolTests(unittest.IsolatedAsyncioTestCase):
             stdout=asyncio.StreamReader(),
         )
         self.host = HostTools(self.process, "/project",
-                              lambda args: self.adapter._approve_host(1, args))
+                              lambda args, call_id: self.adapter._approve_host(1, args, call_id))
         self.adapter.host_tools[1] = self.host
 
     async def asyncTearDown(self):
@@ -39,7 +39,7 @@ class HostToolTests(unittest.IsolatedAsyncioTestCase):
     def call(self, **args):
         return self.request(name="bypass_sandbox", arguments=args or {
             "command": "echo hello", "reason": "testing",
-        })
+        }, _meta={"claudecode/toolUseId": "toolu_host"})
 
     async def test_discovery_and_protocol_errors(self):
         result = await self.host.dispatch(self.request("initialize"))
@@ -64,6 +64,8 @@ class HostToolTests(unittest.IsolatedAsyncioTestCase):
                 task = asyncio.create_task(self.host.dispatch(self.call()))
                 event = await asyncio.wait_for(self.host.events.get(), 1)
                 self.assertEqual(event["type"], "approval_request")
+                self.assertEqual(event["call_id"], "toolu_host")
+                self.assertNotEqual(event["request_id"], "toolu_host")
                 self.assertIsNone(auto_approval_setting(event["action"]))
                 self.assertEqual(event["action"]["arguments"]["cwd"], "/project")
                 run.assert_not_awaited()

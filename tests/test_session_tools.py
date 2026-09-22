@@ -240,6 +240,9 @@ time.sleep(60)
                                         if event["type"] == "approval_request":
                                             operation.assert_not_awaited()
                                             self.assertEqual(event["action"]["name"], name)
+                                            # The approval folds into the tool_use it gates.
+                                            tool_use = [e for e in events if e["type"] == "tool_use"]
+                                            self.assertEqual(event["call_id"], tool_use[-1]["call_id"])
                                             self.assertIsNone(auto_approval_setting(event["action"]))
                                             with self.assertRaises(KeyError):
                                                 await adapter.send_approval({"id": 9}, event["request_id"], "allow")

@@ -95,9 +95,10 @@ async def execute_host_command(
 
 class HostTools:
     def __init__(self, process: Any, cwd: str,
-                 approve: Callable[[dict[str, str]], Awaitable[Any]], *,
+                 approve: Callable[[dict[str, str], str | None], Awaitable[Any]], *,
                  host_enabled: bool = True,
-                 session_call: Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]] | None = None) -> None:
+                 session_call: Callable[[str, dict[str, Any], str | None],
+                                        Awaitable[dict[str, Any]]] | None = None) -> None:
         self.process = process
         self.cwd = cwd
         self.approve = approve
@@ -225,16 +226,21 @@ class HostTools:
                     or params["name"] not in self.tool_names):
                 return self.error(mid, -32602, "Unknown tool")
             name = params["name"]
+            # Claude Code names the tool_use this call belongs to, so its approval can fold into it.
+            meta = params.get("_meta")
+            tool_use_id = meta.get("claudecode/toolUseId") if isinstance(meta, dict) else None
+            tool_use_id = tool_use_id if isinstance(tool_use_id, str) and tool_use_id else None
             try:
                 args = (validate_host_arguments(params.get("arguments")) if name == "bypass_sandbox"
                         else validate_session_arguments(name, params.get("arguments")))
             except ValueError as exc:
                 return self.error(mid, -32602, str(exc))
             if name == "bypass_sandbox":
-                result = await execute_host_command(args, self.cwd, self.approve)
+                result = await execute_host_command(
+                    args, self.cwd, lambda values: self.approve(values, tool_use_id))
             else:
                 assert self.session_call is not None
-                result = await self.session_call(name, args)
+                result = await self.session_call(name, args, tool_use_id)
         else:
             return self.error(mid, -32601, "Unknown method")
         return {"jsonrpc": "2.0", "id": mid, "result": result}
