@@ -3643,7 +3643,7 @@ class InputMessageIdTests(unittest.IsolatedAsyncioTestCase):
             async def send(message):
                 sent.append(message)
 
-            async def run(session_id, value):
+            async def run(session_id, value, **kwargs):
                 database.append_scrollback(session_id, "output", {"text": "new"})
 
             with (

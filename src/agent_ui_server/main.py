@@ -32,6 +32,7 @@ from .network_guard import (
 )
 from .sandbox_paths import merge_paths, validate_paths
 from .usage import collect_usage
+from .session_tools import delivery_prompt
 
 SCROLLBACK_REPLAY_LIMIT = 200
 WEBSOCKET_LIVE_QUEUE_CAPACITY = 256
@@ -475,6 +476,10 @@ async def list_sessions() -> list[dict[str, Any]]:
 
 @app.post("/sessions", status_code=201)
 async def create_session(payload: CreateSessionRequest) -> dict[str, Any]:
+    return await create_session_operation(payload)
+
+
+async def create_session_operation(payload: CreateSessionRequest) -> dict[str, Any]:
     """Create a session under an existing project.
 
     Without a `worktree_id` the session runs in the project directory, as it
@@ -822,6 +827,12 @@ async def get_scrollback(
     after: int | None = Query(default=None, ge=0),
     limit: int = Query(default=200, ge=1, le=1000),
 ) -> dict[str, Any]:
+    return read_session_operation(session_id, after=after, limit=limit)
+
+
+def read_session_operation(
+    session_id: int, *, after: int | None = None, limit: int = 200,
+) -> dict[str, Any]:
     require_session_or_404(session_id)
     rows = db.scrollback_after(session_id, after, limit + 1)
     messages = rows[:limit]
@@ -830,6 +841,31 @@ async def get_scrollback(
         "next_cursor": messages[-1]["id"] if messages else after,
         "has_more": len(rows) > limit,
     }
+
+
+async def session_tool_operation(sender_id: int, name: str, args: dict[str, Any]) -> Any:
+    # Called only by the mandatory approved tool executor. Never expose sender_id
+    # as an HTTP or model-supplied field.
+    require_session_or_404(sender_id)
+    if name == "read_session":
+        return read_session_operation(**args)
+    if name == "message_session":
+        return await begin_turn(args["session_id"], args["message"], sender_session_id=sender_id)
+    if name == "start_session":
+        creation = {key: value for key, value in args.items() if key != "message"}
+        session = await create_session_operation(CreateSessionRequest(**creation))
+        try:
+            message_id = await begin_turn(session["id"], args["message"], sender_session_id=sender_id)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Session {session['id']} was created, but its initial message failed: {exc}"
+            ) from exc
+        return {"session_id": session["id"], "message_id": message_id}
+    raise ValueError("Unknown session tool")
+
+
+for _adapter in adapters.values():
+    _adapter.session_operation = session_tool_operation
 
 
 @app.post("/sessions/{session_id}/turn", status_code=202)
@@ -1104,7 +1140,12 @@ async def receive_subscriber(
         return
 
 
-async def begin_turn(session_id: int, prompt: str) -> int:
+async def begin_turn(
+    session_id: int, prompt: str, *, sender_session_id: int | None = None,
+) -> int:
+    source = ({"type": "user"} if sender_session_id is None else
+              {"type": "agent", "session_id": sender_session_id})
+    payload = {"text": prompt, "source": source}
     async with turn_lock:
         session = require_session_or_404(session_id)
         require_not_archived(session)
@@ -1120,7 +1161,7 @@ async def begin_turn(session_id: int, prompt: str) -> int:
             raise HTTPException(status_code=409, detail="Session is already running")
 
         def start() -> int:
-            row = db.append_scrollback(session_id, "input", {"text": prompt})
+            row = db.append_scrollback(session_id, "input", payload)
             db.update_status(session_id, "running")
             db.touch_session(session_id)
             return row["id"]
@@ -1129,17 +1170,19 @@ async def begin_turn(session_id: int, prompt: str) -> int:
             session_id,
             start,
             lambda _result: [
-                {"type": "input", "text": prompt},
+                {"type": "input", **payload},
                 {"type": "status", "status": "running"},
             ],
         )
 
-        task = asyncio.create_task(run_turn(session_id, prompt))
+        task = asyncio.create_task(run_turn(session_id, prompt, source=source))
         running_tasks[session_id] = task
         return message_id
 
 
-async def run_turn(session_id: int, prompt: str) -> None:
+async def run_turn(
+    session_id: int, prompt: str, *, source: dict[str, Any] | None = None,
+) -> None:
     session = db.require_session(session_id)
     adapter = adapters[session["agent"]]
 
@@ -1152,7 +1195,7 @@ async def run_turn(session_id: int, prompt: str) -> None:
             project = db.get_project_by_id(session["project_id"])
             if project is not None:
                 session["git_repository"] = project["path"]
-        async for event in adapter.start_turn(session, prompt):
+        async for event in adapter.start_turn(session, delivery_prompt(prompt, source)):
             event_type = event.get("type")
 
             # Decide auto-approval before persisting/broadcasting so the event

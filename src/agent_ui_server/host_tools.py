@@ -1,4 +1,4 @@
-"""Shared approved host execution, plus Claude's SDK MCP pipe transport.
+"""Shared approved host execution, plus Claude's server-tool MCP pipe transport.
 
 The pipe reader stays live while approval/execution waits in a separate task.
 """
@@ -11,6 +11,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from .shell import run_command
+from .session_tools import TOOLS, validate_session_arguments
 from .sandbox import SandboxFilesystem
 
 SERVER = "agent_ui"
@@ -94,10 +95,17 @@ async def execute_host_command(
 
 class HostTools:
     def __init__(self, process: Any, cwd: str,
-                 approve: Callable[[dict[str, str]], Awaitable[Any]]) -> None:
+                 approve: Callable[[dict[str, str]], Awaitable[Any]], *,
+                 host_enabled: bool = True,
+                 session_call: Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]] | None = None) -> None:
         self.process = process
         self.cwd = cwd
         self.approve = approve
+        self.host_enabled = host_enabled
+        self.session_call = session_call
+        self.tool_names = ({"bypass_sandbox"} if host_enabled else set()) | (
+            {tool["name"] for tool in TOOLS} if session_call else set()
+        )
         self.events: asyncio.Queue[bytes | dict[str, Any]] = asyncio.Queue()
         self.calls: dict[str, asyncio.Task[None]] = {}
         self.execution_lock = asyncio.Lock()
@@ -210,16 +218,23 @@ class HostTools:
         elif method == "ping":
             result = {}
         elif method == "tools/list":
-            result = {"tools": [TOOL]}
+            result = {"tools": ([TOOL] if self.host_enabled else []) + (TOOLS if self.session_call else [])}
         elif method == "tools/call":
             params = message.get("params")
-            if not isinstance(params, dict) or params.get("name") != "bypass_sandbox":
+            if (not isinstance(params, dict) or not isinstance(params.get("name"), str)
+                    or params["name"] not in self.tool_names):
                 return self.error(mid, -32602, "Unknown tool")
+            name = params["name"]
             try:
-                args = validate_host_arguments(params.get("arguments"))
+                args = (validate_host_arguments(params.get("arguments")) if name == "bypass_sandbox"
+                        else validate_session_arguments(name, params.get("arguments")))
             except ValueError as exc:
                 return self.error(mid, -32602, str(exc))
-            result = await execute_host_command(args, self.cwd, self.approve)
+            if name == "bypass_sandbox":
+                result = await execute_host_command(args, self.cwd, self.approve)
+            else:
+                assert self.session_call is not None
+                result = await self.session_call(name, args)
         else:
             return self.error(mid, -32601, "Unknown method")
         return {"jsonrpc": "2.0", "id": mid, "result": result}

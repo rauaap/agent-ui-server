@@ -13,9 +13,10 @@ from pathlib import Path
 from typing import Any
 
 from .actions import approval_request_event, tool_use_event
+from .session_tools import MODELS, SessionOperation, execute_session_tool, validate_session_arguments
 from .sandbox import claude_sandbox_command, pi_sandbox_command
 from .host_tools import (
-    HostTools, TOOL_NAME, execute_host_command, pi_sandbox_guidance, sandbox_guidance,
+    HostTools, execute_host_command, pi_sandbox_guidance, sandbox_guidance,
     validate_host_arguments,
 )
 from .tool_actions import (
@@ -209,6 +210,8 @@ async def stop_process(process: asyncio.subprocess.Process) -> int | None:
 
 
 class AgentAdapter(abc.ABC):
+    session_operation: SessionOperation | None = None
+
     # Human-readable name for an agent picker, surfaced by `GET /agents`. It
     # lives on the adapter so the id, the label and the implementation cannot
     # drift apart; the endpoint falls back to the id if a subclass omits it.
@@ -333,7 +336,7 @@ class ClaudeCodeAdapter(AgentAdapter):
             os.environ.get("CLAUDE_HOST_EXEC") == "1"
             and session.get("sandbox", True)
         )
-        if host_enabled:
+        if host_enabled or self.session_operation is not None:
             command.extend(["--mcp-config", json.dumps({
                 "mcpServers": {"agent_ui": {"type": "sdk", "name": "agent_ui"}}
             })])
@@ -377,9 +380,14 @@ class ClaudeCodeAdapter(AgentAdapter):
         result_seen = False
         error_seen = False
         host = None
-        if host_enabled:
+        if host_enabled or self.session_operation is not None:
             host = HostTools(process, session["working_dir"],
-                             lambda args: self._approve_host(session_id, args))
+                             lambda args: self._approve_host(session_id, args),
+                             host_enabled=host_enabled,
+                             session_call=(lambda name, args: execute_session_tool(
+                                 name, args, session_id, self.session_operation,
+                                 lambda action: self._approve_server_action(session_id, action),
+                             )) if self.session_operation is not None else None)
             self.host_tools[session_id] = host
 
         try:
@@ -475,14 +483,19 @@ class ClaudeCodeAdapter(AgentAdapter):
 
     async def _approve_host(self, session_id: int, args: dict[str, str]) -> ApprovalDecision:
         host = self.host_tools[session_id]
+        return await self._approve_server_action(session_id, {
+            "kind": "other", "name": "Execute outside sandbox",
+            "arguments": {**args, "cwd": host.cwd},
+        })
+
+    async def _approve_server_action(self, session_id: int, action: dict[str, Any]) -> ApprovalDecision:
+        host = self.host_tools[session_id]
         request_id = "host_" + uuid.uuid4().hex
         future = asyncio.get_running_loop().create_future()
         self.pending_approvals[request_id] = future
         self.pending_sessions[request_id] = session_id
         self.pending_options[request_id] = self.OPTIONS
         # 'other' deliberately never inherits normal command auto-approval.
-        action = {"kind": "other", "name": "Execute outside sandbox",
-                  "arguments": {**args, "cwd": host.cwd}}
         try:
             await host.events.put(approval_request_event(
                 request_id, request_id, action, _event_options(self.OPTIONS)))
@@ -532,7 +545,8 @@ class ClaudeCodeAdapter(AgentAdapter):
 
             # Allow transport dispatch only; the host executor asks independently.
             if tool in self.AUTO_APPROVE_TOOLS or (
-                tool == TOOL_NAME and session_id in self.host_tools
+                session_id in self.host_tools
+                and tool in {f"mcp__agent_ui__{name}" for name in self.host_tools[session_id].tool_names}
             ):
                 try:
                     await self._write_approval_response(
@@ -974,6 +988,9 @@ class PiAdapter(AgentAdapter):
         host_enabled = os.environ.get("PI_HOST_EXEC") == "1" and session.get("sandbox", True)
         if host_enabled:
             command.append("--agent-ui-host-exec")
+        session_enabled = self.session_operation is not None
+        if session_enabled:
+            command.append("--agent-ui-session-tools")
         if self.web_extension_path:
             command.extend(["-e", self.web_extension_path])
         if session.get("agent_session_id"):
@@ -1112,6 +1129,12 @@ class PiAdapter(AgentAdapter):
                 self.pending_options.pop(request_id, None)
 
         async def approve_host(args: dict[str, str], tool_call_id: str) -> ApprovalDecision:
+            return await approve_server_action({
+                "kind": "other", "name": "Execute outside sandbox",
+                "arguments": {**args, "cwd": session["working_dir"]},
+            }, tool_call_id)
+
+        async def approve_server_action(action: dict[str, Any], tool_call_id: str) -> ApprovalDecision:
             request_id = "host_" + uuid.uuid4().hex
             future = loop.create_future()
             self.pending_approvals[request_id] = future
@@ -1121,9 +1144,7 @@ class PiAdapter(AgentAdapter):
                 await flush_text()
                 await queue.put(approval_request_event(
                     request_id, tool_call_id,
-                    {"kind": "other", "name": "Execute outside sandbox", "arguments": {
-                        **args, "cwd": session["working_dir"],
-                    }}, _event_options(self.OPTIONS),
+                    action, _event_options(self.OPTIONS),
                 ))
                 return await future
             finally:
@@ -1131,12 +1152,21 @@ class PiAdapter(AgentAdapter):
                 self.pending_sessions.pop(request_id, None)
                 self.pending_options.pop(request_id, None)
 
-        async def resolve_host(dialog_id: Any, tool_call_id: str, args: dict[str, str]) -> None:
+        async def resolve_host(
+            dialog_id: Any, tool_call_id: str, args: dict[str, Any], name: str = "bypass_sandbox",
+        ) -> None:
             try:
                 async with host_lock:
-                    result = await execute_host_command(
-                        args, session["working_dir"], lambda values: approve_host(values, tool_call_id),
-                    )
+                    if name == "bypass_sandbox":
+                        result = await execute_host_command(
+                            args, session["working_dir"], lambda values: approve_host(values, tool_call_id),
+                        )
+                    else:
+                        assert self.session_operation is not None
+                        result = await execute_session_tool(
+                            name, args, session_id, self.session_operation,
+                            lambda action: approve_server_action(action, tool_call_id),
+                        )
                 await answer_dialog(dialog_id, json.dumps(result))
             except asyncio.CancelledError:
                 await answer_dialog(dialog_id, None)
@@ -1237,6 +1267,8 @@ class PiAdapter(AgentAdapter):
                 if not ready.done():
                     if host_enabled and envelope.get("hostTool") != "bypass_sandbox":
                         ready.set_exception(RuntimeError("Pi extension did not register bypass_sandbox"))
+                    elif session_enabled and envelope.get("sessionTools") != list(MODELS):
+                        ready.set_exception(RuntimeError("Pi extension did not register session tools"))
                     else:
                         ready.set_result(None)
                 return
@@ -1247,21 +1279,24 @@ class PiAdapter(AgentAdapter):
                     host_calls[call_id].cancel()
                 return
 
-            if kind == "host_exec":
+            if kind in {"host_exec", "session_tool"}:
                 try:
-                    if (not host_enabled or method != "input"
+                    name = "bypass_sandbox" if kind == "host_exec" else envelope.get("name")
+                    enabled = host_enabled if kind == "host_exec" else session_enabled
+                    if (not enabled or method != "input"
                             or self.processes.get(session_id) is not process):
-                        raise ValueError("Host execution is not enabled for this session")
+                        raise ValueError("Server tool is not enabled for this session")
                     call_id = envelope.get("toolCallId")
                     if not isinstance(call_id, str) or not call_id or call_id in host_calls:
                         raise ValueError("Invalid or duplicate host tool call id")
-                    args = validate_host_arguments(envelope.get("arguments"))
+                    args = (validate_host_arguments(envelope.get("arguments")) if kind == "host_exec"
+                            else validate_session_arguments(name, envelope.get("arguments")))
                 except ValueError as exc:
                     await answer_dialog(dialog_id, json.dumps({
                         "isError": True, "content": [{"type": "text", "text": str(exc)}],
                     }))
                     return
-                task = asyncio.create_task(resolve_host(dialog_id, call_id, args))
+                task = asyncio.create_task(resolve_host(dialog_id, call_id, args, name))
                 host_calls[call_id] = task
                 task.add_done_callback(lambda _, key=call_id: host_calls.pop(key, None))
                 return

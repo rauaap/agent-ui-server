@@ -11,6 +11,7 @@ from unittest import mock
 from agent_ui_server.actions import auto_approval_setting
 from agent_ui_server.agent import PiAdapter
 from agent_ui_server.sandbox import SandboxFilesystem, SandboxMount
+from agent_ui_server.session_tools import TOOLS
 
 
 def fake_sandbox(command, cwd, *, system_prompt=None, **kwargs):
@@ -183,7 +184,8 @@ time.sleep(60)
         script = Path(__file__).parent / "fixtures/pi_host_extension_test.mjs"
         process = await asyncio.create_subprocess_exec(
             shutil.which("node"), str(script), str(Path(shutil.which("pi")).resolve()),
-            PiAdapter.DEFAULT_EXTENSION, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            PiAdapter.DEFAULT_EXTENSION, json.dumps(TOOLS),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         try:
             stdout, stderr = await asyncio.wait_for(process.communicate(), 30)
@@ -199,7 +201,7 @@ time.sleep(60)
         # tool registration. No user prompt or inference request is sent.
         for enabled in (False, True):
             command = [shutil.which("pi"), "--mode", "rpc", "--no-session", "--no-extensions",
-                       "-e", PiAdapter.DEFAULT_EXTENSION]
+                       "-e", PiAdapter.DEFAULT_EXTENSION, "--agent-ui-session-tools"]
             if enabled:
                 command.append("--agent-ui-host-exec")
             process = await asyncio.create_subprocess_exec(
@@ -215,6 +217,9 @@ time.sleep(60)
                         envelope = PiAdapter._envelope(event.get("message"))
                         if envelope and envelope.get("kind") == "ready":
                             self.assertEqual(envelope.get("hostTool"), "bypass_sandbox" if enabled else None)
+                            self.assertEqual(envelope.get("sessionTools"), [
+                                "message_session", "start_session", "read_session",
+                            ])
                             break
                     else:
                         self.fail((await stderr).decode())

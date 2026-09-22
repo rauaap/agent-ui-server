@@ -457,6 +457,37 @@ request shapes return FastAPI's usual `422`.
 
 See [the design](docs/sandbox_paths_design.md) for mount rules and lifecycle details.
 
+### Inter-agent communication
+
+Claude and pi sessions expose three server-approved tools:
+
+- `message_session(session_id, message)` submits an input to an idle session and
+  returns its persisted input ID, without waiting for a response.
+- `start_session(name, project_path, message, agent?, worktree_id?, sandbox?)`
+  creates a session under an existing project, sends its first message, and returns
+  `session_id` and `message_id`. If messaging fails, the session is retained and its
+  ID is reported in the error.
+- `read_session(session_id, after?, limit=200)` returns one unchanged scrollback
+  page (`messages`, `next_cursor`, `has_more`). The cursor is exclusive; limit is
+  1–1000. Reads do not wait for completion.
+
+Claude names these `mcp__agent_ui__message_session`, etc., on the existing SDK MCP
+server. Pi registers them in the bundled extension. Every call, including reads,
+requires explicit approval; ordinary read/command auto-approval does not apply.
+They are available independently of sandbox-bypass flags and session sandboxing.
+Busy targets reject messages rather than queueing them.
+
+Input payloads now include `source`: `{"type":"user"}` for user submissions, or
+`{"type":"agent","session_id":42}` for a message from session 42. The server sets
+this identity, including for a newly started session's first message. Both live
+WebSocket input events and persisted scrollback payloads carry the field. Missing
+`source` on legacy records means user-originated.
+
+Stored `text` is unchanged. At harness delivery the server prefixes agent messages
+with sender context, allowing the recipient to reply using that session ID. No
+parent/child roles are imposed. Client rendering and links to sender sessions are
+UI concerns. See [the design](docs/inter_agent_communication_design.md).
+
 ### Experimental sandbox-bypass tools
 
 Enable either or both tools in the server environment:

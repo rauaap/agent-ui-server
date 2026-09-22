@@ -16,7 +16,7 @@
  * tool uses the same input/response channel for server-approved host execution.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 /** Bumped when the `title` envelope shape changes; PiAdapter checks it. */
@@ -163,7 +163,66 @@ const QUESTION_SCHEMA = Type.Object({
 	),
 });
 
+const SESSION_TOOLS = [
+	{
+		name: "message_session",
+		description: "Send a message to an idle session with user approval. Returns its persisted input ID, not a response. The recipient sees your session ID and can reply.",
+		parameters: Type.Object({
+			session_id: Type.Integer({ minimum: 1, description: "Target session ID." }),
+			message: Type.String({ minLength: 1, description: "Message to send." }),
+		}, { additionalProperties: false }),
+	},
+	{
+		name: "start_session",
+		description: "Create a session under an existing project and send its first message with user approval. Returns session_id and message_id. If messaging fails, the created session is retained and its ID reported.",
+		parameters: Type.Object({
+			name: Type.String({ minLength: 1, maxLength: 120, description: "Display name for the new session." }),
+			project_path: Type.String({ minLength: 1, description: "Path of an existing registered project." }),
+			message: Type.String({ minLength: 1, description: "Message to send." }),
+			agent: Type.Optional(Type.Union([Type.String(), Type.Null()], { description: "Agent backend: claude-code (default) or pi." })),
+			worktree_id: Type.Optional(Type.Union([Type.Integer({ minimum: 1 }), Type.Null()], { description: "Existing worktree ID; omit to use the project directory." })),
+			sandbox: Type.Optional(Type.Union([Type.Boolean(), Type.Null()], { description: "Run sandboxed; defaults to true." })),
+		}, { additionalProperties: false }),
+	},
+	{
+		name: "read_session",
+		description: "Read one page of persisted session events with user approval. Returns messages, next_cursor and has_more; after is an exclusive input/event ID cursor. Does not wait for a response. Use a smaller limit for large events.",
+		parameters: Type.Object({
+			session_id: Type.Integer({ minimum: 1, description: "Target session ID." }),
+			after: Type.Optional(Type.Union([Type.Integer({ minimum: 0 }), Type.Null()], { description: "Return events after this event ID." })),
+			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000, default: 200, description: "Maximum events to return; defaults to 200." })),
+		}, { additionalProperties: false }),
+	},
+];
+
+async function requestServerTool(
+	kind: string, toolCallId: string, params: unknown,
+	signal: AbortSignal | undefined, ctx: ExtensionContext, name?: string,
+) {
+	if (ctx.mode !== "rpc") throw new Error("Server tools require the agent-ui RPC server.");
+	if (signal?.aborted) throw new Error("Server tool cancelled.");
+	const cancel = () => ctx.ui.notify(envelope("host_cancel", { toolCallId }), "info");
+	signal?.addEventListener("abort", cancel, { once: true });
+	try {
+		const response = await ctx.ui.input(
+			envelope(kind, { toolCallId, arguments: params, name }), undefined, { signal },
+		);
+		if (!response) throw new Error("Server tool cancelled or unavailable.");
+		const result = JSON.parse(response);
+		if (result.isError) throw new Error(result.content.map((part: { text: string }) => part.text).join("\n"));
+		return { content: result.content, details: {} };
+	} finally {
+		signal?.removeEventListener("abort", cancel);
+	}
+}
+
 export default function (pi: ExtensionAPI) {
+	pi.registerFlag("agent-ui-session-tools", {
+		description: "Enable server-approved inter-session communication (agent-ui RPC only)",
+		type: "boolean",
+		default: false,
+	});
+	let sessionEnabled = false;
 	pi.registerFlag("agent-ui-host-exec", {
 		description: "Enable server-approved execution outside Bubblewrap (agent-ui RPC only)",
 		type: "boolean",
@@ -190,23 +249,7 @@ export default function (pi: ExtensionAPI) {
 				reason: Type.String({ minLength: 1 }),
 			}, { additionalProperties: false }),
 			async execute(toolCallId, params, signal, _onUpdate, ctx) {
-				if (ctx.mode !== "rpc") throw new Error("Host execution requires the agent-ui RPC server.");
-				if (signal?.aborted) throw new Error("Host execution cancelled.");
-				const cancel = () => ctx.ui.notify(envelope("host_cancel", { toolCallId }), "info");
-				signal?.addEventListener("abort", cancel, { once: true });
-				try {
-					// This input dialog is an RPC request, not a prompt shown to the user.
-					// The server owns approval and returns the bounded command result as JSON.
-					const response = await ctx.ui.input(
-						envelope("host_exec", { toolCallId, arguments: params }), undefined, { signal },
-					);
-					if (!response) throw new Error("Host execution cancelled or unavailable.");
-					const result = JSON.parse(response);
-					if (result.isError) throw new Error(result.content.map((part: { text: string }) => part.text).join("\n"));
-					return { content: result.content, details: {} };
-				} finally {
-					signal?.removeEventListener("abort", cancel);
-				}
+				return requestServerTool("host_exec", toolCallId, params, signal, ctx);
 			},
 		});
 	}
@@ -219,10 +262,22 @@ export default function (pi: ExtensionAPI) {
 	 * prompt, turning that into a startup error.
 	 */
 	pi.on("session_start", (_event, ctx) => {
+		sessionEnabled = pi.getFlag("agent-ui-session-tools") === true;
+		if (sessionEnabled) {
+			for (const tool of SESSION_TOOLS) {
+				pi.registerTool({
+					...tool, label: tool.name, promptSnippet: tool.description,
+					async execute(toolCallId, params, signal, _onUpdate, ctx) {
+						return requestServerTool("session_tool", toolCallId, params, signal, ctx, tool.name);
+					},
+				});
+			}
+		}
 		hostEnabled = pi.getFlag("agent-ui-host-exec") === true;
 		if (hostEnabled) registerHostTool();
 		ctx.ui.notify(envelope("ready", {
 			questionTool: QUESTION_TOOL, hostTool: hostEnabled ? HOST_TOOL : undefined,
+			sessionTools: sessionEnabled ? SESSION_TOOLS.map(tool => tool.name) : undefined,
 		}), "info");
 	});
 
@@ -239,6 +294,7 @@ export default function (pi: ExtensionAPI) {
 		if (event.toolName === QUESTION_TOOL) return;
 		// Host execution has a mandatory server-side gate, not this normal tool gate.
 		if (hostEnabled && event.toolName === HOST_TOOL) return;
+		if (sessionEnabled && SESSION_TOOLS.some(tool => tool.name === event.toolName)) return;
 		if (READ_ONLY_TOOLS.has(event.toolName)) return;
 
 		// No dialog transport (print/json mode) means nobody can approve, so
