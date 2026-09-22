@@ -277,6 +277,7 @@ FastAPI also exposes generated OpenAPI documentation at `/docs`.
 | `POST` | `/sessions/{id}/detach-worktree` | Detach an archived session while preserving its cwd |
 | `POST` | `/sessions/{id}/turn` | Start an agent turn |
 | `POST` | `/sessions/{id}/bash` | Start a direct one-shot shell command |
+| `GET` | `/sessions/{id}/scrollback` | Read persisted transcript events with cursor pagination |
 | `POST` | `/sessions/{id}/stop` | Stop the agent turn and shell command |
 | `DELETE` | `/sessions/{id}` | Delete a session and its transcript |
 
@@ -328,7 +329,42 @@ work in an archived session or project is rejected.
 {"status": "running", "message_id": 123}
 ```
 
-`message_id` is the ID of the persisted input event.
+`message_id` is the persisted input event's ID. Use it as `after` to read
+subsequent persisted events, even if output started before the first read:
+
+```sh
+curl 'http://127.0.0.1:8000/sessions/7/scrollback?after=123&limit=200' \
+  -H "authorization: Bearer $AUTH_TOKEN"
+```
+
+```json
+{
+  "messages": [
+    {
+      "id": 124,
+      "session_id": 7,
+      "ts": "2026-01-01T12:00:00+00:00",
+      "type": "output",
+      "payload": {"text": "Hello"}
+    }
+  ],
+  "next_cursor": 124,
+  "has_more": false
+}
+```
+
+- `after`: optional nonnegative ID, exclusive; omit to read from the beginning.
+- `limit`: defaults to 200; must be within 1–1000. Invalid parameters return 422.
+- Messages belong only to the requested session, ordered by ID ascending, with
+  decoded JSON payloads. At most `limit` messages are returned.
+- Advance `after` to `next_cursor` for the next page. Empty pages retain the
+  supplied `after`, or return `null` when it was omitted.
+- `has_more` indicates whether additional persisted events existed at query
+  time; `false` does not mean the running turn or command has finished.
+
+Reads return immediately without waiting for new events or requiring a live
+WebSocket connection. Archived sessions remain readable; nonexistent sessions
+return 404.
 
 ### Subscription usage
 

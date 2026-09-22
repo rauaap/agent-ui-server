@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.routing import Match, Mount
@@ -814,6 +814,22 @@ async def delete_session(session_id: int) -> dict[str, str]:
     session = require_session_or_404(session_id)
     await teardown_session(session)
     return {"status": "deleted"}
+
+
+@app.get("/sessions/{session_id}/scrollback")
+async def get_scrollback(
+    session_id: int,
+    after: int | None = Query(default=None, ge=0),
+    limit: int = Query(default=200, ge=1, le=1000),
+) -> dict[str, Any]:
+    require_session_or_404(session_id)
+    rows = db.scrollback_after(session_id, after, limit + 1)
+    messages = rows[:limit]
+    return {
+        "messages": messages,
+        "next_cursor": messages[-1]["id"] if messages else after,
+        "has_more": len(rows) > limit,
+    }
 
 
 @app.post("/sessions/{session_id}/turn", status_code=202)

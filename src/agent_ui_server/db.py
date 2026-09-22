@@ -1255,6 +1255,32 @@ class Database:
             "payload": payload,
         }
 
+    def scrollback_after(
+        self, session_id: int, after: int | None = None, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        """Read persisted events in ascending ID order, excluding the cursor."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT id, session_id, ts, type, payload
+                FROM scrollback
+                WHERE session_id = ? AND id > ?
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (session_id, after if after is not None else 0, limit),
+            ).fetchall()
+
+        decoded = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["payload"] = json.loads(item["payload"])
+            except json.JSONDecodeError:
+                item["payload"] = {"text": item["payload"]}
+            decoded.append(item)
+        return decoded
+
     def recent_scrollback(self, session_id: int, limit: int = 200) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(
