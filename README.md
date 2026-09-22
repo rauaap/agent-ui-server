@@ -319,6 +319,17 @@ Only one agent turn may run per session. A direct shell command has a separate
 slot and may run while the agent is running or awaiting approval. Starting new
 work in an archived session or project is rejected.
 
+### Persisted scrollback and input cursors
+
+`POST /sessions/{id}/turn` (body `{"prompt":"..."}`) and
+`POST /sessions/{id}/bash` (body `{"command":"..."}`) return HTTP **202**:
+
+```json
+{"status": "running", "message_id": 123}
+```
+
+`message_id` is the ID of the persisted input event.
+
 ### Subscription usage
 
 `GET /usage` reports how much of each plan's five-hour and weekly quota has

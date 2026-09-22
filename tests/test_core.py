@@ -3614,6 +3614,75 @@ class ShellCommandTests(unittest.IsolatedAsyncioTestCase):
                 await task
 
 
+class InputMessageIdTests(unittest.IsolatedAsyncioTestCase):
+    async def _check_endpoint(self, endpoint, field, event_type, runner, tasks):
+        from unittest import mock
+
+        from fastapi import FastAPI
+
+        from agent_ui_server import main
+
+        app = FastAPI()
+        app.include_router(main.app.router)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Database(Path(tmpdir) / "sessions.db")
+            self.addCleanup(database.close)
+            session = make_session(database, tmpdir)
+            # Ensure the cursor is neither the session ID nor a constant.
+            database.append_scrollback(session["id"], "output", {"text": "old"})
+            text = "echo hello"
+            sent = []
+
+            async def receive():
+                return {
+                    "type": "http.request",
+                    "body": json.dumps({field: text}).encode(),
+                    "more_body": False,
+                }
+
+            async def send(message):
+                sent.append(message)
+
+            async def run(session_id, value):
+                database.append_scrollback(session_id, "output", {"text": "new"})
+
+            with (
+                mock.patch.object(main, "db", database),
+                mock.patch.object(main, "adapters", {session["agent"]: object()}),
+                mock.patch.object(main, "enqueue_for_subscribers", return_value=[]),
+                mock.patch.object(main, runner, side_effect=run),
+                mock.patch.object(main, tasks, {}),
+            ):
+                # Exercise routing and response serialization without auth middleware.
+                await app(
+                    {
+                        "type": "http",
+                        "method": "POST",
+                        "path": f"/sessions/{session['id']}/{endpoint}",
+                        "root_path": "",
+                        "query_string": b"",
+                        "headers": [(b"content-type", b"application/json")],
+                    },
+                    receive,
+                    send,
+                )
+                await getattr(main, tasks)[session["id"]]
+
+            rows = database.recent_scrollback(session["id"])
+            input_row = next(row for row in rows if row["type"] == event_type)
+            self.assertEqual(sent[0]["status"], 202)
+            body = json.loads(b"".join(m.get("body", b"") for m in sent))
+            self.assertEqual(body, {"status": "running", "message_id": input_row["id"]})
+            self.assertIsInstance(body["message_id"], int)
+            self.assertLess(body["message_id"], rows[-1]["id"])
+
+    async def test_turn_returns_persisted_input_id(self):
+        await self._check_endpoint("turn", "prompt", "input", "run_turn", "running_tasks")
+
+    async def test_bash_returns_persisted_input_id(self):
+        await self._check_endpoint("bash", "command", "bash_input", "run_bash", "bash_tasks")
+
+
 class BashModeTests(unittest.IsolatedAsyncioTestCase):
     """main.begin_bash / run_bash: the parts that must not touch turn state."""
 

@@ -817,15 +817,15 @@ async def delete_session(session_id: int) -> dict[str, str]:
 
 
 @app.post("/sessions/{session_id}/turn", status_code=202)
-async def start_turn(session_id: int, payload: TurnRequest) -> dict[str, str]:
-    await begin_turn(session_id, payload.prompt)
-    return {"status": "running"}
+async def start_turn(session_id: int, payload: TurnRequest) -> dict[str, str | int]:
+    message_id = await begin_turn(session_id, payload.prompt)
+    return {"status": "running", "message_id": message_id}
 
 
 @app.post("/sessions/{session_id}/bash", status_code=202)
-async def start_bash(session_id: int, payload: BashRequest) -> dict[str, str]:
-    await begin_bash(session_id, payload.command)
-    return {"status": "running"}
+async def start_bash(session_id: int, payload: BashRequest) -> dict[str, str | int]:
+    message_id = await begin_bash(session_id, payload.command)
+    return {"status": "running", "message_id": message_id}
 
 
 @app.websocket("/ws/sessions/{session_id}/files")
@@ -1088,7 +1088,7 @@ async def receive_subscriber(
         return
 
 
-async def begin_turn(session_id: int, prompt: str) -> None:
+async def begin_turn(session_id: int, prompt: str) -> int:
     async with turn_lock:
         session = require_session_or_404(session_id)
         require_not_archived(session)
@@ -1103,12 +1103,13 @@ async def begin_turn(session_id: int, prompt: str) -> None:
         ):
             raise HTTPException(status_code=409, detail="Session is already running")
 
-        def start() -> None:
-            db.append_scrollback(session_id, "input", {"text": prompt})
+        def start() -> int:
+            row = db.append_scrollback(session_id, "input", {"text": prompt})
             db.update_status(session_id, "running")
             db.touch_session(session_id)
+            return row["id"]
 
-        await commit_stream(
+        message_id = await commit_stream(
             session_id,
             start,
             lambda _result: [
@@ -1119,6 +1120,7 @@ async def begin_turn(session_id: int, prompt: str) -> None:
 
         task = asyncio.create_task(run_turn(session_id, prompt))
         running_tasks[session_id] = task
+        return message_id
 
 
 async def run_turn(session_id: int, prompt: str) -> None:
@@ -1213,7 +1215,7 @@ async def run_turn(session_id: int, prompt: str) -> None:
         running_tasks.pop(session_id, None)
 
 
-async def begin_bash(session_id: int, command: str) -> None:
+async def begin_bash(session_id: int, command: str) -> int:
     """Start a one-shot shell command in the session's working directory.
 
     Deliberately none of what `begin_turn` does: no turn lock, no status
@@ -1228,17 +1230,19 @@ async def begin_bash(session_id: int, command: str) -> None:
             status_code=409, detail="A command is already running in this session"
         )
 
-    def start() -> None:
-        db.append_scrollback(session_id, "bash_input", {"command": command})
+    def start() -> int:
+        row = db.append_scrollback(session_id, "bash_input", {"command": command})
         db.touch_session(session_id)
+        return row["id"]
 
-    await commit_stream(
+    message_id = await commit_stream(
         session_id,
         start,
         lambda _result: [{"type": "bash_input", "command": command}],
     )
 
     bash_tasks[session_id] = asyncio.create_task(run_bash(session_id, command))
+    return message_id
 
 
 async def run_bash(session_id: int, command: str) -> None:
