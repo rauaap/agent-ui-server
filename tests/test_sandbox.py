@@ -95,7 +95,7 @@ class SandboxSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(updated["sandbox"], False)
         self.assertEqual(send.call_args.args[1], [{
             "type": "settings", "sandbox": False,
-            "auto_approve_write": False, "auto_approve_command": False,
+            "auto_approve_write": True, "auto_approve_command": True,
             "auto_approve_inter_agent_communication": False,
         }])
         self.assertIs((await self.patch(default["id"], name="renamed"))["sandbox"], False)
@@ -112,11 +112,11 @@ class SandboxSettingsTests(unittest.IsolatedAsyncioTestCase):
         for status in ("running", "awaiting_approval"):
             self.database.update_status(session["id"], status)
             with self.assertRaises(HTTPException) as caught:
-                await self.patch(session["id"], sandbox=False, name="wrong", auto_approve_write=True)
+                await self.patch(session["id"], sandbox=False, name="wrong", auto_approve_write=False)
             self.assertEqual(caught.exception.status_code, 409)
             current = self.database.require_session(session["id"])
             self.assertIs(current["sandbox"], True)
-            self.assertIs(current["auto_approve_write"], False)
+            self.assertIs(current["auto_approve_write"], True)
             self.assertEqual(current["name"], "session")
             # Other settings are still live-editable.
             await self.patch(session["id"], auto_approve_command=True)

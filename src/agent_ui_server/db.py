@@ -1010,15 +1010,18 @@ class Database:
         the returned session's `working_dir` is derived from whichever link is
         set, so it stays correct if either path is ever changed.
         """
+        # Set creation defaults explicitly so existing databases need no schema
+        # migration and existing sessions retain their approval preferences.
         now = utc_now()
         with self._lock, self._conn:
             cursor = self._conn.execute(
                 """
                 INSERT INTO sessions (
                     name, project_id, worktree_id, agent,
-                    agent_session_id, status, created_at, last_active_at, sandbox
+                    agent_session_id, status, created_at, last_active_at, sandbox,
+                    auto_approve_write, auto_approve_command
                 )
-                VALUES (?, ?, ?, ?, NULL, 'idle', ?, ?, ?)
+                VALUES (?, ?, ?, ?, NULL, 'idle', ?, ?, ?, 1, 1)
                 """,
                 (name, project_id, worktree_id, agent, now, now, int(sandbox)),
             )

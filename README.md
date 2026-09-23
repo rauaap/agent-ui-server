@@ -33,6 +33,8 @@ The API can also be exercised directly with tools such as `curl` and
 - Normalizes provider-specific tool calls into a canonical action schema
 - Presents tool approvals and multiple-choice agent questions to clients
 - Supports per-session auto-approval for commands, file writes, and inter-agent communication
+  (commands and writes default on for new sessions; inter-agent communication defaults off).
+  Existing sessions keep their settings; sandbox bypass still requires explicit approval.
 - Creates and manages Git worktrees independently of sessions
 - Runs explicit one-shot shell commands without involving the agent
 - Synchronizes a session's working-directory file tree for path completion

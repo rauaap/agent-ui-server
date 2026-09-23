@@ -110,21 +110,35 @@ class DatabaseTests(unittest.TestCase):
                 database.rename_session("missing", "nope")
             database.close()
 
-    def test_auto_approve_defaults_off_and_toggles(self) -> None:
+    def test_auto_approve_defaults_and_toggles(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             database = Database(Path(tmpdir) / "sessions.db")
             session = make_session(database, "/projects/demo")
 
-            # New sessions start with every toggle off, exposed as bools.
-            self.assertIs(session["auto_approve_write"], False)
-            self.assertIs(session["auto_approve_command"], False)
+            # Commands and writes default on; inter-agent approval stays off.
+            self.assertIs(session["auto_approve_write"], True)
+            self.assertIs(session["auto_approve_command"], True)
             self.assertIs(session["auto_approve_inter_agent_communication"], False)
 
-            updated = database.set_auto_approve(session["id"], command=True)
-            self.assertIs(updated["auto_approve_command"], True)
+            updated = database.set_auto_approve(session["id"], command=False)
+            self.assertIs(updated["auto_approve_command"], False)
+            self.assertIs(updated["auto_approve_write"], True)
+
+            updated = database.set_auto_approve(session["id"], write=False)
             self.assertIs(updated["auto_approve_write"], False)
+            self.assertIs(updated["auto_approve_command"], False)
+
+            database.close()
+            database = Database(Path(tmpdir) / "sessions.db")
+            persisted = database.require_session(session["id"])
+            self.assertIs(persisted["auto_approve_write"], False)
+            self.assertIs(persisted["auto_approve_command"], False)
+            fresh = make_session(database, "/projects/demo")
+            self.assertIs(fresh["auto_approve_write"], True)
+            self.assertIs(fresh["auto_approve_command"], True)
 
             # A partial update leaves the untouched toggles alone.
+            database.set_auto_approve(session["id"], command=True)
             updated = database.set_auto_approve(session["id"], write=True)
             self.assertIs(updated["auto_approve_write"], True)
             self.assertIs(updated["auto_approve_command"], True)
@@ -3073,6 +3087,7 @@ class WebSocketOrderingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_approval_transition_stays_after_initial_snapshot(self) -> None:
         session_id = self.session["id"]
+        self.main.db.set_auto_approve(session_id, command=False)
         websocket = _FakeWebSocket(send_open=False)
         endpoint = asyncio.create_task(
             self.main.session_websocket(websocket, session_id)
@@ -3345,8 +3360,9 @@ class RunTurnAutoApproveTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             main.db = Database(Path(tmpdir) / "sessions.db")
             session = make_session(main.db, tmpdir, agent="fake")
-            if auto_command:
-                main.db.set_auto_approve(session["id"], command=True)
+            main.db.set_auto_approve(
+                session["id"], command=auto_command, write=False
+            )
 
             adapter = _AutoApproveAdapter(category)
             main.adapters["fake"] = adapter
