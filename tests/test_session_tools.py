@@ -36,6 +36,7 @@ class ValidationTests(unittest.IsolatedAsyncioTestCase):
             ("message_session", {"session_id": "1", "message": "hi"}),
             ("message_session", {"session_id": 1, "message": ""}),
             ("start_session", {**CALLS["start_session"], "source": {"type": "user"}}),
+            ("start_session", {**CALLS["start_session"], "sandbox": False}),
         ]:
             with self.subTest(name=name, args=args), self.assertRaises(ValueError):
                 await execute_session_tool(name, args, 7, operation, approve)
@@ -104,6 +105,7 @@ class SessionOperationTests(unittest.IsolatedAsyncioTestCase):
             "name": "new", "project_path": self.tmp.name, "message": "first",
         })
         await self.finish()
+        self.assertTrue(self.db.get_session(result["session_id"])["sandbox"])
         followup = await main.session_tool_operation(self.sender["id"], "message_session", {
             "session_id": result["session_id"], "message": "second",
         })

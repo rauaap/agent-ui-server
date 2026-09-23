@@ -181,7 +181,6 @@ const SESSION_TOOLS = [
 			message: Type.String({ minLength: 1, description: "Message to send." }),
 			agent: Type.Optional(Type.Union([Type.String(), Type.Null()], { description: "Agent backend: claude-code (default) or pi." })),
 			worktree_id: Type.Optional(Type.Union([Type.Integer({ minimum: 1 }), Type.Null()], { description: "Existing worktree ID; omit to use the project directory." })),
-			sandbox: Type.Optional(Type.Union([Type.Boolean(), Type.Null()], { description: "Run sandboxed; defaults to true." })),
 		}, { additionalProperties: false }),
 	},
 	{

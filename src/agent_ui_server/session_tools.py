@@ -28,7 +28,6 @@ class StartSession(Arguments):
     message: str = Field(min_length=1, description="Message to send.")
     agent: str | None = Field(default=None, description="Agent backend: claude-code (default) or pi.")
     worktree_id: int | None = Field(default=None, ge=1, description="Existing worktree ID; omit to use the project directory.")
-    sandbox: bool | None = Field(default=None, description="Run sandboxed; defaults to true.")
 
 
 class ReadSession(Arguments):

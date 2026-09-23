@@ -463,8 +463,8 @@ Claude and pi sessions expose three server-approved tools:
 
 - `message_session(session_id, message)` submits an input to an idle session and
   returns its persisted input ID, without waiting for a response.
-- `start_session(name, project_path, message, agent?, worktree_id?, sandbox?)`
-  creates a session under an existing project, sends its first message, and returns
+- `start_session(name, project_path, message, agent?, worktree_id?)`
+  creates a sandboxed session under an existing project, sends its first message, and returns
   `session_id` and `message_id`. If messaging fails, the session is retained and its
   ID is reported in the error.
 - `read_session(session_id, after?, limit=200)` returns one unchanged scrollback

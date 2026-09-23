@@ -9,7 +9,7 @@ Expose three server-executed tools to agents, matching the high-level helpers in
 `../agent-ui-api`:
 
 - `message_session(session_id, message)`
-- `start_session(name, project_path, message, *, agent=None, worktree_id=None, sandbox=None)`
+- `start_session(name, project_path, message, *, agent=None, worktree_id=None)`
 - `read_session(session_id, *, after=None, limit=200)`
 
 Communication is between sessions, not between fixed parent/child roles. An agent
@@ -40,6 +40,9 @@ Preserve the API helper's semantics: optional creation arguments use the existin
 server defaults. If creation succeeds but the first message fails, retain the
 session and report its ID with the failure. Do not automatically retry or delete
 it.
+
+Agent-started sessions are always sandboxed; the tool has no `sandbox` argument.
+Unsandboxed sessions can only be created through the HTTP API.
 
 The session itself does not need an agent-created/user-created distinction. Its
 first input does, just like every subsequent agent-sent input.
