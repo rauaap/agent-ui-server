@@ -171,10 +171,25 @@ agent-sender wrapper.
 - **Shared backend:** centralize schemas, argument validation, approval policy,
   and session operations rather than duplicating business logic per harness.
 
-Each of the three tools requires explicit server-side approval before executing,
-including reads. Existing read/command auto-approval must not authorize these
-operations. The approval request must identify the requested operation and its
-arguments. Denial or cancellation must not execute the operation.
+Each of the three tools requires server-side approval before executing,
+including reads. Existing read/write/command auto-approval must not authorize
+these operations. The approval request must identify the requested operation and
+its arguments. Denial or cancellation must not execute the operation.
+
+### Auto-approval
+
+The sending session's `auto_approve_inter_agent_communication` toggle (default
+off) auto-approves all three tools, with one exception: a `message_session` or
+`read_session` targeting an unsandboxed or missing session always asks. Messaging
+an unsandboxed session would let a sandboxed sender run anything outside
+Bubblewrap, and reading it would show the sender host data. `start_session` needs no
+such check because agent-started sessions are always sandboxed. The check runs
+against the target's current state when the approval is raised.
+
+The toggle is on the sender, not the recipient: a recipient's history and
+replies flow back to the sender, so the trust decision is whether this sender may
+reach other sessions (and what they have seen) without asking. There are no
+project-level permissions. Cross-project messaging is allowed.
 
 These capabilities are independent of sandbox bypass: their availability must
 not depend on `CLAUDE_HOST_EXEC`, `PI_HOST_EXEC`, or whether the calling session
@@ -206,6 +221,8 @@ agent-specific implementation of turn startup.
 - Live events, scrollback, and `read_session` agree on provenance.
 - Both harnesses receive sender context while stored text remains unchanged.
 - All three operations require approval, even with ordinary auto-approval on.
+- The sender's inter-agent toggle auto-approves them, except messages and reads
+  targeting unsandboxed or missing sessions.
 - Denied/cancelled requests do not execute; pending requests are cleaned up.
 - Both harness integrations work independently of sandbox bypass settings.
 - Existing missing/archived/busy target behavior is preserved.

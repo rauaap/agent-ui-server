@@ -1,4 +1,4 @@
-"""Shared validation and mandatory approval for inter-session tools.
+"""Shared validation and approval for inter-session tools.
 
 The application supplies operations; harness transports never call HTTP routes.
 """
@@ -58,6 +58,30 @@ def validate_session_arguments(name: str, args: Any) -> dict[str, Any]:
     return MODELS[name].model_validate(args).model_dump(exclude_none=True)
 
 
+def auto_approval_setting(
+    action: dict[str, Any], get_session: Callable[[int], dict[str, Any] | None],
+) -> str | None:
+    """The sender toggle that may auto-approve a session-tool action, or None.
+
+    Any call targeting an unsandboxed (or missing) session always asks: a message
+    would let a sandboxed sender run anything outside Bubblewrap, and a read
+    would show it host data. start_session needs no check, since agent-started
+    sessions are always sandboxed.
+    """
+    name = action.get("name")
+    if action.get("kind") != "other" or name not in MODELS:
+        return None
+    try:
+        args = validate_session_arguments(name, action.get("arguments"))
+    except ValueError:
+        return None
+    if "session_id" in args:
+        target = get_session(args["session_id"])
+        if target is None or not target["sandbox"]:
+            return None
+    return "auto_approve_inter_agent_communication"
+
+
 def tool_result(value: Any, *, error: bool = False) -> dict[str, Any]:
     return {"isError": error, "content": [{"type": "text", "text": json.dumps(value)}]}
 
@@ -67,7 +91,8 @@ async def execute_session_tool(
     approve: Callable[[dict[str, Any]], Awaitable[Any]],
 ) -> dict[str, Any]:
     args = validate_session_arguments(name, args)
-    # Never inherit native read/command auto-approval. The approved arguments are
+    # Never inherit native read/command auto-approval; only the sender's
+    # inter-agent toggle applies (auto_approval_setting). The approved arguments are
     # a copy, so approval handling cannot mutate the operation about to execute.
     decision = await approve({"kind": "other", "name": name, "arguments": dict(args)})
     if decision.behavior != "allow":

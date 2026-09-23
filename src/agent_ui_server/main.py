@@ -32,7 +32,7 @@ from .network_guard import (
 )
 from .sandbox_paths import merge_paths, validate_paths
 from .usage import collect_usage
-from .session_tools import delivery_prompt
+from .session_tools import auto_approval_setting as session_tool_approval_setting, delivery_prompt
 
 SCROLLBACK_REPLAY_LIMIT = 200
 WEBSOCKET_LIVE_QUEUE_CAPACITY = 256
@@ -217,6 +217,7 @@ class UpdateSessionRequest(BaseModel):
     name: str | None = Field(default=None, max_length=120)
     auto_approve_write: bool | None = None
     auto_approve_command: bool | None = None
+    auto_approve_inter_agent_communication: bool | None = None
     sandbox: bool | None = None
     archived: bool | None = None
 
@@ -721,7 +722,8 @@ async def _update_session(
     if any(
         value is not None
         for value in (
-            payload.auto_approve_write, payload.auto_approve_command, payload.sandbox
+            payload.auto_approve_write, payload.auto_approve_command,
+            payload.auto_approve_inter_agent_communication, payload.sandbox,
         )
     ):
         def update_settings() -> dict[str, Any]:
@@ -731,6 +733,7 @@ async def _update_session(
                 session_id,
                 write=payload.auto_approve_write,
                 command=payload.auto_approve_command,
+                inter_agent_communication=payload.auto_approve_inter_agent_communication,
             )
 
         session = await commit_stream(
@@ -741,6 +744,9 @@ async def _update_session(
                     "type": "settings",
                     "auto_approve_write": updated["auto_approve_write"],
                     "auto_approve_command": updated["auto_approve_command"],
+                    "auto_approve_inter_agent_communication": updated[
+                        "auto_approve_inter_agent_communication"
+                    ],
                     "sandbox": updated["sandbox"],
                 }
             ],
@@ -1204,7 +1210,9 @@ async def run_turn(
             # next approval, not only on the next turn.
             auto_setting: str | None = None
             if event_type == "approval_request":
-                setting = auto_approval_setting(event.get("action"))
+                setting = auto_approval_setting(event.get("action")) or (
+                    session_tool_approval_setting(event["action"], db.get_session)
+                )
                 current = db.get_session(session_id) or session
                 if setting is not None and current.get(setting):
                     auto_setting = setting

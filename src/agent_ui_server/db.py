@@ -16,7 +16,8 @@ VALID_STATUSES = {"idle", "running", "awaiting_approval"}
 # Per-session auto-approve toggles, stored as 0/1 INTEGER columns. Read-only
 # tools never reach the permission gate on either agent, so only the mutating
 # categories are switchable; the keys here are the column suffixes.
-AUTO_APPROVE_CATEGORIES = ("write", "command")
+# `inter_agent_communication` covers the session tools, reads included.
+AUTO_APPROVE_CATEGORIES = ("write", "command", "inter_agent_communication")
 
 # Every sessions column stored as 0/1 that the API exposes as a bool. A
 # separate name from AUTO_APPROVE_CATEGORIES, which also drives
@@ -35,7 +36,8 @@ _SESSION_QUERY = """
            COALESCE(w.path, s.detached_working_dir, p.path) AS working_dir,
            s.agent, s.agent_session_id, s.status,
            s.created_at, s.last_active_at, s.archived_at,
-           s.auto_approve_write, s.auto_approve_command, s.sandbox
+           s.auto_approve_write, s.auto_approve_command,
+           s.auto_approve_inter_agent_communication, s.sandbox
     FROM sessions s
     JOIN projects p ON p.id = s.project_id
     LEFT JOIN worktrees w ON w.id = s.worktree_id
@@ -60,6 +62,7 @@ _POST_MIGRATION_COLUMNS = {
         "archived_at": "TEXT",
         "archived_with_project": "INTEGER NOT NULL DEFAULT 0",
         "sandbox": "INTEGER NOT NULL DEFAULT 1",
+        "auto_approve_inter_agent_communication": "INTEGER NOT NULL DEFAULT 0",
         # The immutable harness cwd after an archived session is detached from
         # its worktree. NULL while the project/worktree link still supplies it.
         "detached_working_dir": "TEXT",
@@ -161,8 +164,9 @@ class Database:
                     "RENAME COLUMN claude_session_id TO agent_session_id"
                 )
             # Add the per-session auto-approve toggles to databases created
-            # before the feature existed.
-            for category in AUTO_APPROVE_CATEGORIES:
+            # before the feature existed. Only the two the rebuilds below copy;
+            # later toggles are in _POST_MIGRATION_COLUMNS.
+            for category in ("write", "command"):
                 column = f"auto_approve_{category}"
                 if column not in columns:
                     self._conn.execute(
@@ -1080,13 +1084,18 @@ class Database:
         *,
         write: bool | None = None,
         command: bool | None = None,
+        inter_agent_communication: bool | None = None,
     ) -> dict[str, Any]:
         """Update whichever auto-approve toggles are provided; leave the rest.
 
         Returns the refreshed session. A call with nothing to update is a no-op
         that still returns the current row.
         """
-        updates = {"write": write, "command": command}
+        updates = {
+            "write": write,
+            "command": command,
+            "inter_agent_communication": inter_agent_communication,
+        }
         assignments: list[str] = []
         params: list[Any] = []
         for category, value in updates.items():

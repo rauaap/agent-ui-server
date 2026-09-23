@@ -16,6 +16,7 @@ from agent_ui_server.db import Database
 from agent_ui_server.session_tools import (
     MODELS, delivery_prompt, execute_session_tool, validate_session_arguments,
 )
+from agent_ui_server.session_tools import auto_approval_setting as session_tool_approval_setting
 
 
 CALLS = {
@@ -136,6 +137,89 @@ class SessionOperationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(HTTPException):
             await main.begin_turn(self.target["id"], "hello", sender_session_id=self.sender["id"])
         self.assertEqual(self.prompts, [])
+
+
+class _ApprovalAdapter:
+    """Emit one approval_request for `action`, then finish once it is answered."""
+
+    def __init__(self, action):
+        self.action = action
+        self.future = None
+
+    async def start_turn(self, session, prompt):
+        self.future = asyncio.get_running_loop().create_future()
+        yield {"type": "approval_request", "request_id": "perm_1", "call_id": "call-1",
+               "action": self.action, "options": []}
+        await self.future
+        yield {"type": "done"}
+
+    async def send_approval(self, session, request_id, behavior, *, option_id=None, message=None):
+        if not self.future.done():
+            self.future.set_result(ApprovalDecision(behavior=behavior))
+        return behavior
+
+    async def stop(self, session):
+        pass
+
+
+class AutoApprovalTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = Database(":memory:")
+        self.addCleanup(self.db.close)
+        project = self.db.create_project(self.tmp.name, "test")
+        self.sender = self.db.create_session("sender", project["id"], "fake")
+        self.sandboxed = self.db.create_session("sandboxed", project["id"], "claude-code")
+        self.unsandboxed = self.db.create_session("unsandboxed", project["id"], "claude-code")
+        self.db.set_sandbox(self.unsandboxed["id"], False)
+        for patch in (
+            mock.patch.object(main, "db", self.db),
+            mock.patch.object(main, "enqueue_for_subscribers", return_value=[]),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def action(self, name, **args):
+        return {"kind": "other", "name": name, "arguments": {**CALLS[name], **args}}
+
+    async def auto_approved(self, action, **toggles):
+        """Whether run_turn answers `action` itself rather than waiting on the user."""
+        self.db.set_auto_approve(self.sender["id"], **toggles)
+        with mock.patch.dict(main.adapters, {"fake": _ApprovalAdapter(action)}):
+            try:
+                await asyncio.wait_for(main.run_turn(self.sender["id"], "go"), 0.2)
+            except TimeoutError:
+                return False
+        return True
+
+    async def test_toggle_approves_every_tool_unless_target_is_unsandboxed(self):
+        cases = [(self.action("start_session"), True)]
+        for name in ("message_session", "read_session"):
+            cases += [
+                (self.action(name, session_id=self.sandboxed["id"]), True),
+                (self.action(name, session_id=self.unsandboxed["id"]), False),
+                (self.action(name, session_id=999), False),
+            ]
+        for action, expected in cases:
+            with self.subTest(action=action):
+                self.assertIs(await self.auto_approved(action, inter_agent_communication=True), expected)
+
+    async def test_toggle_off_or_other_toggles_never_approve(self):
+        action = self.action("message_session", session_id=self.sandboxed["id"])
+        self.assertFalse(await self.auto_approved(action, inter_agent_communication=False))
+        self.assertFalse(await self.auto_approved(
+            action, inter_agent_communication=False, write=True, command=True,
+        ))
+
+    def test_only_valid_session_tool_actions_have_a_setting(self):
+        for action in (
+            {"kind": "other", "name": "Execute outside sandbox", "arguments": {"command": "ls"}},
+            {"kind": "other", "name": "message_session", "arguments": {"session_id": "8", "message": "hi"}},
+            {"kind": "command", "command": "ls"},
+        ):
+            with self.subTest(action=action):
+                self.assertIsNone(session_tool_approval_setting(action, self.db.get_session))
 
 
 class TransportTests(unittest.IsolatedAsyncioTestCase):

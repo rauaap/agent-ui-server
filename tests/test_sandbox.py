@@ -96,6 +96,7 @@ class SandboxSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(send.call_args.args[1], [{
             "type": "settings", "sandbox": False,
             "auto_approve_write": False, "auto_approve_command": False,
+            "auto_approve_inter_agent_communication": False,
         }])
         self.assertIs((await self.patch(default["id"], name="renamed"))["sandbox"], False)
         reopened = Database(self.database.path)

@@ -115,18 +115,26 @@ class DatabaseTests(unittest.TestCase):
             database = Database(Path(tmpdir) / "sessions.db")
             session = make_session(database, "/projects/demo")
 
-            # New sessions start with both toggles off, exposed as bools.
+            # New sessions start with every toggle off, exposed as bools.
             self.assertIs(session["auto_approve_write"], False)
             self.assertIs(session["auto_approve_command"], False)
+            self.assertIs(session["auto_approve_inter_agent_communication"], False)
 
             updated = database.set_auto_approve(session["id"], command=True)
             self.assertIs(updated["auto_approve_command"], True)
             self.assertIs(updated["auto_approve_write"], False)
 
-            # A partial update leaves the untouched toggle alone.
+            # A partial update leaves the untouched toggles alone.
             updated = database.set_auto_approve(session["id"], write=True)
             self.assertIs(updated["auto_approve_write"], True)
             self.assertIs(updated["auto_approve_command"], True)
+            self.assertIs(updated["auto_approve_inter_agent_communication"], False)
+
+            updated = database.set_auto_approve(
+                session["id"], inter_agent_communication=True
+            )
+            self.assertIs(updated["auto_approve_inter_agent_communication"], True)
+            self.assertIs(updated["auto_approve_write"], True)
 
             # An empty update is a no-op that still returns the row.
             same = database.set_auto_approve(session["id"])

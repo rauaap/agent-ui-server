@@ -32,7 +32,7 @@ The API can also be exercised directly with tools such as `curl` and
 - Streams output and persists the latest transcript history in SQLite
 - Normalizes provider-specific tool calls into a canonical action schema
 - Presents tool approvals and multiple-choice agent questions to clients
-- Supports per-session auto-approval for commands and file writes
+- Supports per-session auto-approval for commands, file writes, and inter-agent communication
 - Creates and manages Git worktrees independently of sessions
 - Runs explicit one-shot shell commands without involving the agent
 - Synchronizes a session's working-directory file tree for path completion
@@ -473,7 +473,10 @@ Claude and pi sessions expose three server-approved tools:
 
 Claude names these `mcp__agent_ui__message_session`, etc., on the existing SDK MCP
 server. Pi registers them in the bundled extension. Every call, including reads,
-requires explicit approval; ordinary read/command auto-approval does not apply.
+requires approval; ordinary read/write/command auto-approval does not apply. The
+sending session's `auto_approve_inter_agent_communication` toggle (default off,
+set with `PATCH /sessions/{id}`) auto-approves them, except that a message or read
+targeting an unsandboxed or missing session always asks.
 They are available independently of sandbox-bypass flags and session sandboxing.
 Busy targets reject messages rather than queueing them.
 
@@ -743,7 +746,9 @@ alongside a `web_search` query are dropped from the action, since a canonical
 search carries a query and forbids a URL.
 
 Auto-approval is derived from `action.kind`: `command` uses
-`auto_approve_command`; `edit` and `write` use `auto_approve_write`. There is no
+`auto_approve_command`; `edit` and `write` use `auto_approve_write`. Inter-agent
+tools (`other` actions named `message_session`, `start_session`, `read_session`)
+use `auto_approve_inter_agent_communication`, as described above. There is no
 provider-name table and no `category` field on the wire. An auto-approved
 request carries `"auto_approved": true` and is followed by an
 `approval_response` with `"auto": true`.
@@ -762,7 +767,7 @@ request carries `"auto_approved": true` and is followed by an
   "exit_code": 0, "duration_ms": 821, "timed_out": false, "truncated": false }
 { "type": "renamed", "name": "new label" }
 { "type": "settings", "auto_approve_write": true, "auto_approve_command": false,
-  "sandbox": true }
+  "auto_approve_inter_agent_communication": false, "sandbox": true }
 { "type": "archived", "archived_at": "2026-08-26T11:02:00Z" }
 { "type": "worktree_detached", "worktree_id": null, "working_dir": "/projects/app-fix" }
 { "type": "done", "session_id": "harness-session-id" }
