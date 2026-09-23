@@ -10,6 +10,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from .approvals import denial_message
 from .shell import run_command
 from .session_tools import TOOLS, validate_session_arguments
 from .sandbox import SandboxFilesystem
@@ -84,7 +85,7 @@ async def execute_host_command(
     decision = await approve(dict(args))
     if decision.behavior != "allow":
         return {"isError": True, "content": [{
-            "type": "text", "text": decision.message or "Host execution denied by user",
+            "type": "text", "text": denial_message(decision.message),
         }]}
     output = await run_command(args["command"], cwd)
     return {

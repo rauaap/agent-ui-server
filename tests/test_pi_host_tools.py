@@ -76,7 +76,10 @@ class PiHostToolTests(unittest.IsolatedAsyncioTestCase):
                 output = json.loads(result["content"][0]["text"])
                 self.assertEqual(output["stdout"].strip(), self.tmp.name)
             else:
-                self.assertEqual(result["content"][0]["text"], "not allowed")
+                self.assertEqual(
+                    result["content"][0]["text"],
+                    "Tool execution was denied by the user. Reason: not allowed",
+                )
             self.assertEqual(events[-1]["type"], "done")
 
     async def test_invalid_arguments_and_disabled_sessions_cannot_execute(self):

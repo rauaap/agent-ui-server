@@ -10,6 +10,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .approvals import denial_message
+
 SessionOperation = Callable[[int, str, dict[str, Any]], Awaitable[Any]]
 
 
@@ -96,7 +98,7 @@ async def execute_session_tool(
     # a copy, so approval handling cannot mutate the operation about to execute.
     decision = await approve({"kind": "other", "name": name, "arguments": dict(args)})
     if decision.behavior != "allow":
-        return tool_result(decision.message or "Session operation denied by user", error=True)
+        return tool_result(denial_message(decision.message), error=True)
     try:
         return tool_result(await operation(sender_id, name, args))
     except Exception as exc:
