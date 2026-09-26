@@ -1232,12 +1232,8 @@ class Database:
     def set_agent_session_id(self, session_id: int, agent_session_id: str) -> None:
         with self._lock, self._conn:
             cursor = self._conn.execute(
-                """
-                UPDATE sessions
-                SET agent_session_id = ?, last_active_at = ?
-                WHERE id = ?
-                """,
-                (agent_session_id, utc_now(), session_id),
+                "UPDATE sessions SET agent_session_id = ? WHERE id = ?",
+                (agent_session_id, session_id),
             )
         if cursor.rowcount == 0:
             raise KeyError(f"Unknown session: {session_id}")
