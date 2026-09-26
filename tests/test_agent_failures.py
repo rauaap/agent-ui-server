@@ -24,8 +24,14 @@ class ClaudeFailureTests(unittest.IsolatedAsyncioTestCase):
                 )]
                 self.assertEqual(events, [
                     {"type": "error", "message": f"Claude Code failed: {expected}"},
-                    {"type": "done", "session_id": "resume"},
+                    {"type": "done"},
                 ])
+
+    async def test_init_reports_session_id(self):
+        events = [e async for e in ClaudeCodeAdapter()._events_from_json(
+            1, None, {"type": "system", "subtype": "init", "session_id": "resume"}
+        )]
+        self.assertEqual(events, [{"type": "session", "session_id": "resume"}])
 
     async def test_success_result_is_not_an_error(self):
         events = [e async for e in ClaudeCodeAdapter()._events_from_json(
@@ -50,7 +56,6 @@ class ClaudeFailureTests(unittest.IsolatedAsyncioTestCase):
             )]
         self.assertEqual([e["type"] for e in events], ["error", "done"])
         self.assertIn("quota exceeded", events[0]["message"])
-        self.assertEqual(events[1]["session_id"], "resume")
 
     async def test_clean_exit_without_result_is_an_error(self):
         original = asyncio.create_subprocess_exec

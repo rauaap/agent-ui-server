@@ -772,7 +772,7 @@ request carries `"auto_approved": true` and is followed by an
   "auto_approve_inter_agent_communication": false, "sandbox": true }
 { "type": "archived", "archived_at": "2026-08-26T11:02:00Z" }
 { "type": "worktree_detached", "worktree_id": null, "working_dir": "/projects/app-fix" }
-{ "type": "done", "session_id": "harness-session-id" }
+{ "type": "done" }
 { "type": "error", "message": "Human-readable failure" }
 ```
 

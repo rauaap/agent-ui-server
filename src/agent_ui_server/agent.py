@@ -624,11 +624,13 @@ class ClaudeCodeAdapter(AgentAdapter):
                 detail = "\n".join(str(item) for item in errors if item) if isinstance(errors, list) else ""
                 detail = detail or event.get("result") or event.get("error") or subtype or "Unknown error"
                 yield {"type": "error", "message": f"Claude Code failed: {detail}"}
-            # done also carries the resume id and closes stdin on failed results.
-            yield {
-                "type": "done",
-                "session_id": self._extract_session_id(event),
-            }
+            # done also closes stdin on failed results.
+            yield {"type": "done"}
+            return
+
+        if event_type == "system" and event.get("subtype") == "init":
+            if event.get("session_id"):
+                yield {"type": "session", "session_id": event["session_id"]}
             return
 
         if event_type == "error":
@@ -732,15 +734,6 @@ class ClaudeCodeAdapter(AgentAdapter):
         return approval_request_event(
             request_id, call_id, action, _event_options(self.OPTIONS)
         )
-
-    def _extract_session_id(self, event: dict[str, Any]) -> str | None:
-        if event.get("session_id"):
-            return event["session_id"]
-        for key in ("result", "metadata", "message"):
-            nested = event.get(key)
-            if isinstance(nested, dict) and nested.get("session_id"):
-                return nested["session_id"]
-        return None
 
     def _error_message(self, event: dict[str, Any]) -> str:
         for key in ("message", "error"):
@@ -1060,7 +1053,6 @@ class PiAdapter(AgentAdapter):
         deny_reasons: dict[str, str] = {}
         batches: dict[str, dict[str, Any]] = {}
         text_buf: list[str] = []
-        current_sid: str | None = session.get("agent_session_id")
         pending_error: str | None = None
 
         assert process.stdin is not None
@@ -1349,7 +1341,7 @@ class PiAdapter(AgentAdapter):
                 await collect_question(envelope, dialog_id)
 
         async def handle_message(message: dict[str, Any]) -> None:
-            nonlocal current_sid, pending_error
+            nonlocal pending_error
             kind = message.get("type")
 
             if kind == "message_end":
@@ -1419,7 +1411,7 @@ class PiAdapter(AgentAdapter):
                 await flush_text()
                 if pending_error:
                     await queue.put({"type": "error", "message": pending_error})
-                await queue.put({"type": "done", "session_id": current_sid})
+                await queue.put({"type": "done"})
                 await queue.put(None)
                 return
 
@@ -1427,7 +1419,7 @@ class PiAdapter(AgentAdapter):
                 if message.get("command") == "get_state" and message.get("success"):
                     data = message.get("data")
                     if isinstance(data, dict) and data.get("sessionId"):
-                        current_sid = str(data["sessionId"])
+                        await queue.put({"type": "session", "session_id": str(data["sessionId"])})
                     return
                 if not message.get("success"):
                     await flush_text()

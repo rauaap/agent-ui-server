@@ -185,7 +185,7 @@ class HostToolTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(output["isError"], behavior == "deny")
                 if behavior == "allow":
                     self.assertEqual(json.loads(output["content"][0]["text"])["stdout"], "prototype")
-                self.assertEqual(events[-1], {"type": "done", "session_id": "fake-host-session"})
+                self.assertEqual(events[-1], {"type": "done"})
                 self.assertEqual(adapter.host_tools, {})
                 self.assertEqual(adapter.pending_approvals, {})
 

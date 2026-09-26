@@ -2482,13 +2482,6 @@ class ClaudeCodeAdapterParsingTests(unittest.TestCase):
         self.assertEqual(event["action"], {"kind": "read", "path": "/projects/demo/a.txt"})
         self.assertNotIn("category", event)
 
-    def test_result_session_id_is_extracted_from_nested_payload(self) -> None:
-        session_id = self.adapter._extract_session_id(
-            {"type": "result", "result": {"session_id": "abc123"}}
-        )
-
-        self.assertEqual(session_id, "abc123")
-
     def test_normalize_questions_extracts_fields_with_defaults(self) -> None:
         questions = _normalize_questions(
             [
@@ -2737,7 +2730,7 @@ for line in sys.stdin:
                 events = await self._collect(adapter)
                 self.assertEqual([e["message"] for e in events if e["type"] == "error"],
                                  ["429 quota exceeded"])
-                self.assertEqual(events[-1], {"type": "done", "session_id": "sess-abc"})
+                self.assertEqual(events[-1], {"type": "done"})
 
     async def test_exhausted_retries_report_once_after_partial_output(self):
         failed = {"type": "message_end", "message": {"role": "assistant",
@@ -2755,9 +2748,10 @@ for line in sys.stdin:
         ]})
         events = await self._collect(adapter)
         self.assertEqual(events, [
+            {"type": "session", "session_id": "sess-abc"},
             {"type": "output", "text": "partial"},
             {"type": "error", "message": "quota exceeded"},
-            {"type": "done", "session_id": "sess-abc"},
+            {"type": "done"},
         ])
 
     async def test_recovered_provider_error_is_not_reported(self):
@@ -2861,7 +2855,7 @@ for line in sys.stdin:
         self.assertEqual(approval["call_id"], "c1")
         self.assertEqual(approval["action"], by_type["tool_use"]["action"])
         self.assertEqual(by_type["output"]["text"], "done!")
-        self.assertEqual(by_type["done"]["session_id"], "sess-abc")
+        self.assertEqual(by_type["session"]["session_id"], "sess-abc")
 
     async def test_question_batch_becomes_one_event(self):
         def dialog(index, header, label):
@@ -3259,7 +3253,7 @@ class _AutoApproveAdapter:
             "options": [],
         }
         await self.future
-        yield {"type": "done", "session_id": "agent-1"}
+        yield {"type": "done"}
 
     async def send_approval(self, session, request_id, behavior, *, option_id=None, message=None):
         self.effective = behavior
@@ -3412,6 +3406,56 @@ class RunTurnAutoApproveTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(
                 self._drive(auto_command=False, category="command"), timeout=0.2
             )
+
+
+class _InterruptedAdapter:
+    """Report a session id, then fail before any `done`."""
+
+    async def start_turn(self, session, prompt):
+        yield {"type": "session", "session_id": "agent-1"}
+        raise RuntimeError("interrupted")
+
+    async def stop(self, session) -> None:
+        pass
+
+
+class RunTurnAgentSessionTests(unittest.IsolatedAsyncioTestCase):
+    async def _drive(self, stored: str | None):
+        from unittest import mock
+
+        from agent_ui_server import main
+
+        original_db = main.db
+        original_enqueue = main.enqueue_for_subscribers
+        with tempfile.TemporaryDirectory() as tmpdir:
+            main.db = Database(Path(tmpdir) / "sessions.db")
+            session = make_session(main.db, tmpdir, agent="interrupted")
+            if stored:
+                main.db.set_agent_session_id(session["id"], stored)
+            main.adapters["interrupted"] = _InterruptedAdapter()
+            events: list[dict] = []
+            main.enqueue_for_subscribers = (
+                lambda _session_id, messages: events.extend(messages) or []
+            )
+            try:
+                with mock.patch.object(
+                    main.db, "set_agent_session_id", wraps=main.db.set_agent_session_id
+                ) as write:
+                    await main.run_turn(session["id"], "go")
+                agent_session_id = main.db.require_session(session["id"])["agent_session_id"]
+            finally:
+                main.enqueue_for_subscribers = original_enqueue
+                main.adapters.pop("interrupted", None)
+                main.db.close()
+                main.db = original_db
+        self.assertNotIn("session", [e["type"] for e in events])
+        return agent_session_id, write.call_count
+
+    async def test_new_agent_session_is_stored_before_done(self) -> None:
+        self.assertEqual(await self._drive(None), ("agent-1", 1))
+
+    async def test_resumed_agent_session_is_not_rewritten(self) -> None:
+        self.assertEqual(await self._drive("agent-0"), ("agent-0", 0))
 
 
 class _FakeStdin:

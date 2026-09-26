@@ -218,11 +218,10 @@ current value there rather than replaying this event.
 
 ## `done`
 
-Marks the end of a turn. `session_id` is the agent's own session id and **may be
-`null`**.
+Marks the end of a turn.
 
 ```json
-{ "type": "done", "session_id": "8c2e..." }
+{ "type": "done" }
 ```
 
 ## `error`

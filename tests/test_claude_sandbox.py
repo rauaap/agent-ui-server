@@ -291,5 +291,5 @@ else:
                         self.assertNotIn(session['id'], adapter.processes)
                         self.assertFalse(adapter.pending_approvals)
                         if prompt == "finish":
-                            self.assertIn({"type": "done", "session_id": "resumed-id"}, events)
+                            self.assertIn({"type": "done"}, events)
                     self.assertEqual(wrap.call_count, 2)

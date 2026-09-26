@@ -1204,6 +1204,14 @@ async def run_turn(
         async for event in adapter.start_turn(session, delivery_prompt(prompt, source)):
             event_type = event.get("type")
 
+            # The harness reports its session id at the start of every turn;
+            # only a new agent session needs it stored.
+            if event_type == "session":
+                if not session.get("agent_session_id") and event.get("session_id"):
+                    session["agent_session_id"] = event["session_id"]
+                    db.set_agent_session_id(session_id, event["session_id"])
+                continue
+
             # Decide auto-approval before persisting/broadcasting so the event
             # carries the marker and we can skip the awaiting_approval status.
             # Re-read the session so a toggle flipped mid-turn applies on the
@@ -1244,8 +1252,6 @@ async def run_turn(
                 # Auto-approved requests never leave running state.
                 if awaiting:
                     db.update_status(session_id, "awaiting_approval")
-                if event_type == "done" and event.get("session_id"):
-                    db.set_agent_session_id(session_id, event["session_id"])
 
             frames = (
                 [{"type": "status", "status": "awaiting_approval"}, event]
