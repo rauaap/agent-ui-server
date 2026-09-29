@@ -237,7 +237,8 @@ export default function (pi: ExtensionAPI) {
 				"Runs in the session working directory with the server environment. " +
 				"Use when sandbox visibility, permissions, or container execution block normal tools. " +
 				"Does not disable sandboxing for the session. Output is bounded by server limits; " +
-				"timeouts and truncation are reported in the result.",
+				"the command is killed after timeout_seconds (default 120), and timeouts and " +
+				"truncation are reported in the result.",
 			promptSnippet: "Run a command outside the sandbox with user approval",
 			promptGuidelines: [
 				"Use bypass_sandbox when Bubblewrap hides needed paths or blocks commands such as Podman.",
@@ -246,6 +247,10 @@ export default function (pi: ExtensionAPI) {
 			parameters: Type.Object({
 				command: Type.String({ minLength: 1 }),
 				reason: Type.String({ minLength: 1 }),
+				timeout_seconds: Type.Optional(Type.Number({
+					exclusiveMinimum: 0,
+					description: "Seconds before the command is killed; defaults to 120.",
+				})),
 			}, { additionalProperties: false }),
 			async execute(toolCallId, params, signal, _onUpdate, ctx) {
 				return requestServerTool("host_exec", toolCallId, params, signal, ctx);

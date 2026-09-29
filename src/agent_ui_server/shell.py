@@ -24,7 +24,7 @@ READ_CHUNK = 64 * 1024
 # A command with nobody watching it must not run forever, and its output must
 # not be able to fill the database or a WebSocket frame. Both are per-command;
 # the output cap applies to stdout and stderr separately.
-BASH_TIMEOUT_SECONDS = float(os.environ.get("BASH_TIMEOUT_SECONDS", "120"))
+BASH_TIMEOUT_SECONDS = 120.0
 BASH_OUTPUT_LIMIT = int(os.environ.get("BASH_OUTPUT_LIMIT", str(100 * 1024)))
 
 # How long a timed-out command gets to honour SIGTERM before SIGKILL.

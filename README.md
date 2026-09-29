@@ -245,7 +245,6 @@ to the API must use their paths *inside* the container, such as
 | `PI_EXTENSION` | bundled `pi_extension.ts` | Pi approval/question extension |
 | `PI_WEB_SEARCH` | bundled `pi_web_search/index.ts` | Pi web extension; empty disables web access |
 | `WEB_ROOT` | unset | Static files mounted at `/` |
-| `BASH_TIMEOUT_SECONDS` | `120` | Timeout for a direct shell command |
 | `BASH_OUTPUT_LIMIT` | `102400` | Bytes retained per stdout/stderr stream |
 | `GIT_TIMEOUT_SECONDS` | `30` | Timeout for a Git operation |
 | `GIT_OUTPUT_LIMIT` | `4096` | Git error-output limit |
@@ -499,8 +498,8 @@ Enable either or both tools in the server environment:
 
 | Setting | Tool in sandboxed sessions |
 | --- | --- |
-| `CLAUDE_HOST_EXEC=1` | Claude: `mcp__agent_ui__bypass_sandbox(command, reason)` |
-| `PI_HOST_EXEC=1` | Pi: `bypass_sandbox(command, reason)` |
+| `CLAUDE_HOST_EXEC=1` | Claude: `mcp__agent_ui__bypass_sandbox(command, reason, timeout_seconds?)` |
+| `PI_HOST_EXEC=1` | Pi: `bypass_sandbox(command, reason, timeout_seconds?)` |
 
 Both settings default to disabled. Non-sandboxed sessions receive neither tool
 nor its system-prompt guidance.
@@ -526,7 +525,7 @@ Bubblewrap and when to discover and use `mcp__agent_ui__bypass_sandbox` through
 ToolSearch. The mount plan is rebuilt for every turn, including resumed sessions.
 
 The agent remains sandboxed. Each host-tool invocation asks the user to
-**Execute outside sandbox**, showing the exact command, reason, and session
+**Execute outside sandbox**, showing the exact command, reason, timeout, and session
 working directory. Ordinary command auto-approval does not bypass this gate;
 only a per-invocation approval permits execution. Denial is returned to the agent
 as a tool error. Both adapters permit dispatch through the ordinary tool gate to
@@ -534,7 +533,9 @@ this server-owned approval gate, avoiding duplicate prompts.
 
 Approved commands use the same server-side shell runner as user `!` commands:
 `bash -lc`, server environment, session working directory, no interactive stdin,
-and the existing `BASH_TIMEOUT_SECONDS` / `BASH_OUTPUT_LIMIT` limits. Output and
+and the `BASH_OUTPUT_LIMIT` output cap. The agent may pass `timeout_seconds`
+(any finite positive number, default 120); the approval prompt's arguments always
+include the timeout that will apply. Output and
 exit status are returned when execution finishes (not streamed). Cancellation
 or turn termination cancels active host commands. Containerized deployments
 execute inside the server container, not outside that container. Sandbox `/tmp`
@@ -818,7 +819,7 @@ Each command is a fresh `bash -lc` process in the session's working directory:
 
 - no `cd`, environment variable, or shell function persists to the next command;
 - stdin is closed, so interactive programs receive EOF rather than hanging;
-- timeout terminates the entire process group and escalates to `SIGKILL`;
+- a 120-second timeout terminates the entire process group and escalates to `SIGKILL`;
 - stdout and stderr are drained and truncated to bounded head/tail output;
 - one shell command may run per session, independently of its agent turn;
 - the stop endpoint cancels both the shell command and agent process.

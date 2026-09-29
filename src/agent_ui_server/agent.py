@@ -482,7 +482,7 @@ class ClaudeCodeAdapter(AgentAdapter):
         return validated
 
     async def _approve_host(
-        self, session_id: int, args: dict[str, str], call_id: str | None = None,
+        self, session_id: int, args: dict[str, Any], call_id: str | None = None,
     ) -> ApprovalDecision:
         host = self.host_tools[session_id]
         return await self._approve_server_action(session_id, {
@@ -1124,7 +1124,7 @@ class PiAdapter(AgentAdapter):
                 self.pending_sessions.pop(request_id, None)
                 self.pending_options.pop(request_id, None)
 
-        async def approve_host(args: dict[str, str], tool_call_id: str) -> ApprovalDecision:
+        async def approve_host(args: dict[str, Any], tool_call_id: str) -> ApprovalDecision:
             return await approve_server_action({
                 "kind": "other", "name": "Execute outside sandbox",
                 "arguments": {**args, "cwd": session["working_dir"]},

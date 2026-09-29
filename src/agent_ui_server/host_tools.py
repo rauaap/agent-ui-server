@@ -6,12 +6,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from .approvals import denial_message
-from .shell import run_command
+from .shell import BASH_TIMEOUT_SECONDS, run_command
 from .session_tools import TOOLS, validate_session_arguments
 from .sandbox import SandboxFilesystem
 
@@ -40,13 +41,18 @@ TOOL = {
         "Use when sandbox restrictions block execution, such as running Podman. "
         "Claude's dangerouslyDisableSandbox flag cannot bypass Bubblewrap. "
         "Runs in the session working directory, with the server's environment. "
-        "Commands are non-interactive and subject to a server timeout."
+        "Commands are non-interactive and killed after timeout_seconds "
+        f"(default {BASH_TIMEOUT_SECONDS:g}); raise it for long-running commands."
     ),
     "inputSchema": {
         "type": "object",
         "properties": {
             "command": {"type": "string", "minLength": 1},
             "reason": {"type": "string", "minLength": 1},
+            "timeout_seconds": {
+                "type": "number", "exclusiveMinimum": 0,
+                "description": f"Seconds before the command is killed; defaults to {BASH_TIMEOUT_SECONDS:g}.",
+            },
         },
         "required": ["command", "reason"],
         "additionalProperties": False,
@@ -70,15 +76,23 @@ def pi_sandbox_guidance(filesystem: SandboxFilesystem) -> str:
     )
 
 
-def validate_host_arguments(args: Any) -> dict[str, str]:
-    if (not isinstance(args, dict) or set(args) != {"command", "reason"}
-            or any(not isinstance(v, str) or not v.strip() for v in args.values())):
-        raise ValueError("Expected non-empty command and reason strings only")
-    return dict(args)
+def validate_host_arguments(args: Any) -> dict[str, Any]:
+    if (not isinstance(args, dict) or not {"command", "reason"} <= set(args)
+            or not set(args) <= {"command", "reason", "timeout_seconds"}
+            or any(not isinstance(args[k], str) or not args[k].strip() for k in ("command", "reason"))):
+        raise ValueError("Expected non-empty command and reason strings and an optional timeout_seconds")
+    timeout = args.get("timeout_seconds")
+    if timeout is None:
+        timeout = BASH_TIMEOUT_SECONDS
+    elif (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout) or timeout <= 0):
+        raise ValueError("timeout_seconds must be a finite positive number")
+    # The default is filled in so the approval prompt shows the timeout that will apply.
+    return {**args, "timeout_seconds": timeout}
 
 
 async def execute_host_command(
-    args: dict[str, str], cwd: str, approve: Callable[[dict[str, str]], Awaitable[Any]],
+    args: dict[str, Any], cwd: str, approve: Callable[[dict[str, Any]], Awaitable[Any]],
 ) -> dict[str, Any]:
     # Neither provider's native tool gate can authorize host execution.
     args = validate_host_arguments(args)
@@ -87,7 +101,7 @@ async def execute_host_command(
         return {"isError": True, "content": [{
             "type": "text", "text": denial_message(decision.message),
         }]}
-    output = await run_command(args["command"], cwd)
+    output = await run_command(args["command"], cwd, timeout=args["timeout_seconds"])
     return {
         "isError": output["exit_code"] != 0 or output["timed_out"],
         "content": [{"type": "text", "text": json.dumps(output)}],
@@ -96,7 +110,7 @@ async def execute_host_command(
 
 class HostTools:
     def __init__(self, process: Any, cwd: str,
-                 approve: Callable[[dict[str, str], str | None], Awaitable[Any]], *,
+                 approve: Callable[[dict[str, Any], str | None], Awaitable[Any]], *,
                  host_enabled: bool = True,
                  session_call: Callable[[str, dict[str, Any], str | None],
                                         Awaitable[dict[str, Any]]] | None = None) -> None:

@@ -105,6 +105,14 @@ class PiHostToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([r["isError"] for r in results], [False, True])
         self.assertEqual(json.loads(results[1]["content"][0]["text"])["exit_code"], 3)
 
+    async def test_timeout_seconds_limits_the_command(self):
+        events = await self.collect([{"command": "sleep 5", "reason": "test", "timeout_seconds": 0.5}])
+        request = next(e for e in events if e["type"] == "approval_request")
+        self.assertEqual(request["action"]["arguments"]["timeout_seconds"], 0.5)
+        result = self.results(events)[0]
+        self.assertTrue(result["isError"])
+        self.assertTrue(json.loads(result["content"][0]["text"])["timed_out"])
+
     async def test_extension_cancel_while_awaiting_approval(self):
         async def cancel(event):
             if event["type"] == "approval_request":
@@ -122,7 +130,7 @@ class PiHostToolTests(unittest.IsolatedAsyncioTestCase):
         for mode in ("stop", "exit", "tool_abort"):
             started, cancelled = asyncio.Event(), asyncio.Event()
 
-            async def execute(*args):
+            async def execute(*args, **kwargs):
                 started.set()
                 try:
                     await asyncio.Future()

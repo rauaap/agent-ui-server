@@ -1,6 +1,7 @@
 """Protocol-level prototype tests; these do not substitute for a real Claude CLI test."""
 import asyncio
 import json
+import math
 import os
 import tempfile
 import unittest
@@ -53,6 +54,10 @@ class HostToolTests(unittest.IsolatedAsyncioTestCase):
                               (self.call(command="echo", reason=""), -32602),
                               (self.call(command="echo", reason="ok", cwd="/"), -32602),
                               (self.call(command=2, reason="ok"), -32602),
+                              (self.call(command="echo", reason="ok", timeout_seconds=0), -32602),
+                              (self.call(command="echo", reason="ok", timeout_seconds=True), -32602),
+                              (self.call(command="echo", reason="ok", timeout_seconds="5"), -32602),
+                              (self.call(command="echo", reason="ok", timeout_seconds=math.inf), -32602),
                               (self.request(name="other", arguments={}), -32602)):
             self.assertEqual((await self.host.dispatch(request))["error"]["code"], code)
         self.assertEqual(self.adapter.pending_approvals, {})
@@ -68,18 +73,30 @@ class HostToolTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotEqual(event["request_id"], "toolu_host")
                 self.assertIsNone(auto_approval_setting(event["action"]))
                 self.assertEqual(event["action"]["arguments"]["cwd"], "/project")
+                self.assertEqual(event["action"]["arguments"]["timeout_seconds"], 120)
                 run.assert_not_awaited()
                 with self.assertRaises(KeyError):
                     await self.adapter.send_approval({"id": 2}, event["request_id"], "allow")
                 await self.adapter.send_approval({"id": 1}, event["request_id"], behavior)
                 response = await task
                 if behavior == "allow":
-                    run.assert_awaited_once_with("echo hello", "/project")
+                    run.assert_awaited_once_with("echo hello", "/project", timeout=120)
                     self.assertFalse(response["result"]["isError"])
                 else:
                     run.assert_not_awaited()
                     self.assertTrue(response["result"]["isError"])
                 self.assertEqual(self.adapter.pending_approvals, {})
+
+    async def test_timeout_is_passed_through_and_shown_for_approval(self):
+        with mock.patch("agent_ui_server.host_tools.run_command", new_callable=mock.AsyncMock) as run:
+            run.return_value = {"stdout": "", "stderr": "", "exit_code": 0, "timed_out": False}
+            task = asyncio.create_task(self.host.dispatch(
+                self.call(command="sleep 1", reason="testing", timeout_seconds=600)))
+            event = await asyncio.wait_for(self.host.events.get(), 1)
+            self.assertEqual(event["action"]["arguments"]["timeout_seconds"], 600)
+            await self.adapter.send_approval({"id": 1}, event["request_id"], "allow")
+            await task
+            run.assert_awaited_once_with("sleep 1", "/project", timeout=600)
 
     async def test_native_permission_does_not_double_prompt(self):
         event = {"type": "control_request", "request_id": "p1", "request": {
@@ -121,7 +138,7 @@ class HostToolTests(unittest.IsolatedAsyncioTestCase):
         started = asyncio.Event()
         cancelled = asyncio.Event()
 
-        async def execute(*args):
+        async def execute(*args, **kwargs):
             started.set()
             try:
                 await asyncio.Future()
