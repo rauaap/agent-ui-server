@@ -27,12 +27,12 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
         script = '''import json,sys
 request=json.loads(sys.stdin.readline())
 assert request['request']['subtype']=='initialize'
-print(json.dumps({'type':'control_response','response':{'subtype':'success','request_id':request['request_id'],'response':{'models':[{'value':'default','resolvedModel':'claude-opus-5-5','displayName':'Default (recommended)'},{'value':'opus','resolvedModel':'claude-opus-5-5','displayName':'Opus 5.5'},{'value':'claude-opus-5-5','resolvedModel':'claude-opus-5-5','displayName':'Duplicate'},{'value':'sonnet','resolvedModel':'claude-sonnet-5-5','displayName':'Sonnet 5.5'}]}}}),flush=True)
+print(json.dumps({'type':'control_response','response':{'subtype':'success','request_id':request['request_id'],'response':{'models':[{'value':'default','resolvedModel':'claude-opus-5-5','displayName':'Default (recommended)'},{'value':'opus','resolvedModel':'claude-opus-5-5','displayName':'Opus 5.5','supportedEffortLevels':['low','max']},{'value':'claude-opus-5-5','resolvedModel':'claude-opus-5-5','displayName':'Duplicate'},{'value':'haiku','resolvedModel':'claude-haiku-4-5','displayName':'Haiku 4.5'}]}}}),flush=True)
 sys.stdin.read()
 '''
         self.assertEqual(await self.run_script("claude-code", script), {
-            "models": [{"id": "claude-opus-5-5", "name": "Opus 5.5"},
-                       {"id": "claude-sonnet-5-5", "name": "Sonnet 5.5"}], "error": None})
+            "models": [{"id": "claude-opus-5-5", "name": "Opus 5.5", "reasoning_levels": ["low", "max"]},
+                       {"id": "claude-haiku-4-5", "name": "Haiku 4.5", "reasoning_levels": []}], "error": None})
 
     async def test_claude_missing_concrete_id_does_not_fall_back(self):
         script = '''import json,sys
@@ -44,12 +44,38 @@ sys.stdin.read()
         self.assertEqual(result["models"], [])
         self.assertIsNotNone(result["error"])
 
-    async def test_pi_table(self):
-        result = await self.run_script("pi", "print('provider model context max-out thinking images\\nopenai old-model 128K 32K yes yes\\nopenai new-model 128K 32K yes yes')")
-        self.assertEqual(result, {"models": [
-            {"id": "openai/new-model", "name": "new-model"},
-            {"id": "openai/old-model", "name": "old-model"},
+    async def test_pi_rpc_metadata_only(self):
+        script = '''import json,sys
+models=[{'provider':'openai','id':'old-model'},{'provider':'anthropic','id':'z-model'},{'provider':'openai','id':'new-model'}]
+levels={'old-model':['off','low'],'new-model':['low','high','max'],'z-model':['off']}
+selected=None
+print(json.dumps({'type':'extension_ui_request','id':'x'}),flush=True)
+for line in sys.stdin:
+    command=json.loads(line)
+    kind=command['type']
+    assert kind in ('get_available_models','set_model','get_available_thinking_levels'),kind
+    data=None
+    if kind=='get_available_models':
+        data={'models':models}
+    elif kind=='set_model':
+        selected=command['modelId']
+    else:
+        data={'levels':levels[selected]}
+    print(json.dumps({'type':'response','id':command['id'],'command':kind,'success':True,'data':data}),flush=True)
+'''
+        self.assertEqual(await self.run_script("pi", script), {"models": [
+            {"id": "openai/old-model", "name": "old-model", "reasoning_levels": ["off", "low"]},
+            {"id": "openai/new-model", "name": "new-model", "reasoning_levels": ["low", "high", "max"]},
+            {"id": "anthropic/z-model", "name": "z-model", "reasoning_levels": ["off"]},
         ], "error": None})
+
+    async def test_pi_rpc_error_response(self):
+        script = '''import json,sys
+command=json.loads(sys.stdin.readline())
+print(json.dumps({'type':'response','id':command['id'],'command':command['type'],'success':False,'error':'No models'}),flush=True)
+sys.stdin.read()
+'''
+        self.assertEqual(await self.run_script("pi", script), {"models": [], "error": "Model discovery failed: No models"})
 
     async def test_failure_and_timeout_are_isolated(self):
         result = await self.run_script("pi", "import sys;sys.exit(2)")
@@ -63,17 +89,28 @@ sys.stdin.read()
         self.assertIsNotNone(result["claude-code"]["error"])
         self.assertIsNone(result["pi"]["error"])
 
-    async def test_launches_use_saved_model_on_resume(self):
-        for adapter, resume_flag in [(ClaudeCodeAdapter(), "--resume"), (PiAdapter(), "--session")]:
-            commands = []
-            async def spawn(*args, **kwargs):
-                commands.append(args)
-                raise FileNotFoundError("Probe stops after capturing launch arguments")
-            with tempfile.TemporaryDirectory() as cwd, patch("agent_ui_server.agent.asyncio.create_subprocess_exec", spawn):
-                _ = [e async for e in adapter.start_turn({"id": 1, "working_dir": cwd, "sandbox": False, "agent_session_id": "resume-id", "model": "saved-model"}, "hi")]
-            command = commands[0]
+    async def launch_command(self, adapter, session):
+        commands = []
+        async def spawn(*args, **kwargs):
+            commands.append(args)
+            raise FileNotFoundError("Probe stops after capturing launch arguments")
+        with tempfile.TemporaryDirectory() as cwd, patch("agent_ui_server.agent.asyncio.create_subprocess_exec", spawn):
+            _ = [e async for e in adapter.start_turn({"id": 1, "working_dir": cwd, "sandbox": False, **session}, "hi")]
+        return commands[0]
+
+    async def test_launches_use_saved_model_and_reasoning_level_on_resume(self):
+        for adapter, resume_flag, level_flag in [
+            (ClaudeCodeAdapter(), "--resume", "--effort"), (PiAdapter(), "--session", "--thinking"),
+        ]:
+            command = await self.launch_command(adapter, {
+                "agent_session_id": "resume-id", "model": "saved-model", "reasoning_level": "high",
+            })
             self.assertEqual(command[command.index("--model") + 1], "saved-model")
+            self.assertEqual(command[command.index(level_flag) + 1], "high")
             self.assertEqual(command[command.index(resume_flag) + 1], "resume-id")
+            command = await self.launch_command(adapter, {"model": None, "reasoning_level": None})
+            self.assertNotIn("--model", command)
+            self.assertNotIn(level_flag, command)
 
 
 class SessionModelTests(unittest.IsolatedAsyncioTestCase):
@@ -86,7 +123,7 @@ class SessionModelTests(unittest.IsolatedAsyncioTestCase):
         self.project = self.db.create_project(self.tmp.name, "project")
         self.patch_db = patch.object(main, "db", self.db)
         self.patch_db.start()
-        self.catalog = {"pi": {"models": [{"id": "p/m", "name": "M"}], "error": None}, "claude-code": {"models": [], "error": "Unavailable"}}
+        self.catalog = {"pi": {"models": [{"id": "p/m", "name": "M", "reasoning_levels": ["low", "high"]}], "error": None}, "claude-code": {"models": [], "error": "Unavailable"}}
         self.patch_catalog = patch.object(main, "model_catalog", self.catalog)
         self.patch_catalog.start()
 
@@ -118,7 +155,8 @@ class SessionModelTests(unittest.IsolatedAsyncioTestCase):
                 {"id": "claude-code", "name": "Claude Code", "default": True,
                  "models": [], "models_error": "Unavailable"},
                 {"id": "pi", "name": "Pi", "default": False,
-                 "models": [{"id": "p/m", "name": "M"}], "models_error": None},
+                 "models": [{"id": "p/m", "name": "M", "reasoning_levels": ["low", "high"]}],
+                 "models_error": None},
             ]
             self.assertEqual(await self.main.list_agents(), expected)
             self.assertEqual(await self.main.list_agents(), expected)
@@ -129,7 +167,7 @@ class SessionModelTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_empty_catalog_and_model_order(self):
         self.catalog["claude-code"] = {"models": [], "error": None}
-        self.catalog["pi"]["models"].append({"id": "p/second", "name": "Second"})
+        self.catalog["pi"]["models"].append({"id": "p/second", "name": "Second", "reasoning_levels": []})
         agents = await self.main.list_agents()
         self.assertEqual(agents[0]["models"], [])
         self.assertIsNone(agents[0]["models_error"])
@@ -144,6 +182,34 @@ class SessionModelTests(unittest.IsolatedAsyncioTestCase):
         agent = schema["components"]["schemas"]["CatalogAgent"]
         self.assertEqual(set(agent["required"]), {"id", "name", "default", "models", "models_error"})
         self.assertEqual(agent["properties"]["models"]["items"]["$ref"], "#/components/schemas/CatalogModel")
+        model = schema["components"]["schemas"]["CatalogModel"]
+        self.assertEqual(set(model["required"]), {"id", "name", "reasoning_levels"})
+
+    async def test_reasoning_level_create_validate_and_update(self):
+        create = self.main.CreateSessionRequest
+        session = await self.main.create_session(create(name="t", project_path=self.tmp.name, agent="pi", model="p/m", reasoning_level="high"))
+        self.assertEqual(session["reasoning_level"], "high")
+        default = await self.main.create_session(create(name="d", project_path=self.tmp.name, agent="pi", model="p/m"))
+        self.assertIsNone(default["reasoning_level"])
+        for model, level in [(None, "high"), ("p/m", "max")]:
+            with self.assertRaises(HTTPException) as caught:
+                await self.main.create_session(create(name="t", project_path=self.tmp.name, agent="pi", model=model, reasoning_level=level))
+            self.assertEqual(caught.exception.status_code, 400)
+
+        update = self.main.UpdateSessionRequest
+        updated = await self.main.update_session(default["id"], update(reasoning_level="low"))
+        self.assertEqual(updated["reasoning_level"], "low")
+        with self.assertRaises(HTTPException) as caught:
+            await self.main.update_session(default["id"], update(reasoning_level="max", name="unapplied"))
+        self.assertEqual(caught.exception.status_code, 400)
+        unchanged = await self.main.update_session(default["id"], update(reasoning_level=None))
+        self.assertEqual((unchanged["name"], unchanged["reasoning_level"]), ("d", "low"))
+        reopened = Database(self.path)
+        try:
+            self.assertEqual(reopened.get_session(session["id"])["reasoning_level"], "high")
+        finally:
+            reopened.close()
+        self.assertEqual(validate_session_arguments("start_session", {"name": "n", "project_path": "/p", "message": "hi", "model": "p/m", "reasoning_level": "low"})["reasoning_level"], "low")
 
     async def test_startup_discovers_once(self):
         with patch.object(self.main, "load_auth_token"), patch.object(self.main, "discover_catalog", AsyncMock(return_value=self.catalog)) as discover:

@@ -30,6 +30,7 @@ class StartSession(Arguments):
     message: str = Field(min_length=1, description="Message to send.")
     agent: str | None = Field(default=None, description="Agent backend: claude-code (default) or pi.")
     model: str | None = Field(default=None, min_length=1, description="Model ID from the selected agent's models in GET /agents; omit to use the harness default.")
+    reasoning_level: str | None = Field(default=None, min_length=1, description="One of the chosen model's reasoning_levels in GET /agents; requires model. Omit to use the harness default.")
     worktree_id: int | None = Field(default=None, ge=1, description="Existing worktree ID; omit to use the project directory.")
 
 

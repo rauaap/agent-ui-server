@@ -34,7 +34,7 @@ BOOL_COLUMNS = tuple(
 _SESSION_QUERY = """
     SELECT s.id, s.name, s.project_id, s.worktree_id,
            COALESCE(w.path, s.detached_working_dir, p.path) AS working_dir,
-           s.agent, s.model, s.agent_session_id, s.status,
+           s.agent, s.model, s.reasoning_level, s.agent_session_id, s.status,
            s.created_at, s.last_active_at, s.archived_at,
            s.auto_approve_write, s.auto_approve_command,
            s.auto_approve_inter_agent_communication, s.sandbox
@@ -60,6 +60,8 @@ _POST_MIGRATION_COLUMNS = {
     },
     "sessions": {
         "model": "TEXT",
+        # NULL leaves the choice to the harness default.
+        "reasoning_level": "TEXT",
         "archived_at": "TEXT",
         "archived_with_project": "INTEGER NOT NULL DEFAULT 0",
         "sandbox": "INTEGER NOT NULL DEFAULT 1",
@@ -1004,6 +1006,7 @@ class Database:
         worktree_id: int | None = None,
         sandbox: bool = True,
         model: str | None = None,
+        reasoning_level: str | None = None,
     ) -> dict[str, Any]:
         """Create a session belonging to a project.
 
@@ -1019,13 +1022,14 @@ class Database:
             cursor = self._conn.execute(
                 """
                 INSERT INTO sessions (
-                    name, project_id, worktree_id, agent, model,
+                    name, project_id, worktree_id, agent, model, reasoning_level,
                     agent_session_id, status, created_at, last_active_at, sandbox,
                     auto_approve_write, auto_approve_command
                 )
-                VALUES (?, ?, ?, ?, ?, NULL, 'idle', ?, ?, ?, 1, 1)
+                VALUES (?, ?, ?, ?, ?, ?, NULL, 'idle', ?, ?, ?, 1, 1)
                 """,
-                (name, project_id, worktree_id, agent, model, now, now, int(sandbox)),
+                (name, project_id, worktree_id, agent, model, reasoning_level,
+                 now, now, int(sandbox)),
             )
             session_id = cursor.lastrowid
         return self.require_session(session_id)
@@ -1068,6 +1072,16 @@ class Database:
             cursor = self._conn.execute(
                 "UPDATE sessions SET name = ? WHERE id = ?",
                 (name, session_id),
+            )
+        if cursor.rowcount == 0:
+            raise KeyError(f"Unknown session: {session_id}")
+        return self.require_session(session_id)
+
+    def set_reasoning_level(self, session_id: int, level: str | None) -> dict[str, Any]:
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                "UPDATE sessions SET reasoning_level = ? WHERE id = ?",
+                (level, session_id),
             )
         if cursor.rowcount == 0:
             raise KeyError(f"Unknown session: {session_id}")

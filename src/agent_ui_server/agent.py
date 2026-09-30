@@ -342,6 +342,8 @@ class ClaudeCodeAdapter(AgentAdapter):
             })])
         if session.get("model") is not None:
             command.extend(["--model", session["model"]])
+        if session.get("reasoning_level") is not None:
+            command.extend(["--effort", session["reasoning_level"]])
         if session.get("agent_session_id"):
             command.extend(["--resume", session["agent_session_id"]])
 
@@ -994,6 +996,8 @@ class PiAdapter(AgentAdapter):
             command.extend(["-e", self.web_extension_path])
         if session.get("model") is not None:
             command.extend(["--model", session["model"]])
+        if session.get("reasoning_level") is not None:
+            command.extend(["--thinking", session["reasoning_level"]])
         if session.get("agent_session_id"):
             command.extend(["--session", session["agent_session_id"]])
 

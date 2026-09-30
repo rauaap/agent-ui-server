@@ -274,7 +274,7 @@ FastAPI also exposes generated OpenAPI documentation at `/docs`.
 | `DELETE` | `/worktrees/{id}` | Remove a clean, unused worktree |
 | `GET` | `/sessions` | List sessions and current metadata |
 | `POST` | `/sessions` | Create a session for a registered project |
-| `PATCH` | `/sessions/{id}` | Rename, archive, or change auto-approval/sandbox settings |
+| `PATCH` | `/sessions/{id}` | Rename, archive, or change reasoning level or auto-approval/sandbox settings |
 | `POST` | `/sessions/{id}/detach-worktree` | Detach an archived session while preserving its cwd |
 | `POST` | `/sessions/{id}/turn` | Start an agent turn |
 | `POST` | `/sessions/{id}/bash` | Start a direct one-shot shell command |
@@ -290,19 +290,35 @@ FastAPI also exposes generated OpenAPI documentation at `/docs`.
 [
   {
     "id": "claude-code", "name": "Claude Code", "default": true,
-    "models": [{"id": "claude-opus-5-5", "name": "Opus 5.5"}],
+    "models": [
+      {"id": "claude-opus-5-5", "name": "Opus 5.5",
+       "reasoning_levels": ["low", "medium", "high", "xhigh", "max"]},
+      {"id": "claude-haiku-4-5-20251001", "name": "Haiku 4.5", "reasoning_levels": []}
+    ],
     "models_error": null
   },
   {
     "id": "pi", "name": "Pi", "default": false,
-    "models": [{"id": "openai-codex/gpt-5.5", "name": "gpt-5.5"}],
+    "models": [
+      {"id": "openai-codex/gpt-5.5", "name": "gpt-5.5",
+       "reasoning_levels": ["off", "minimal", "low", "medium", "high", "xhigh"]}
+    ],
     "models_error": null
   }
 ]
 ```
 
 There is no separate `/models` endpoint. Settings and session creation use
-this same catalog. Reasoning capabilities are not included yet.
+this same catalog.
+
+`reasoning_levels` lists, in the harness's own order and vocabulary, the levels
+the harness accepts for that model; an empty list means there is no choice.
+Claude's come from each model's `supportedEffortLevels` and are API effort
+values. Pi's come from Pi itself (`get_available_thinking_levels` per model)
+and are Pi's normalized thinking levels, which its provider adapters translate
+or clamp; distinct levels can produce the same provider request. The catalog
+does not report a default level: Claude Code resolves its default per model
+and account only at turn time, and Pi applies its own settings.
 
 Discovery runs once on startup, with a 30-second timeout per harness, in
 parallel. There are no refreshes. A failed harness returns an empty `models`
@@ -311,8 +327,9 @@ from working. Clients treat IDs as opaque and use the catalog for the selected
 agent when creating a session. Claude IDs are concrete `resolvedModel` IDs,
 not moving aliases. The `default` entry is removed and duplicate concrete IDs
 are folded together, preserving Claude's order and the first non-default label.
-Pi IDs remain provider-qualified; its discovered list is reversed before
-being returned. Clients preselect the first entry and send
+Pi discovery runs one short-lived `pi --mode rpc --no-extensions --no-session`
+process, which sends no prompt. Pi IDs remain provider-qualified; its list is
+sorted by provider and model, as `pi --list-models` prints it, then reversed. Clients preselect the first entry and send
 an explicit ID; on discovery failure they show the error and block creation
 for that harness rather than offering a default/fallback choice.
 
@@ -324,6 +341,18 @@ include `model`. The selection is persisted and used on every turn/resume;
 resumes do not revalidate against the startup catalog. Existing sessions get
 `model: null`. `PATCH /sessions/{id}` rejects `model` with `422`: changing models
 is not supported. The agent-facing `start_session` tool accepts the same field.
+
+`POST /sessions` also accepts `reasoning_level` (string or null). Null means
+the harness picks: nothing is passed and clients show "Default". A level
+requires an explicit `model` and must be one of that model's
+`reasoning_levels` (`400` otherwise). It is passed as `--effort` to Claude Code
+and `--thinking` to Pi on every turn and resume. `PATCH /sessions/{id}` can set
+a different level from the same list, taking effect from the next turn, and
+broadcasts `{"type": "reasoning_level", "reasoning_level": "high"}`. Null in a
+PATCH leaves the level unchanged; a set level cannot be cleared, because a
+resumed Pi session would keep its last level rather than return to Pi's
+default. Session responses include `reasoning_level`, and `start_session`
+accepts it too.
 
 Create a project before creating a session. Every request needs the token
 (see [Security model](#security-model)):
@@ -801,6 +830,7 @@ request carries `"auto_approved": true` and is followed by an
 { "type": "bash_output", "command": "pytest -q", "stdout": "...", "stderr": "",
   "exit_code": 0, "duration_ms": 821, "timed_out": false, "truncated": false }
 { "type": "renamed", "name": "new label" }
+{ "type": "reasoning_level", "reasoning_level": "high" }
 { "type": "settings", "auto_approve_write": true, "auto_approve_command": false,
   "auto_approve_inter_agent_communication": false, "sandbox": true }
 { "type": "archived", "archived_at": "2026-08-26T11:02:00Z" }

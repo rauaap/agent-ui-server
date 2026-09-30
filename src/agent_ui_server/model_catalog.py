@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
-import os
 import tempfile
 from typing import Any
 
@@ -23,38 +23,53 @@ async def discover_models(agent: str, executable: str) -> dict[str, Any]:
         return {"models": [], "error": f"Model discovery failed: {exc}"}
 
 
-async def _pi_models(executable: str) -> list[dict[str, str]]:
-    process = await asyncio.create_subprocess_exec(
-        executable, "--no-extensions", "--list-models",
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        env={**os.environ, "NO_COLOR": "1"}, start_new_session=True,
-    )
-    try:
-        stdout, stderr = await process.communicate()
-        if process.returncode:
-            raise RuntimeError(stderr.decode(errors="replace").strip() or f"Exit code {process.returncode}")
-        lines = stdout.decode().splitlines()
-        header = next((i for i, line in enumerate(lines) if line.split()[:2] == ["provider", "model"]), None)
-        if header is None:
-            if "No models available" in stdout.decode():
-                return []
-            raise RuntimeError("Unrecognized Pi model listing")
-        models = []
-        for line in lines[header + 1:]:
-            if not line.strip():
-                continue
-            fields = line.split()
-            if len(fields) != 6:
-                raise RuntimeError("Unrecognized Pi model row")
-            provider, model = fields[:2]
-            models.append({"id": f"{provider}/{model}", "name": model})
-        # Clients preselect the first entry; reverse Pi's listing order.
-        return models[::-1]
-    finally:
-        await stop_process(process)
+async def _pi_models(executable: str) -> list[dict[str, Any]]:
+    # Metadata only over RPC: no prompt, session file, extensions, or project settings.
+    with tempfile.TemporaryDirectory(prefix="agent-ui-models-") as cwd:
+        process = await asyncio.create_subprocess_exec(
+            executable, "--mode", "rpc", "--no-extensions", "--no-session", cwd=cwd,
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE, start_new_session=True,
+        )
+        stderr_task = asyncio.create_task(process.stderr.read())
+        request_ids = itertools.count()
+
+        async def call(command: dict[str, Any]) -> Any:
+            request_id = str(next(request_ids))
+            process.stdin.write((json.dumps({**command, "id": request_id}) + "\n").encode())
+            await process.stdin.drain()
+            while line := await process.stdout.readline():
+                event = json.loads(line)
+                if event.get("type") != "response" or event.get("id") != request_id:
+                    continue
+                if not event["success"]:
+                    raise RuntimeError(event["error"])
+                return event.get("data")
+            stderr = (await stderr_task).decode(errors="replace").strip()
+            raise RuntimeError(stderr or "Pi exited before model discovery")
+
+        try:
+            models = (await call({"type": "get_available_models"}))["models"]
+            # Match `pi --list-models` order, then reverse: clients preselect the first entry.
+            models.sort(key=lambda model: (model["provider"], model["id"]), reverse=True)
+            catalog = []
+            for model in models:
+                # Pi decides which of its levels a model offers; ask rather than
+                # re-deriving that from `thinkingLevelMap`.
+                await call({"type": "set_model", "provider": model["provider"], "modelId": model["id"]})
+                levels = (await call({"type": "get_available_thinking_levels"}))["levels"]
+                catalog.append({
+                    "id": f"{model['provider']}/{model['id']}",
+                    "name": model["id"],
+                    "reasoning_levels": levels,
+                })
+            return catalog
+        finally:
+            await stop_process(process)
+            await stderr_task
 
 
-async def _claude_models(executable: str) -> list[dict[str, str]]:
+async def _claude_models(executable: str) -> list[dict[str, Any]]:
     # No prompt, session persistence, tools, project settings, or MCP servers.
     with tempfile.TemporaryDirectory(prefix="agent-ui-models-") as cwd:
         process = await asyncio.create_subprocess_exec(
@@ -91,7 +106,12 @@ async def _claude_models(executable: str) -> list[dict[str, str]]:
                     if model_id in seen:
                         continue
                     seen.add(model_id)
-                    catalog.append({"id": model_id, "name": model["displayName"]})
+                    catalog.append({
+                        "id": model_id,
+                        "name": model["displayName"],
+                        # Absent for models without effort control, e.g. Haiku.
+                        "reasoning_levels": model.get("supportedEffortLevels", []),
+                    })
                 return catalog
             raise RuntimeError("Claude exited before model discovery")
         finally:

@@ -191,6 +191,7 @@ class CreateSessionRequest(BaseModel):
     project_path: str = Field(min_length=1)
     agent: str = "claude-code"
     model: str | None = Field(default=None, min_length=1)
+    reasoning_level: str | None = Field(default=None, min_length=1)
     worktree_id: int | None = None
     sandbox: bool = True
 
@@ -212,10 +213,12 @@ class CreateSessionRequest(BaseModel):
 
 
 class UpdateSessionRequest(BaseModel):
-    """Partial update: name, auto-approve toggles, sandbox, archive flag.
+    """Partial update: name, reasoning level, auto-approve toggles, sandbox, archive flag.
 
     Every field is optional; only the ones supplied are applied. `name` keeps
-    the old rename contract (non-empty, trimmed) when present.
+    the old rename contract (non-empty, trimmed) when present. A reasoning level
+    cannot be cleared back to the harness default: a resumed Pi session would
+    keep its last level anyway.
     """
 
     @model_validator(mode="before")
@@ -226,6 +229,7 @@ class UpdateSessionRequest(BaseModel):
         return data
 
     name: str | None = Field(default=None, max_length=120)
+    reasoning_level: str | None = Field(default=None, min_length=1)
     auto_approve_write: bool | None = None
     auto_approve_command: bool | None = None
     auto_approve_inter_agent_communication: bool | None = None
@@ -278,6 +282,8 @@ async def shutdown() -> None:
 class CatalogModel(BaseModel):
     id: str
     name: str
+    # The harness's own vocabulary; empty when the model offers no choice.
+    reasoning_levels: list[str]
 
 
 class CatalogAgent(BaseModel):
@@ -506,6 +512,30 @@ async def create_session(payload: CreateSessionRequest) -> dict[str, Any]:
     return await create_session_operation(payload)
 
 
+def catalog_model(agent: str, model_id: str) -> dict[str, Any]:
+    catalog = model_catalog.get(agent)
+    if catalog is None or catalog["error"] is not None:
+        raise HTTPException(status_code=503, detail="Model discovery unavailable for this agent")
+    for model in catalog["models"]:
+        if model["id"] == model_id:
+            return model
+    raise HTTPException(status_code=400, detail="Unknown model for this agent")
+
+
+def validate_reasoning_level(agent: str, model_id: str | None, level: str | None) -> None:
+    """Accept only a level the startup catalog lists for the session's model.
+
+    Levels differ per model, so the harness-default model has none to check
+    against. Resumes pass the stored level on without revalidating.
+    """
+    if level is None:
+        return
+    if model_id is None:
+        raise HTTPException(status_code=400, detail="reasoning_level requires an explicit model")
+    if level not in catalog_model(agent, model_id)["reasoning_levels"]:
+        raise HTTPException(status_code=400, detail="Unsupported reasoning level for this model")
+
+
 async def create_session_operation(payload: CreateSessionRequest) -> dict[str, Any]:
     """Create a session under an existing project.
 
@@ -516,11 +546,8 @@ async def create_session_operation(payload: CreateSessionRequest) -> dict[str, A
     if payload.agent not in adapters:
         raise HTTPException(status_code=400, detail="Unknown agent")
     if payload.model is not None:
-        catalog = model_catalog.get(payload.agent)
-        if catalog is None or catalog["error"] is not None:
-            raise HTTPException(status_code=503, detail="Model discovery unavailable for this agent")
-        if not any(model["id"] == payload.model for model in catalog["models"]):
-            raise HTTPException(status_code=400, detail="Unknown model for this agent")
+        catalog_model(payload.agent, payload.model)
+    validate_reasoning_level(payload.agent, payload.model, payload.reasoning_level)
     name = payload.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="name cannot be empty")
@@ -562,6 +589,7 @@ async def create_session_operation(payload: CreateSessionRequest) -> dict[str, A
         project_id=project["id"],
         agent=payload.agent,
         model=payload.model,
+        reasoning_level=payload.reasoning_level,
         worktree_id=payload.worktree_id,
         sandbox=payload.sandbox,
     )
@@ -743,6 +771,7 @@ async def _update_session(
             status_code=409,
             detail="Cannot change sandbox while a turn is in progress",
         )
+    validate_reasoning_level(current["agent"], current["model"], payload.reasoning_level)
     session: dict[str, Any] | None = None
 
     if payload.name is not None:
@@ -750,6 +779,16 @@ async def _update_session(
             session_id,
             lambda: db.rename_session(session_id, payload.name),
             lambda _session: [{"type": "renamed", "name": payload.name}],
+        )
+
+    if payload.reasoning_level is not None:
+        # Applies from the next turn; a running turn keeps the level it started with.
+        session = await commit_stream(
+            session_id,
+            lambda: db.set_reasoning_level(session_id, payload.reasoning_level),
+            lambda updated: [
+                {"type": "reasoning_level", "reasoning_level": updated["reasoning_level"]}
+            ],
         )
 
     if any(
