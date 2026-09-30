@@ -275,14 +275,25 @@ async def shutdown() -> None:
     db.close()
 
 
-@app.get("/agents")
-async def list_agents() -> list[dict[str, Any]]:
-    """List the adapters this server can run, in picker order.
+class CatalogModel(BaseModel):
+    id: str
+    name: str
 
-    An id alone does not make a picker — a client also needs something to
-    display and needs to know which one to preselect. The label comes off the
-    adapter class and the default off `CreateSessionRequest`, so neither is
-    restated here and neither can drift from what `POST /sessions` accepts.
+
+class CatalogAgent(BaseModel):
+    id: str
+    name: str
+    default: bool
+    models: list[CatalogModel]
+    models_error: str | None
+
+
+@app.get("/agents", response_model=list[CatalogAgent])
+async def list_agents() -> list[dict[str, Any]]:
+    """Return registered agents and their startup model catalogs in picker order.
+
+    Labels come from adapters and the default from `CreateSessionRequest`.
+    Requests never refresh model discovery.
     """
     default = CreateSessionRequest.model_fields["agent"].default
     return [
@@ -290,15 +301,11 @@ async def list_agents() -> list[dict[str, Any]]:
             "id": agent_id,
             "name": type(adapter).LABEL or agent_id,
             "default": agent_id == default,
+            "models": model_catalog[agent_id]["models"],
+            "models_error": model_catalog[agent_id]["error"],
         }
         for agent_id, adapter in adapters.items()
     ]
-
-
-@app.get("/models")
-async def list_models() -> dict[str, Any]:
-    """Return catalogs discovered once at startup; requests never refresh them."""
-    return model_catalog
 
 
 @app.get("/usage")

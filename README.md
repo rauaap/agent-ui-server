@@ -261,8 +261,7 @@ FastAPI also exposes generated OpenAPI documentation at `/docs`.
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/agents` | List registered agent adapters for a picker |
-| `GET` | `/models` | Read per-harness model catalogs discovered at server startup |
+| `GET` | `/agents` | List registered agents with their startup model catalogs |
 | `GET` | `/usage` | Five-hour and weekly consumption for each subscription |
 | `GET` | `/sandbox-paths` | Read server-wide sandbox path defaults |
 | `PATCH` | `/sandbox-paths` | Replace server-wide sandbox path defaults |
@@ -285,27 +284,29 @@ FastAPI also exposes generated OpenAPI documentation at `/docs`.
 
 ### Agents and sessions
 
-`GET /agents` currently returns:
+`GET /agents` returns agents and their models together, in picker order:
 
 ```json
 [
-  { "id": "claude-code", "name": "Claude Code", "default": true },
-  { "id": "pi", "name": "Pi", "default": false }
+  {
+    "id": "claude-code", "name": "Claude Code", "default": true,
+    "models": [{"id": "claude-opus-5-5", "name": "Opus 5.5"}],
+    "models_error": null
+  },
+  {
+    "id": "pi", "name": "Pi", "default": false,
+    "models": [{"id": "openai-codex/gpt-5.5", "name": "gpt-5.5"}],
+    "models_error": null
+  }
 ]
 ```
 
-`GET /models` returns a catalog per harness:
-
-```json
-{
-  "claude-code": {"models": [{"id": "claude-opus-5-5", "name": "Opus 5.5"}], "error": null},
-  "pi": {"models": [{"id": "openai-codex/gpt-5.5", "name": "gpt-5.5"}], "error": null}
-}
-```
+There is no separate `/models` endpoint. Settings and session creation use
+this same catalog. Reasoning capabilities are not included yet.
 
 Discovery runs once on startup, with a 30-second timeout per harness, in
 parallel. There are no refreshes. A failed harness returns an empty `models`
-array and an `error` string without preventing the server or other harness
+array and a `models_error` string without preventing the server or other harness
 from working. Clients treat IDs as opaque and use the catalog for the selected
 agent when creating a session. Claude IDs are concrete `resolvedModel` IDs,
 not moving aliases. The `default` entry is removed and duplicate concrete IDs
@@ -316,7 +317,7 @@ an explicit ID; on discovery failure they show the error and block creation
 for that harness rather than offering a default/fallback choice.
 
 `POST /sessions` accepts `model` (string or null). Omitted/null means harness
-default for compatibility with existing clients. Explicit IDs must belong to
+default. Explicit IDs must belong to
 the selected agent's catalog (`400` otherwise); discovery failure makes explicit
 selection unavailable (`503`). Session responses, including `GET /sessions`,
 include `model`. The selection is persisted and used on every turn/resume;

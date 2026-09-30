@@ -336,7 +336,9 @@ class AppWiringTests(unittest.IsolatedAsyncioTestCase):
     async def test_startup_loads_the_token_file(self) -> None:
         from agent_ui_server import main
 
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(main, "auth_token", None):
+        catalog = {agent: {"models": [], "error": None} for agent in main.adapters}
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(main, "auth_token", None), \
+                mock.patch.object(main, "model_catalog", catalog):
             path = Path(tmp) / "token"
             with mock.patch.dict("os.environ", {"AUTH_TOKEN_FILE": str(path)}), \
                     mock.patch("builtins.print") as printed:

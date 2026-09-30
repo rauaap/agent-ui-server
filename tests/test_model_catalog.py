@@ -114,12 +114,36 @@ class SessionModelTests(unittest.IsolatedAsyncioTestCase):
                 await self.main.create_session(self.main.CreateSessionRequest(name="test", project_path=self.tmp.name, agent=agent, model=model))
             self.assertEqual(caught.exception.status_code, status)
         with patch.object(self.main, "discover_catalog", AsyncMock()) as discover:
-            self.assertEqual(await self.main.list_models(), self.catalog)
-            self.assertEqual(await self.main.list_models(), self.catalog)
+            expected = [
+                {"id": "claude-code", "name": "Claude Code", "default": True,
+                 "models": [], "models_error": "Unavailable"},
+                {"id": "pi", "name": "Pi", "default": False,
+                 "models": [{"id": "p/m", "name": "M"}], "models_error": None},
+            ]
+            self.assertEqual(await self.main.list_agents(), expected)
+            self.assertEqual(await self.main.list_agents(), expected)
             discover.assert_not_called()
         with self.assertRaises(ValidationError):
             self.main.UpdateSessionRequest(model="p/m")
         self.assertEqual(validate_session_arguments("start_session", {"name": "n", "project_path": "/p", "message": "hi", "model": "p/m"})["model"], "p/m")
+
+    async def test_empty_catalog_and_model_order(self):
+        self.catalog["claude-code"] = {"models": [], "error": None}
+        self.catalog["pi"]["models"].append({"id": "p/second", "name": "Second"})
+        agents = await self.main.list_agents()
+        self.assertEqual(agents[0]["models"], [])
+        self.assertIsNone(agents[0]["models_error"])
+        self.assertEqual(agents[1]["models"], self.catalog["pi"]["models"])
+
+    def test_openapi_catalog_schema_and_removed_models_endpoint(self):
+        schema = self.main.app.openapi()
+        self.assertNotIn("/models", schema["paths"])
+        response = schema["paths"]["/agents"]["get"]["responses"]["200"]
+        items = response["content"]["application/json"]["schema"]["items"]
+        self.assertEqual(items["$ref"], "#/components/schemas/CatalogAgent")
+        agent = schema["components"]["schemas"]["CatalogAgent"]
+        self.assertEqual(set(agent["required"]), {"id", "name", "default", "models", "models_error"})
+        self.assertEqual(agent["properties"]["models"]["items"]["$ref"], "#/components/schemas/CatalogModel")
 
     async def test_startup_discovers_once(self):
         with patch.object(self.main, "load_auth_token"), patch.object(self.main, "discover_catalog", AsyncMock(return_value=self.catalog)) as discover:

@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path, PurePosixPath
 from typing import Any
+from unittest.mock import patch
 
 import asyncio
 
@@ -2306,6 +2307,14 @@ class DeleteProjectTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ListAgentsTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        from agent_ui_server import main
+
+        catalog = {agent: {"models": [], "error": None} for agent in main.adapters}
+        patcher = patch.object(main, "model_catalog", catalog)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     async def test_lists_every_registered_adapter(self) -> None:
         from agent_ui_server import main
 
