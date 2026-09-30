@@ -34,7 +34,7 @@ BOOL_COLUMNS = tuple(
 _SESSION_QUERY = """
     SELECT s.id, s.name, s.project_id, s.worktree_id,
            COALESCE(w.path, s.detached_working_dir, p.path) AS working_dir,
-           s.agent, s.agent_session_id, s.status,
+           s.agent, s.model, s.agent_session_id, s.status,
            s.created_at, s.last_active_at, s.archived_at,
            s.auto_approve_write, s.auto_approve_command,
            s.auto_approve_inter_agent_communication, s.sandbox
@@ -59,6 +59,7 @@ _POST_MIGRATION_COLUMNS = {
         "archived_at": "TEXT",
     },
     "sessions": {
+        "model": "TEXT",
         "archived_at": "TEXT",
         "archived_with_project": "INTEGER NOT NULL DEFAULT 0",
         "sandbox": "INTEGER NOT NULL DEFAULT 1",
@@ -1002,6 +1003,7 @@ class Database:
         agent: str,
         worktree_id: int | None = None,
         sandbox: bool = True,
+        model: str | None = None,
     ) -> dict[str, Any]:
         """Create a session belonging to a project.
 
@@ -1017,13 +1019,13 @@ class Database:
             cursor = self._conn.execute(
                 """
                 INSERT INTO sessions (
-                    name, project_id, worktree_id, agent,
+                    name, project_id, worktree_id, agent, model,
                     agent_session_id, status, created_at, last_active_at, sandbox,
                     auto_approve_write, auto_approve_command
                 )
-                VALUES (?, ?, ?, ?, NULL, 'idle', ?, ?, ?, 1, 1)
+                VALUES (?, ?, ?, ?, ?, NULL, 'idle', ?, ?, ?, 1, 1)
                 """,
-                (name, project_id, worktree_id, agent, now, now, int(sandbox)),
+                (name, project_id, worktree_id, agent, model, now, now, int(sandbox)),
             )
             session_id = cursor.lastrowid
         return self.require_session(session_id)

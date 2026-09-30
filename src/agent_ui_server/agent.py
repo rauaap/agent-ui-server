@@ -340,6 +340,8 @@ class ClaudeCodeAdapter(AgentAdapter):
             command.extend(["--mcp-config", json.dumps({
                 "mcpServers": {"agent_ui": {"type": "sdk", "name": "agent_ui"}}
             })])
+        if session.get("model") is not None:
+            command.extend(["--model", session["model"]])
         if session.get("agent_session_id"):
             command.extend(["--resume", session["agent_session_id"]])
 
@@ -990,6 +992,8 @@ class PiAdapter(AgentAdapter):
             command.append("--agent-ui-session-tools")
         if self.web_extension_path:
             command.extend(["-e", self.web_extension_path])
+        if session.get("model") is not None:
+            command.extend(["--model", session["model"]])
         if session.get("agent_session_id"):
             command.extend(["--session", session["agent_session_id"]])
 

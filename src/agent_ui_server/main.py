@@ -32,7 +32,10 @@ from .network_guard import (
 )
 from .sandbox_paths import merge_paths, validate_paths
 from .usage import collect_usage
+from .model_catalog import discover_catalog
 from .session_tools import auto_approval_setting as session_tool_approval_setting, delivery_prompt
+
+model_catalog: dict[str, Any] = {}
 
 SCROLLBACK_REPLAY_LIMIT = 200
 WEBSOCKET_LIVE_QUEUE_CAPACITY = 256
@@ -187,6 +190,7 @@ class CreateSessionRequest(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     project_path: str = Field(min_length=1)
     agent: str = "claude-code"
+    model: str | None = Field(default=None, min_length=1)
     worktree_id: int | None = None
     sandbox: bool = True
 
@@ -213,6 +217,13 @@ class UpdateSessionRequest(BaseModel):
     Every field is optional; only the ones supplied are applied. `name` keeps
     the old rename contract (non-empty, trimmed) when present.
     """
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_model_change(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "model" in data:
+            raise ValueError("Session model cannot be changed")
+        return data
 
     name: str | None = Field(default=None, max_length=120)
     auto_approve_write: bool | None = None
@@ -245,6 +256,8 @@ async def startup() -> None:
     # Also covers launches that bypass main(), such as `uvicorn ...:app`.
     load_auth_token()
     db.reset_active_sessions()
+    global model_catalog
+    model_catalog = await discover_catalog(adapters)
 
 
 @app.on_event("shutdown")
@@ -280,6 +293,12 @@ async def list_agents() -> list[dict[str, Any]]:
         }
         for agent_id, adapter in adapters.items()
     ]
+
+
+@app.get("/models")
+async def list_models() -> dict[str, Any]:
+    """Return catalogs discovered once at startup; requests never refresh them."""
+    return model_catalog
 
 
 @app.get("/usage")
@@ -489,6 +508,12 @@ async def create_session_operation(payload: CreateSessionRequest) -> dict[str, A
     """
     if payload.agent not in adapters:
         raise HTTPException(status_code=400, detail="Unknown agent")
+    if payload.model is not None:
+        catalog = model_catalog.get(payload.agent)
+        if catalog is None or catalog["error"] is not None:
+            raise HTTPException(status_code=503, detail="Model discovery unavailable for this agent")
+        if not any(model["id"] == payload.model for model in catalog["models"]):
+            raise HTTPException(status_code=400, detail="Unknown model for this agent")
     name = payload.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="name cannot be empty")
@@ -529,6 +554,7 @@ async def create_session_operation(payload: CreateSessionRequest) -> dict[str, A
         name=name,
         project_id=project["id"],
         agent=payload.agent,
+        model=payload.model,
         worktree_id=payload.worktree_id,
         sandbox=payload.sandbox,
     )

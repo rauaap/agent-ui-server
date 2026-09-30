@@ -29,6 +29,7 @@ class StartSession(Arguments):
     project_path: str = Field(min_length=1, description="Path of an existing registered project.")
     message: str = Field(min_length=1, description="Message to send.")
     agent: str | None = Field(default=None, description="Agent backend: claude-code (default) or pi.")
+    model: str | None = Field(default=None, min_length=1, description="Model ID from the server's /models catalog; omit to use the harness default.")
     worktree_id: int | None = Field(default=None, ge=1, description="Existing worktree ID; omit to use the project directory.")
 
 

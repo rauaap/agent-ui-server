@@ -262,6 +262,7 @@ FastAPI also exposes generated OpenAPI documentation at `/docs`.
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/agents` | List registered agent adapters for a picker |
+| `GET` | `/models` | Read per-harness model catalogs discovered at server startup |
 | `GET` | `/usage` | Five-hour and weekly consumption for each subscription |
 | `GET` | `/sandbox-paths` | Read server-wide sandbox path defaults |
 | `PATCH` | `/sandbox-paths` | Replace server-wide sandbox path defaults |
@@ -292,6 +293,36 @@ FastAPI also exposes generated OpenAPI documentation at `/docs`.
   { "id": "pi", "name": "Pi", "default": false }
 ]
 ```
+
+`GET /models` returns a catalog per harness:
+
+```json
+{
+  "claude-code": {"models": [{"id": "claude-opus-5-5", "name": "Opus 5.5"}], "error": null},
+  "pi": {"models": [{"id": "openai-codex/gpt-5.5", "name": "gpt-5.5"}], "error": null}
+}
+```
+
+Discovery runs once on startup, with a 30-second timeout per harness, in
+parallel. There are no refreshes. A failed harness returns an empty `models`
+array and an `error` string without preventing the server or other harness
+from working. Clients treat IDs as opaque and use the catalog for the selected
+agent when creating a session. Claude IDs are concrete `resolvedModel` IDs,
+not moving aliases. The `default` entry is removed and duplicate concrete IDs
+are folded together, preserving Claude's order and the first non-default label.
+Pi IDs remain provider-qualified; its discovered list is reversed before
+being returned. Clients preselect the first entry and send
+an explicit ID; on discovery failure they show the error and block creation
+for that harness rather than offering a default/fallback choice.
+
+`POST /sessions` accepts `model` (string or null). Omitted/null means harness
+default for compatibility with existing clients. Explicit IDs must belong to
+the selected agent's catalog (`400` otherwise); discovery failure makes explicit
+selection unavailable (`503`). Session responses, including `GET /sessions`,
+include `model`. The selection is persisted and used on every turn/resume;
+resumes do not revalidate against the startup catalog. Existing sessions get
+`model: null`. `PATCH /sessions/{id}` rejects `model` with `422`: changing models
+is not supported. The agent-facing `start_session` tool accepts the same field.
 
 Create a project before creating a session. Every request needs the token
 (see [Security model](#security-model)):
