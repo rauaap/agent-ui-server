@@ -92,14 +92,18 @@ class SessionOperationTests(unittest.IsolatedAsyncioTestCase):
             await self.finish()
             source = {"type": "user"} if sender is None else {"type": "agent", "session_id": sender}
             row = next(r for r in self.db.recent_scrollback(sid) if r["id"] == mid)
-            self.assertEqual(row["payload"], {"text": "original", "source": source})
-            self.assertIn({"type": "input", **row["payload"]}, self.events)
+            self.assertEqual(row["payload"], {"text": "original", "source": source, "delivery": "queued"})
+            self.assertIn({"type": "input", "message_id": mid, **row["payload"]}, self.events)
+            self.assertTrue(any(
+                event["type"] == "inputs_shipped" and
+                any(message["message_id"] == mid for message in event["messages"])
+                for event in self.events
+            ))
             self.assertEqual(self.prompts[-1], delivery_prompt("original", source))
             page = await main.session_tool_operation(self.sender["id"], "read_session", {"session_id": sid})
             self.assertIn(row, page["messages"])
             self.assertEqual(page, await main.get_scrollback(sid, after=None, limit=200))
-        legacy = self.db.append_scrollback(sid, "input", {"text": "old"})
-        self.assertEqual(delivery_prompt("old", legacy["payload"].get("source")), "old")
+        self.assertEqual(delivery_prompt("hello", {"type": "user"}), "[Message from user]\nhello")
 
     async def test_start_and_followup_use_same_agent_source(self):
         result = await main.session_tool_operation(self.sender["id"], "start_session", {
@@ -124,14 +128,16 @@ class SessionOperationTests(unittest.IsolatedAsyncioTestCase):
                 })
         self.assertTrue(any(s["name"] == "retained" for s in self.db.list_sessions()))
 
-    async def test_missing_busy_and_archived_target(self):
-        for sid in (999, self.target["id"]):
-            if sid != 999:
-                self.db.update_status(sid, "running")
-            with self.assertRaises(HTTPException):
-                await main.session_tool_operation(self.sender["id"], "message_session", {
-                    "session_id": sid, "message": "hello",
-                })
+    async def test_missing_and_archived_target_rejected_busy_target_queues(self):
+        with self.assertRaises(HTTPException):
+            await main.session_tool_operation(self.sender["id"], "message_session", {
+                "session_id": 999, "message": "hello",
+            })
+        self.db.update_status(self.target["id"], "running")
+        mid = await main.session_tool_operation(self.sender["id"], "message_session", {
+            "session_id": self.target["id"], "message": "hello",
+        })
+        self.assertEqual(self.db.pending_inputs(self.target["id"])[0]["message_id"], mid)
         self.db.update_status(self.target["id"], "idle")
         self.db.set_session_archived(self.target["id"], True)
         with self.assertRaises(HTTPException):

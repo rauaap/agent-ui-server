@@ -3074,12 +3074,13 @@ class WebSocketOrderingTests(unittest.IsolatedAsyncioTestCase):
             lambda _result: [{"type": "status", "status": "idle"}],
         )
         websocket.send_gate.set()
-        await self.wait_for(lambda: len(websocket.sent) == 4)
+        await self.wait_for(lambda: len(websocket.sent) == 5)
 
         self.assertEqual(
             websocket.sent,
             [
                 {"type": "output", "text": "old"},
+                {"type": "input_queue", "messages": []},
                 {"type": "status", "status": "running"},
                 {"type": "archived", "archived_at": None},
                 {"type": "status", "status": "idle"},
@@ -3107,14 +3108,14 @@ class WebSocketOrderingTests(unittest.IsolatedAsyncioTestCase):
                 == "awaiting_approval"
             )
             websocket.send_gate.set()
-            await self.wait_for(lambda: len(websocket.sent) == 4)
+            await self.wait_for(lambda: len(websocket.sent) == 5)
 
             self.assertEqual(
                 [event["type"] for event in websocket.sent],
-                ["status", "archived", "status", "approval_request"],
+                ["input_queue", "status", "archived", "status", "approval_request"],
             )
             self.assertEqual(
-                websocket.sent[2]["status"], "awaiting_approval"
+                websocket.sent[3]["status"], "awaiting_approval"
             )
             self.assertEqual(
                 self.main.db.recent_scrollback(session_id)[-1]["type"],
@@ -3200,13 +3201,31 @@ class WebSocketOrderingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(websocket.close_code, 1011)
         self.assertNotIn(session_id, self.main.subscribers)
 
+    async def test_queue_snapshot_includes_acceptance_outside_replay_window(self) -> None:
+        session_id = self.session["id"]
+        accepted = self.main.db.enqueue_input(session_id, "still queued", {"type": "user"})
+        for i in range(self.main.SCROLLBACK_REPLAY_LIMIT + 1):
+            self.main.db.append_scrollback(session_id, "output", {"text": str(i)})
+        websocket = _FakeWebSocket()
+        endpoint = asyncio.create_task(self.main.session_websocket(websocket, session_id))
+        try:
+            await self.wait_for(lambda: len(websocket.sent) == self.main.SCROLLBACK_REPLAY_LIMIT + 3)
+            self.assertNotIn("input", [frame["type"] for frame in websocket.sent])
+            snapshot = websocket.sent[-3]
+            self.assertEqual(snapshot["type"], "input_queue")
+            self.assertEqual(snapshot["messages"], self.main.db.pending_inputs(session_id))
+            self.assertEqual(snapshot["messages"][0]["message_id"], accepted["id"])
+        finally:
+            endpoint.cancel()
+            await asyncio.gather(endpoint, return_exceptions=True)
+
     async def test_receive_disconnect_stops_writer_and_removes_subscriber(self) -> None:
         session_id = self.session["id"]
         websocket = _FakeWebSocket()
         endpoint = asyncio.create_task(
             self.main.session_websocket(websocket, session_id)
         )
-        await self.wait_for(lambda: len(websocket.sent) == 2)
+        await self.wait_for(lambda: len(websocket.sent) == 3)
         subscriber = next(iter(self.main.subscribers[session_id]))
         assert subscriber.writer is not None
 
@@ -3749,7 +3768,10 @@ class InputMessageIdTests(unittest.IsolatedAsyncioTestCase):
             input_row = next(row for row in rows if row["type"] == event_type)
             self.assertEqual(sent[0]["status"], 202)
             body = json.loads(b"".join(m.get("body", b"") for m in sent))
-            self.assertEqual(body, {"status": "running", "message_id": input_row["id"]})
+            self.assertEqual(body, {
+                "status": "accepted" if endpoint == "turn" else "running",
+                "message_id": input_row["id"],
+            })
             self.assertIsInstance(body["message_id"], int)
             self.assertLess(body["message_id"], rows[-1]["id"])
 

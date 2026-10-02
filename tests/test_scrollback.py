@@ -68,15 +68,18 @@ class ScrollbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body, {
             "messages": [first, second], "next_cursor": second["id"], "has_more": True,
+            "queued_messages": [],
         })
         status, body = await self.get(f"after={body['next_cursor']}&limit=2")
         self.assertEqual(status, 200)
         self.assertEqual(body, {
             "messages": [third], "next_cursor": third["id"], "has_more": False,
+            "queued_messages": [],
         })
         _, body = await self.get(f"after={third['id']}&limit=2")
         self.assertEqual(body, {
             "messages": [], "next_cursor": third["id"], "has_more": False,
+            "queued_messages": [],
         })
 
     async def test_empty_cursor_defaults_and_beyond_end(self):
@@ -86,6 +89,7 @@ class ScrollbackTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(status, 200)
                 self.assertEqual(body, {
                     "messages": [], "next_cursor": cursor, "has_more": False,
+                    "queued_messages": [],
                 })
 
     async def test_default_limit_and_exact_page(self):

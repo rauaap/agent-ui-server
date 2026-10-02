@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import os
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -33,7 +34,7 @@ from .network_guard import (
 from .sandbox_paths import merge_paths, validate_paths
 from .usage import collect_usage
 from .model_catalog import discover_catalog
-from .session_tools import auto_approval_setting as session_tool_approval_setting, delivery_prompt
+from .session_tools import auto_approval_setting as session_tool_approval_setting, batch_delivery_prompt
 
 model_catalog: dict[str, Any] = {}
 
@@ -111,6 +112,8 @@ file_socket_tasks: dict[int, set[asyncio.Task[None]]] = defaultdict(set)
 # the process lifetime avoids unsafe cleanup while another task is waiting.
 stream_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 running_tasks: dict[int, asyncio.Task[None]] = {}
+stopping_sessions: set[int] = set()
+stop_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 # Bash-mode commands are tracked separately from agent turns on purpose: they
 # are allowed to run alongside one, so they must not share the turn's slot.
 bash_tasks: dict[int, asyncio.Task[None]] = {}
@@ -861,29 +864,39 @@ async def detach_session_worktree(session_id: int) -> dict[str, Any]:
 @app.post("/sessions/{session_id}/stop")
 async def stop_session(session_id: int) -> dict[str, str]:
     session = require_session_or_404(session_id)
-    adapter = adapters.get(session["agent"])
-    if adapter is not None:
-        await adapter.stop(session)
-
-    # Stopping the provider process does not necessarily finish run_turn. The
-    # provider may already have written another approval request to stdout; the
-    # reader can register it after adapter.stop() cleared the pending requests
-    # and then wait forever for its decision. Cancel and join the owning task so
-    # no buffered provider event can keep the in-memory turn slot occupied.
-    task = running_tasks.pop(session_id, None)
-    if task is not None and task is not asyncio.current_task() and not task.done():
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-
-    # Stop means everything this session is running, agent or not — otherwise a
-    # runaway `!` command would have no kill switch short of the timeout.
-    await cancel_bash(session_id)
-    await commit_stream(
-        session_id,
-        lambda: db.update_status(session_id, "idle"),
-        lambda _result: [{"type": "status", "status": "idle"}],
-    )
+    async with halted_session(session):
+        await commit_stream(
+            session_id,
+            lambda: db.update_status(session_id, "idle"),
+            lambda _result: [{"type": "status", "status": "idle"}],
+        )
     return {"status": "idle"}
+
+
+@asynccontextmanager
+async def halted_session(session: dict[str, Any]) -> AsyncIterator[None]:
+    """Keep submissions queued throughout Stop or deletion, including cleanup."""
+    session_id = session["id"]
+    async with stop_locks[session_id]:
+        async with turn_lock:
+            stopping_sessions.add(session_id)
+            task = running_tasks.get(session_id)
+        try:
+            adapter = adapters.get(session["agent"])
+            try:
+                if adapter is not None:
+                    await adapter.stop(session)
+            finally:
+                # A buffered approval can outlive provider shutdown. Cancel and
+                # join the owner rather than waiting for that approval forever.
+                if task is not None and task is not asyncio.current_task():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+            await cancel_bash(session_id)
+            yield
+        finally:
+            async with turn_lock:
+                stopping_sessions.discard(session_id)
 
 
 @app.delete("/sessions/{session_id}")
@@ -918,6 +931,7 @@ def read_session_operation(
         "messages": messages,
         "next_cursor": messages[-1]["id"] if messages else after,
         "has_more": len(rows) > limit,
+        "queued_messages": db.pending_inputs(session_id),
     }
 
 
@@ -949,7 +963,7 @@ for _adapter in adapters.values():
 @app.post("/sessions/{session_id}/turn", status_code=202)
 async def start_turn(session_id: int, payload: TurnRequest) -> dict[str, str | int]:
     message_id = await begin_turn(session_id, payload.prompt)
-    return {"status": "running", "message_id": message_id}
+    return {"status": "accepted", "message_id": message_id}
 
 
 @app.post("/sessions/{session_id}/bash", status_code=202)
@@ -1083,7 +1097,7 @@ async def session_websocket(websocket: WebSocket, session_id: int) -> None:
             outbound: asyncio.Queue[dict[str, Any]] = asyncio.Queue(
                 maxsize=(
                     SCROLLBACK_REPLAY_LIMIT
-                    + 2
+                    + 3
                     + WEBSOCKET_LIVE_QUEUE_CAPACITY
                 )
             )
@@ -1092,6 +1106,9 @@ async def session_websocket(websocket: WebSocket, session_id: int) -> None:
                 session_id, SCROLLBACK_REPLAY_LIMIT
             ):
                 outbound.put_nowait(frame_for_scrollback(row))
+            outbound.put_nowait(
+                {"type": "input_queue", "messages": db.pending_inputs(session_id)}
+            )
             outbound.put_nowait(
                 {"type": "status", "status": session["status"]}
             )
@@ -1223,7 +1240,8 @@ async def begin_turn(
 ) -> int:
     source = ({"type": "user"} if sender_session_id is None else
               {"type": "agent", "session_id": sender_session_id})
-    payload = {"text": prompt, "source": source}
+    if not prompt.strip():
+        raise HTTPException(status_code=400, detail="Prompt cannot be empty")
     async with turn_lock:
         session = require_session_or_404(session_id)
         require_not_archived(session)
@@ -1232,38 +1250,42 @@ async def begin_turn(
                 status_code=409,
                 detail=f"Agent is no longer available: {session['agent']}",
             )
-        existing_task = running_tasks.get(session_id)
-        if session["status"] != "idle" or (
-            existing_task and not existing_task.done()
-        ):
-            raise HTTPException(status_code=409, detail="Session is already running")
-
-        def start() -> int:
-            row = db.append_scrollback(session_id, "input", payload)
-            db.update_status(session_id, "running")
-            db.touch_session(session_id)
-            return row["id"]
-
-        message_id = await commit_stream(
+        row = await commit_stream(
             session_id,
-            start,
-            lambda _result: [
-                {"type": "input", **payload},
-                {"type": "status", "status": "running"},
-            ],
+            lambda: db.enqueue_input(session_id, prompt, source),
+            lambda accepted: [frame_for_scrollback(accepted)],
         )
+        existing_task = running_tasks.get(session_id)
+        if session["status"] == "idle" and not (
+            existing_task and not existing_task.done()
+        ) and session_id not in stopping_sessions:
+            await ship_queued_turn(session_id)
+        return row["id"]
 
-        task = asyncio.create_task(run_turn(session_id, prompt, source=source))
-        running_tasks[session_id] = task
-        return message_id
+
+async def ship_queued_turn(session_id: int) -> bool:
+    """Caller holds turn_lock. One inbox snapshot becomes one harness prompt."""
+    row = await commit_stream(
+        session_id,
+        lambda: db.ship_inputs(session_id),
+        lambda shipped: [] if shipped is None else [
+            frame_for_scrollback(shipped),
+            {"type": "status", "status": "running"},
+        ],
+    )
+    if row is None:
+        return False
+    prompt = batch_delivery_prompt(row["payload"]["messages"])
+    running_tasks[session_id] = asyncio.create_task(run_turn(session_id, prompt))
+    return True
 
 
-async def run_turn(
-    session_id: int, prompt: str, *, source: dict[str, Any] | None = None,
-) -> None:
+async def run_turn(session_id: int, prompt: str) -> None:
     session = db.require_session(session_id)
     adapter = adapters[session["agent"]]
 
+    completed = False
+    failed = False
     try:
         if session.get("sandbox", True):
             defaults, project_paths = db.sandbox_paths_snapshot(session["project_id"])
@@ -1273,8 +1295,9 @@ async def run_turn(
             project = db.get_project_by_id(session["project_id"])
             if project is not None:
                 session["git_repository"] = project["path"]
-        async for event in adapter.start_turn(session, delivery_prompt(prompt, source)):
+        async for event in adapter.start_turn(session, prompt):
             event_type = event.get("type")
+            failed = failed or event_type == "error"
 
             # The harness reports its session id at the start of every turn;
             # only a new agent session needs it stored.
@@ -1342,6 +1365,7 @@ async def run_turn(
                 await handle_approval(
                     session_id, event["request_id"], "allow", auto=True
                 )
+        completed = not failed
     except Exception as exc:
         message = f"Agent turn failed: {exc}"
         await commit_stream(
@@ -1352,12 +1376,19 @@ async def run_turn(
             lambda _result: [{"type": "error", "message": message}],
         )
     finally:
-        await commit_stream(
-            session_id,
-            lambda: db.update_status(session_id, "idle"),
-            lambda _result: [{"type": "status", "status": "idle"}],
-        )
-        running_tasks.pop(session_id, None)
+        async with turn_lock:
+            # Only the task that owns the slot may release it. Cancellation,
+            # Stop, failures and shutdown never automatically consume the inbox.
+            current = running_tasks.get(session_id)
+            if current is None or current is asyncio.current_task():
+                running_tasks.pop(session_id, None)
+                if not (completed and session_id not in stopping_sessions
+                        and await ship_queued_turn(session_id)):
+                    await commit_stream(
+                        session_id,
+                        lambda: db.update_status(session_id, "idle"),
+                        lambda _result: [{"type": "status", "status": "idle"}],
+                    )
 
 
 async def begin_bash(session_id: int, command: str) -> int:
@@ -1504,7 +1535,10 @@ async def handle_question_answer(
 
 def frame_for_scrollback(row: dict[str, Any]) -> dict[str, Any]:
     payload = row["payload"] if isinstance(row["payload"], dict) else {}
-    return {"type": row["type"], **payload}
+    frame = {"type": row["type"], **payload}
+    if row["type"] == "input":
+        frame["message_id"] = row["id"]
+    return frame
 
 
 def retire_subscriber_locked(session_id: int, subscriber: Subscriber) -> bool:
@@ -1625,32 +1659,21 @@ async def teardown_session(session: dict[str, Any]) -> None:
     nothing here that can fail halfway.
     """
     session_id = session["id"]
-    adapter = adapters.get(session["agent"])
+    async with halted_session(session):
+        async with stream_locks[session_id]:
+            doomed = list(subscribers.get(session_id, set()))
+            for subscriber in doomed:
+                retire_subscriber_locked(session_id, subscriber)
+            file_endpoints = list(file_socket_tasks.get(session_id, set()))
+            db.delete_session(session_id)
 
-    if adapter is not None:
-        await adapter.stop(session)
-    task = running_tasks.pop(session_id, None)
-    if task:
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-
-    # Before the row goes: the command's own error path writes scrollback.
-    await cancel_bash(session_id)
-
-    async with stream_locks[session_id]:
-        doomed = list(subscribers.get(session_id, set()))
-        for subscriber in doomed:
-            retire_subscriber_locked(session_id, subscriber)
-        file_endpoints = list(file_socket_tasks.get(session_id, set()))
-        db.delete_session(session_id)
-
-    for endpoint in file_endpoints:
-        if endpoint is not asyncio.current_task() and not endpoint.done():
-            endpoint.cancel()
-    if file_endpoints:
-        await asyncio.gather(*file_endpoints, return_exceptions=True)
-    await teardown_subscribers(doomed, code=1000)
-    await file_tree_manager.close_session(session_id)
+        for endpoint in file_endpoints:
+            if endpoint is not asyncio.current_task() and not endpoint.done():
+                endpoint.cancel()
+        if file_endpoints:
+            await asyncio.gather(*file_endpoints, return_exceptions=True)
+        await teardown_subscribers(doomed, code=1000)
+        await file_tree_manager.close_session(session_id)
 
 
 def with_worktree_existence(worktree: dict[str, Any]) -> dict[str, Any]:

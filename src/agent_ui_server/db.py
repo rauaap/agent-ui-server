@@ -236,6 +236,11 @@ class Database:
                 "CREATE UNIQUE INDEX IF NOT EXISTS sandbox_paths_project_path "
                 "ON sandbox_paths(project_id, path) WHERE project_id IS NOT NULL"
             )
+            self._conn.execute("""
+                CREATE TABLE IF NOT EXISTS pending_inputs (
+                    message_id INTEGER PRIMARY KEY REFERENCES scrollback(id) ON DELETE CASCADE
+                )
+            """)
             for table, columns in _POST_MIGRATION_COLUMNS.items():
                 self._add_missing_columns(table, columns)
 
@@ -1260,24 +1265,84 @@ class Database:
         event_type: str,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
+        with self._lock, self._conn:
+            return self._append_scrollback(session_id, event_type, payload)
+
+    def _append_scrollback(
+        self, session_id: int, event_type: str, payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Caller holds the database lock and transaction."""
         ts = utc_now()
         encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
-        with self._lock, self._conn:
-            cursor = self._conn.execute(
-                """
-                INSERT INTO scrollback (session_id, ts, type, payload)
-                VALUES (?, ?, ?, ?)
-                """,
-                (session_id, ts, event_type, encoded),
-            )
-            row_id = cursor.lastrowid
+        cursor = self._conn.execute(
+            """
+            INSERT INTO scrollback (session_id, ts, type, payload)
+            VALUES (?, ?, ?, ?)
+            """,
+            (session_id, ts, event_type, encoded),
+        )
         return {
-            "id": row_id,
+            "id": cursor.lastrowid,
             "session_id": session_id,
             "ts": ts,
             "type": event_type,
             "payload": payload,
         }
+
+    def enqueue_input(
+        self, session_id: int, text: str, source: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist acceptance and pending membership in the same transaction."""
+        with self._lock, self._conn:
+            row = self._append_scrollback(
+                session_id, "input", {"text": text, "source": source, "delivery": "queued"},
+            )
+            self._conn.execute(
+                "INSERT INTO pending_inputs (message_id) VALUES (?)", (row["id"],),
+            )
+            self._conn.execute(
+                "UPDATE sessions SET last_active_at = ? WHERE id = ?",
+                (row["ts"], session_id),
+            )
+            return row
+
+    def pending_inputs(self, session_id: int) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT s.id, s.payload FROM scrollback s
+                JOIN pending_inputs p ON p.message_id = s.id
+                WHERE s.session_id = ? ORDER BY s.id
+                """,
+                (session_id,),
+            ).fetchall()
+            return [
+                {"message_id": row["id"], **json.loads(row["payload"])}
+                for row in rows
+            ]
+
+    def ship_inputs(self, session_id: int) -> dict[str, Any] | None:
+        """Atomically claim the whole inbox and record its delivery boundary.
+
+        Shipped means handed off for one harness turn, not processed or answered.
+        Shipped batches are never replayed automatically after a process crash.
+        """
+        with self._lock, self._conn:
+            messages = self.pending_inputs(session_id)
+            if not messages:
+                return None
+            for message in messages:
+                message["delivery"] = "shipped"
+            row = self._append_scrollback(session_id, "inputs_shipped", {"messages": messages})
+            self._conn.executemany(
+                "DELETE FROM pending_inputs WHERE message_id = ?",
+                [(message["message_id"],) for message in messages],
+            )
+            self._conn.execute(
+                "UPDATE sessions SET status = 'running', last_active_at = ? WHERE id = ?",
+                (row["ts"], session_id),
+            )
+            return row
 
     def scrollback_after(
         self, session_id: int, after: int | None = None, limit: int = 200

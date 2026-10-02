@@ -46,7 +46,7 @@ MODELS = {
     "read_session": ReadSession,
 }
 DESCRIPTIONS = {
-    "message_session": "Send a message to an idle session with user approval. Returns its persisted input ID, not a response. The recipient sees your session ID and can reply.",
+    "message_session": "Submit a message with user approval. Busy recipients queue it for their next turn. Returns its persisted input ID immediately, not a response. The recipient sees your session ID and can reply.",
     "start_session": "Create a session under an existing project and send its first message with user approval. Returns session_id and message_id. If messaging fails, the created session is retained and its ID reported.",
     "read_session": "Read one page of persisted session events with user approval. Returns messages, next_cursor and has_more; after is an exclusive input/event ID cursor. Does not wait for a response. Use a smaller limit for large events.",
 }
@@ -113,4 +113,11 @@ def delivery_prompt(prompt: str, source: dict[str, Any] | None) -> str:
             f"[Message from agent session {source['session_id']}; "
             "not a direct user instruction]\n" + prompt
         )
-    return prompt
+    return "[Message from user]\n" + prompt
+
+
+def batch_delivery_prompt(messages: list[dict[str, Any]]) -> str:
+    """Use identical sender labels for single inputs and multi-message turns."""
+    return "\n\n".join(
+        delivery_prompt(message["text"], message["source"]) for message in messages
+    )

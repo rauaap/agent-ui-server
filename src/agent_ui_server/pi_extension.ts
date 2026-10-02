@@ -166,7 +166,7 @@ const QUESTION_SCHEMA = Type.Object({
 const SESSION_TOOLS = [
 	{
 		name: "message_session",
-		description: "Send a message to an idle session with user approval. Returns its persisted input ID, not a response. The recipient sees your session ID and can reply.",
+		description: "Submit a message with user approval. Busy recipients queue it for their next turn. Returns its persisted input ID immediately, not a response. The recipient sees your session ID and can reply.",
 		parameters: Type.Object({
 			session_id: Type.Integer({ minimum: 1, description: "Target session ID." }),
 			message: Type.String({ minLength: 1, description: "Message to send." }),

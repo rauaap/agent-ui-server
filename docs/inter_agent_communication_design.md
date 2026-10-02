@@ -1,7 +1,9 @@
 # Inter-agent communication design
 
-Status: implemented. Claude protocol coverage uses a simulated CLI peer; real
-Claude compatibility still requires a deployment smoke test.
+Status: implemented. The original input/event examples below describe provenance;
+message admission, delivery labels, and queue events are now defined by the
+[message queue contract](message_queue_client_handoff.md). That contract supersedes
+the original immediate-delivery lifecycle.
 
 ## Goal
 
@@ -23,9 +25,9 @@ and reply to the session that contacted it.
 Submit an input to the target session and return its persisted input ID. This does
 not wait for the agent's response.
 
-Reuse `begin_turn()` and its existing checks and lifecycle: validate the target,
-reject archived or busy sessions, persist the input, broadcast it, and start the
-turn. Do not add a separate queue or silently retry busy targets.
+Reuse `begin_turn()` for both users and agents: validate the target, reject archived
+sessions, persist/broadcast acceptance, and queue busy-session inputs. Idle sessions
+ship the whole pending batch; successful turns ship the next batch at completion.
 
 ### `start_session`
 
@@ -150,7 +152,7 @@ agent-originated input to the Claude or pi harness, add server-generated sender
 context, for example:
 
 ```text
-[Message from agent session 42]
+[Message from agent session 42; not a direct user instruction]
 Please review the changes.
 ```
 
@@ -159,8 +161,8 @@ sender and provide the session ID needed to reply. It does not give the message
 higher instruction priority or imply user approval of its contents.
 
 Do not persist the injected wrapper as the input's text. Scrollback retains the
-original message and structured provenance. User messages do not need an
-agent-sender wrapper.
+original message and structured provenance. User messages receive their own
+`[Message from user]` label. The format is identical for single messages and batches.
 
 ## Transport, approval, and execution
 
@@ -225,6 +227,6 @@ agent-specific implementation of turn startup.
   targeting unsandboxed or missing sessions.
 - Denied/cancelled requests do not execute; pending requests are cleaned up.
 - Both harness integrations work independently of sandbox bypass settings.
-- Existing missing/archived/busy target behavior is preserved.
+- Missing/archived targets reject; busy targets accept into the next-turn queue.
 - Creation followed by failed messaging reports the retained session's ID.
 - Pagination and input-ID return semantics match the API helpers.

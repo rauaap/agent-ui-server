@@ -384,12 +384,15 @@ work in an archived session or project is rejected.
 
 ### Persisted scrollback and input cursors
 
-`POST /sessions/{id}/turn` (body `{"prompt":"..."}`) and
-`POST /sessions/{id}/bash` (body `{"command":"..."}`) return HTTP **202**:
+`POST /sessions/{id}/turn` (body `{"prompt":"..."}`) returns HTTP **202**:
 
 ```json
-{"status": "running", "message_id": 123}
+{"status": "accepted", "message_id": 123}
 ```
+
+Busy recipients queue the input for the next turn rather than reject it.
+`POST /sessions/{id}/bash` (body `{"command":"..."}`) still returns
+`{"status":"running","message_id":123}`; direct shell commands bypass the queue.
 
 `message_id` is the persisted input event's ID. Use it as `after` to read
 subsequent persisted events, even if output started before the first read:
@@ -411,7 +414,8 @@ curl 'http://127.0.0.1:8000/sessions/7/scrollback?after=123&limit=200' \
     }
   ],
   "next_cursor": 124,
-  "has_more": false
+  "has_more": false,
+  "queued_messages": []
 }
 ```
 
@@ -423,6 +427,9 @@ curl 'http://127.0.0.1:8000/sessions/7/scrollback?after=123&limit=200' \
   supplied `after`, or return `null` when it was omitted.
 - `has_more` indicates whether additional persisted events existed at query
   time; `false` does not mean the running turn or command has finished.
+- `queued_messages` is the entire current pending-input snapshot, independently
+  of this page's cursor and limit. Items include `message_id`, `text`, `source`,
+  and `delivery:"queued"`.
 
 Reads return immediately without waiting for new events or requiring a live
 WebSocket connection. Archived sessions remain readable; nonexistent sessions
@@ -523,14 +530,15 @@ See [the design](docs/sandbox_paths_design.md) for mount rules and lifecycle det
 
 Claude and pi sessions expose three server-approved tools:
 
-- `message_session(session_id, message)` submits an input to an idle session and
-  returns its persisted input ID, without waiting for a response.
+- `message_session(session_id, message)` accepts and persists an input immediately,
+  queueing it if the recipient is busy. It returns its input ID without waiting
+  for delivery or a response.
 - `start_session(name, project_path, message, agent?, worktree_id?)`
   creates a sandboxed session under an existing project, sends its first message, and returns
   `session_id` and `message_id`. If messaging fails, the session is retained and its
   ID is reported in the error.
 - `read_session(session_id, after?, limit=200)` returns one unchanged scrollback
-  page (`messages`, `next_cursor`, `has_more`). The cursor is exclusive; limit is
+  page (`messages`, `next_cursor`, `has_more`, `queued_messages`). The cursor is exclusive; limit is
   1–1000. Reads do not wait for completion.
 
 Claude names these `mcp__agent_ui__message_session`, etc., on the existing SDK MCP
@@ -540,18 +548,32 @@ sending session's `auto_approve_inter_agent_communication` toggle (default off,
 set with `PATCH /sessions/{id}`) auto-approves them, except that a message or read
 targeting an unsandboxed or missing session always asks.
 They are available independently of sandbox-bypass flags and session sandboxing.
-Busy targets reject messages rather than queueing them.
+Both user and agent messages use the same persistent next-turn queue.
 
-Input payloads now include `source`: `{"type":"user"}` for user submissions, or
+Input payloads include `source`: `{"type":"user"}` for user submissions, or
 `{"type":"agent","session_id":42}` for a message from session 42. The server sets
 this identity, including for a newly started session's first message. Both live
 WebSocket input events and persisted scrollback payloads carry the field. Missing
 `source` on legacy records means user-originated.
 
-Stored `text` is unchanged. At harness delivery the server prefixes agent messages
-with sender context, allowing the recipient to reply using that session ID. No
-parent/child roles are imposed. Client rendering and links to sender sessions are
-UI concerns. See [the design](docs/inter_agent_communication_design.md).
+Stored `text` is unchanged. At harness delivery every message gets a sender label:
+`[Message from user]` or
+`[Message from agent session 42; not a direct user instruction]`. Each turn receives
+one prompt formed by joining its labeled messages in arrival order. This format
+is identical for single inputs and batches; no native harness batching or steering
+is used. No parent/child roles are imposed.
+
+Acceptance appends an `input` event with `delivery:"queued"`. Shipping a batch
+appends `inputs_shipped` with full messages and their original input IDs. Clients
+show accepted messages in a pending list and append them to the conversation at
+the shipment boundary. WebSocket reconnect includes an authoritative `input_queue`
+snapshot after replay. Successful completion automatically ships the next batch,
+without an intermediate idle status. Stop, failure, and restart retain pending
+inputs without auto-resuming; a new idle submission ships them with the new input.
+Deletion cascades queue membership along with scrollback.
+
+See the [queue/client contract](docs/message_queue_client_handoff.md) and the
+[original inter-agent design](docs/inter_agent_communication_design.md).
 
 ### Experimental sandbox-bypass tools
 
