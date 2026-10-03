@@ -352,6 +352,8 @@ class ClaudeCodeAdapter(AgentAdapter):
                 command = claude_sandbox_command(
                     command, session["working_dir"],
                     **({"system_prompt": sandbox_guidance} if host_enabled else {}),
+                    **({"sandbox_network_allowlist": session["sandbox_network_allowlist"]}
+                       if session.get("sandbox_network_allowlist") else {}),
                     **({"sandbox_paths": session["sandbox_paths"]} if session.get("sandbox_paths") else {}),
                     **({"git_repository": session["git_repository"]} if session.get("git_repository") else {}),
                 )
@@ -1006,6 +1008,8 @@ class PiAdapter(AgentAdapter):
                 command = pi_sandbox_command(
                     command, session["working_dir"],
                     **({"system_prompt": pi_sandbox_guidance} if host_enabled else {}),
+                    **({"sandbox_network_allowlist": session["sandbox_network_allowlist"]}
+                       if session.get("sandbox_network_allowlist") else {}),
                     **({"sandbox_paths": session["sandbox_paths"]} if session.get("sandbox_paths") else {}),
                     **({"git_repository": session["git_repository"]} if session.get("git_repository") else {}),
                 )

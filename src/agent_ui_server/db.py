@@ -221,6 +221,13 @@ class Database:
             # have to happen here or an older database would immediately lose
             # them while being upgraded on this same open.
             self._conn.execute("""
+                CREATE TABLE IF NOT EXISTS sandbox_network_allowlist (
+                    ip TEXT NOT NULL,
+                    port INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
+                    PRIMARY KEY (ip, port)
+                )
+            """)
+            self._conn.execute("""
                 CREATE TABLE IF NOT EXISTS sandbox_paths (
                     id INTEGER PRIMARY KEY,
                     project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
@@ -822,6 +829,23 @@ class Database:
         GROUP BY p.id, p.path, p.name, p.archived_at
         ORDER BY last_active_at DESC, p.path ASC
     """
+
+    def get_sandbox_network_allowlist(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [dict(row) for row in self._conn.execute(
+                "SELECT ip, port FROM sandbox_network_allowlist ORDER BY rowid"
+            )]
+
+    def set_sandbox_network_allowlist(self, entries: list[dict[str, Any]]) -> None:
+        from .sandbox_network import validate_network_allowlist
+
+        entries = validate_network_allowlist(entries)
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM sandbox_network_allowlist")
+            self._conn.executemany(
+                "INSERT INTO sandbox_network_allowlist (ip, port) VALUES (?, ?)",
+                [(entry["ip"], entry["port"]) for entry in entries],
+            )
 
     def get_sandbox_paths(self, project_id: int | None = None) -> list[dict[str, Any]]:
         with self._lock:

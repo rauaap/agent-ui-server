@@ -634,6 +634,30 @@ then test Podman in your deployment. The automated tests use a simulated Claude
 peer; they do not establish compatibility with a real Claude version. Pi tests
 also load the real extension and exercise its callback without making model calls.
 
+### Sandbox network exceptions
+
+`GET /sandbox-network` returns the server-wide `sandbox_network_allowlist`.
+`PATCH /sandbox-network` replaces the whole list, for example:
+
+```json
+{"sandbox_network_allowlist": [{"ip": "100.64.0.10", "port": 443}]}
+```
+
+Entries are exact unicast IPv4 addresses and TCP ports (1–65535). DNS names,
+CIDRs, loopback, reserved/multicast addresses, and the sandbox DNS proxy address
+are not accepted. Duplicate pairs are collapsed. An empty list removes all
+exceptions. See [client handoff](docs/sandbox_network_client_handoff.md).
+
+The setting is persisted and applies to every new sandbox launch, including
+resumed sessions, in both agents. Running turns retain their existing rules.
+Private networks and host addresses remain blocked by default. Exceptions use
+host routes plus nftables output filtering **inside the pasta namespace**, so
+only the listed TCP ports are exposed on exception IPs, not other services on
+the same machine. UDP to exception IPs is also blocked. Ordinary internet
+access and the sandbox DNS proxy are unchanged. Missing tools or firewall setup
+errors fail the turn; there is no unsandboxed fallback. This setting does not
+restrict unsandboxed sessions, user shell commands, or approved host executions.
+
 ### Session sandbox
 
 Client integration: [sandbox client handoff](docs/sandbox_client_handoff.md).
@@ -652,9 +676,11 @@ WebSocket event and apply to the next turn. **Both Pi and Claude Code implement
 sandboxing.** Direct user shell commands (`!` or `POST /sessions/{id}/bash`) are
 not sandboxed.
 
-Sandboxed turns require Linux, `bwrap` (Bubblewrap), and permission to create its
-namespaces. Install Bubblewrap with your OS package manager (the container image
-includes it). `PI_BIN` should point to the installer's `<runtime>/bin/pi` beside
+Sandboxed turns require Linux, `bwrap` (Bubblewrap), `pasta` (passt), `ip`
+(iproute2), and permission to create their namespaces. Configured network
+exceptions additionally require `nft` (nftables) and kernel nftables support
+inside an unprivileged network namespace. Install these with your OS package
+manager (the container image includes them). `PI_BIN` should point to the installer's `<runtime>/bin/pi` beside
 `bin/node`, or a system installation under `/usr`. `CLAUDE_BIN` supports native
 Claude binaries and npm Node launchers; only their runtime resources are exposed
 read-only. Claude auto-updates are disabled inside the sandbox. A setup failure

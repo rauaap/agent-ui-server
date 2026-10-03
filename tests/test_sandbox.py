@@ -605,6 +605,58 @@ print(json.dumps({"reached": [t for t in targets if reachable(t)], "route": rout
         self.assertEqual(data["reached"], [])
         self.assertNotEqual(data["route"], 0)
 
+    def test_real_network_exception_is_port_specific_and_immutable(self):
+        require_sandbox(self)
+        if not shutil.which("nft", path=os.defpath + ":/usr/sbin:/sbin"):
+            self.skipTest("nftables not installed")
+        addresses = host_addresses()
+        if not addresses:
+            self.skipTest("no host IPv4 address")
+        target = addresses[0]
+        allowed = socket.create_server(("0.0.0.0", 0))
+        blocked = socket.create_server(("0.0.0.0", 0))
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp.bind(("0.0.0.0", 0))
+        udp.settimeout(0.2)
+        for listener in (allowed, blocked, udp):
+            self.addCleanup(listener.close)
+        entries = [{"ip": target, "port": allowed.getsockname()[1]}]
+        command = pi_sandbox_command(
+            self.command, str(self.cwd), sandbox_network_allowlist=entries,
+        )
+        probe = r'''
+import json, shutil, socket, subprocess, sys
+host, allowed, blocked, udp = sys.argv[1], *map(int, sys.argv[2:])
+def reachable(port):
+    try:
+        socket.create_connection((host, port), timeout=1).close()
+        return True
+    except OSError:
+        return False
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.sendto(b"blocked", (host, udp))
+nft = shutil.which("nft", path="/usr/bin:/bin:/usr/sbin:/sbin")
+firewall = subprocess.run([nft, "flush", "ruleset"], capture_output=True)
+route = subprocess.run(["ip", "route", "del", "blackhole", "100.64.0.0/10"], capture_output=True)
+print(json.dumps({"allowed": reachable(allowed), "blocked": reachable(blocked),
+                  "firewall": firewall.returncode, "route": route.returncode}))
+'''
+        command = command[:inner_start(command)] + [
+            "/usr/bin/python3", "-c", probe, target, str(allowed.getsockname()[1]),
+            str(blocked.getsockname()[1]), str(udp.getsockname()[1]),
+        ]
+        result = subprocess.run(command, capture_output=True, text=True, env={}, timeout=20)
+        if result.returncode and bubblewrap_unavailable(result.stderr):
+            self.skipTest(result.stderr.strip())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertTrue(data["allowed"])
+        self.assertFalse(data["blocked"])
+        self.assertNotEqual(data["firewall"], 0)
+        self.assertNotEqual(data["route"], 0)
+        with self.assertRaises(socket.timeout):
+            udp.recvfrom(1024)
+
     def test_real_stopping_the_launcher_kills_the_sandbox(self):
         # Stop it the way the adapters do: pasta alone exits on SIGTERM and
         # leaves Bubblewrap running, so stop_process signals the group.

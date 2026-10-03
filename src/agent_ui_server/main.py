@@ -32,6 +32,7 @@ from .network_guard import (
     token_path,
 )
 from .sandbox_paths import merge_paths, validate_paths
+from .sandbox_network import validate_network_allowlist
 from .usage import collect_usage
 from .model_catalog import discover_catalog
 from .session_tools import auto_approval_setting as session_tool_approval_setting, batch_delivery_prompt
@@ -118,6 +119,15 @@ stop_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 # are allowed to run alongside one, so they must not share the turn's slot.
 bash_tasks: dict[int, asyncio.Task[None]] = {}
 turn_lock = asyncio.Lock()
+
+
+class SandboxNetworkDestinationRequest(BaseModel):
+    ip: str
+    port: int = Field(strict=True, ge=1, le=65535)
+
+
+class UpdateSandboxNetworkRequest(BaseModel):
+    sandbox_network_allowlist: list[SandboxNetworkDestinationRequest]
 
 
 class SandboxPathRequest(BaseModel):
@@ -326,6 +336,23 @@ async def get_usage() -> dict[str, Any]:
     request, so a user who has only authenticated one of them still sees it.
     """
     return await collect_usage()
+
+
+@app.get("/sandbox-network")
+async def get_sandbox_network() -> dict[str, Any]:
+    return {"sandbox_network_allowlist": db.get_sandbox_network_allowlist()}
+
+
+@app.patch("/sandbox-network")
+async def update_sandbox_network(payload: UpdateSandboxNetworkRequest) -> dict[str, Any]:
+    try:
+        entries = validate_network_allowlist([
+            entry.model_dump() for entry in payload.sandbox_network_allowlist
+        ])
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    db.set_sandbox_network_allowlist(entries)
+    return {"sandbox_network_allowlist": db.get_sandbox_network_allowlist()}
 
 
 @app.get("/sandbox-paths")
@@ -1290,6 +1317,7 @@ async def run_turn(session_id: int, prompt: str) -> None:
         if session.get("sandbox", True):
             defaults, project_paths = db.sandbox_paths_snapshot(session["project_id"])
             session["sandbox_paths"] = merge_paths(defaults, project_paths)
+            session["sandbox_network_allowlist"] = db.get_sandbox_network_allowlist()
             # The worktree's gitfile is agent-writable, so the repository its
             # metadata may come from is taken from the database instead.
             project = db.get_project_by_id(session["project_id"])

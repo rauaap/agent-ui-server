@@ -2,8 +2,8 @@
 
 No unsandboxed fallback. Profile builders return argv; callers must also
 clear the environment of the launcher process itself. Bubblewrap runs inside
-a pasta network namespace, so a sandbox reaches the internet but never the
-server or anything else listening on this host, the tailnet or the LAN.
+a pasta network namespace. Private/host destinations are blocked except for
+server-approved TCP IP:port exceptions filtered by namespace-local nftables.
 """
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from .sandbox_paths import overlaps, validate_paths
+from .sandbox_network import validate_network_allowlist
 
 # pasta forwards DNS sent to this address to the host's resolver; the
 # sandbox's resolv.conf names it, since the host resolver may be blocked.
@@ -96,8 +97,8 @@ def verify_network_namespace(pasta: str) -> None:
     _working_launchers.add(pasta)
 
 
-def network_command(command: list[str]) -> list[str]:
-    """Run `command` in a pasta namespace with internet-only IPv4 routing.
+def network_command(command: list[str], allowlist: list[dict[str, Any]] | None = None) -> list[str]:
+    """Run `command` with IPv4 internet routing and explicit TCP exceptions.
 
     pasta translates the namespace's traffic to ordinary host sockets, so on
     its own a connection to a host address would reach the server. Every
@@ -112,6 +113,22 @@ def network_command(command: list[str]) -> list[str]:
     ip = shutil.which("ip")
     if not ip:
         raise FileNotFoundError("iproute2 (ip) is required for sandbox network isolation")
+    entries = validate_network_allowlist(allowlist or [])
+    firewall = []
+    exceptions = sorted({entry["ip"] for entry in entries}, key=ipaddress.IPv4Address)
+    if entries:
+        nft = shutil.which("nft", path=os.environ.get("PATH", os.defpath) + ":/usr/sbin:/sbin")
+        if not nft:
+            raise FileNotFoundError("nftables (nft) is required for sandbox network exceptions")
+        rules = [
+            "table ip agent_ui {",
+            "chain output {",
+            "type filter hook output priority 0; policy accept;",
+            *(f'ip daddr {entry["ip"]} tcp dport {entry["port"]} accept' for entry in entries),
+            "ip daddr { " + ", ".join(exceptions) + " } drop",
+            "}", "}",
+        ]
+        firewall = [f"{shlex.quote(nft)} -f - <<'AGENT_UI_NFT'", *rules, "AGENT_UI_NFT"]
     verify_network_namespace(pasta)
     ip = shlex.quote(ip)
     blocked = [*BLOCKED_NETWORKS, *(f"{address}/32" for address in host_addresses())]
@@ -124,6 +141,10 @@ def network_command(command: list[str]) -> list[str]:
         f"{ip} route add default dev {SANDBOX_INTERFACE}",
         *(f"{ip} route add blackhole {network}" for network in blocked),
         f"{ip} route add {SANDBOX_DNS}/32 dev {SANDBOX_INTERFACE}",
+        # Install the firewall before opening any route. Replacing handles
+        # an exception IP that is also one of this host's blocked /32s.
+        *firewall,
+        *(f"{ip} route replace {address}/32 dev {SANDBOX_INTERFACE}" for address in exceptions),
         # pasta ignores SIGPIPE and its command inherits that; restore the
         # default so `producer | head` in the agent's shell ends quietly.
         'exec /usr/bin/env --default-signal=PIPE "$@"',
@@ -234,6 +255,7 @@ class SandboxMount:
 class SandboxFilesystem:
     cwd: Path
     mounts: list[SandboxMount]
+    network_allowlist: list[dict[str, Any]] | None = None
 
     def describe(self) -> str:
         """Describe the exact mount plan, not a second filesystem discovery pass."""
@@ -263,8 +285,13 @@ class SandboxFilesystem:
             "server source listed above, not the server's /tmp directory.",
             "Network: outbound IPv4 internet only. This server and every other service "
             "on its host, the tailnet, private LAN ranges and link-local addresses are "
-            "unreachable, and 127.0.0.1 is the sandbox's own loopback.",
+            "unreachable except for any TCP destinations listed below. "
+            "127.0.0.1 is the sandbox's own loopback.",
         ])
+        if self.network_allowlist:
+            lines.append("Server-approved TCP destination exceptions: " + ", ".join(
+                f'{entry["ip"]}:{entry["port"]}' for entry in self.network_allowlist
+            ) + ". Only these ports are reachable on exception IPs.")
         return "\n".join(lines)
 
 
@@ -276,6 +303,7 @@ def sandbox_command(
     writable: list[Path],
     environment: dict[str, str],
     sandbox_paths: list[dict[str, Any]] | None = None,
+    sandbox_network_allowlist: list[dict[str, Any]] | None = None,
     command_suffix: Callable[[SandboxFilesystem], list[str]] | None = None,
     git_repository: str | None = None,
 ) -> list[str]:
@@ -328,7 +356,7 @@ def sandbox_command(
     mounts.extend(SandboxMount("--ro-bind", str(source), target) for source, target in read_only)
     mounts.extend(SandboxMount("--bind" if m.write else "--ro-bind",
                                str(m.source), str(m.destination)) for m in extra_mounts)
-    filesystem = SandboxFilesystem(cwd, mounts)
+    filesystem = SandboxFilesystem(cwd, mounts, validate_network_allowlist(sandbox_network_allowlist or []))
     # --share-net shares pasta's namespace, not the host's. pasta runs this
     # as root of its own user namespace, so map back to the real ids.
     args = [
@@ -359,7 +387,7 @@ def sandbox_command(
     for name, value in env.items():
         args.extend(["--setenv", name, value])
     suffix = command_suffix(filesystem) if command_suffix is not None else []
-    return network_command([*args, "--", *command, *suffix])
+    return network_command([*args, "--", *command, *suffix], filesystem.network_allowlist)
 
 
 def _executable(name: str) -> Path:
@@ -373,6 +401,7 @@ def _executable(name: str) -> Path:
 
 def pi_sandbox_command(command: list[str], working_dir: str, *,
                        sandbox_paths: list[dict[str, Any]] | None = None,
+                       sandbox_network_allowlist: list[dict[str, Any]] | None = None,
                        git_repository: str | None = None,
                        system_prompt: Callable[[SandboxFilesystem], str] | None = None) -> list[str]:
     """Pi installer/system runtime, config and explicit server extensions."""
@@ -412,6 +441,7 @@ def pi_sandbox_command(command: list[str], working_dir: str, *,
 
     return sandbox_command(
         inner, working_dir, read_only=read_only, writable=[config],
+        sandbox_network_allowlist=sandbox_network_allowlist,
         environment={"PATH": f"{bin_dir}:/usr/bin:/bin"},
         sandbox_paths=sandbox_paths, git_repository=git_repository,
         command_suffix=(lambda fs: ["--append-system-prompt", system_prompt(fs)]) if system_prompt else None,
@@ -453,6 +483,7 @@ def _claude_config() -> Path:
 
 def claude_sandbox_command(command: list[str], working_dir: str, *,
                            sandbox_paths: list[dict[str, Any]] | None = None,
+                           sandbox_network_allowlist: list[dict[str, Any]] | None = None,
                            git_repository: str | None = None,
                            system_prompt: Callable[[SandboxFilesystem], str] | None = None) -> list[str]:
     """Claude native binary or npm Node launcher, with persistent config."""
@@ -487,6 +518,7 @@ def claude_sandbox_command(command: list[str], working_dir: str, *,
     config = _claude_config()
     return sandbox_command(
         [str(executable), *command[1:]], working_dir,
+        sandbox_network_allowlist=sandbox_network_allowlist,
         read_only=read_only, writable=[config],
         sandbox_paths=sandbox_paths, git_repository=git_repository,
         command_suffix=(lambda fs: ["--append-system-prompt", system_prompt(fs)]) if system_prompt else None,
