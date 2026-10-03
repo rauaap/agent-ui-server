@@ -1,0 +1,58 @@
+name: Mirror main to GitHub
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Set GH_MIRROR_TOKEN in Gitea secrets to a GitHub token with Contents: write
+# access to the matching rauaap repository. Gitea is the source of truth.
+jobs:
+  mirror:
+    runs-on: host
+    steps:
+      - name: Check out main with full history
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Push latest main to GitHub
+        shell: bash
+        env:
+          GH_MIRROR_TOKEN: ${{ secrets.GH_MIRROR_TOKEN }}
+          REPOSITORY: ${{ gitea.repository }}
+          EVENT_NAME: ${{ gitea.event_name }}
+          EVENT_SHA: ${{ gitea.sha }}
+          GIT_TERMINAL_PROMPT: '0'
+        run: |
+          set -euo pipefail
+          : "${GH_MIRROR_TOKEN:?Set the GH_MIRROR_TOKEN Gitea secret}"
+
+          # All runs on this host share a per-repository lock. Do not put it
+          # in RUNNER_TEMP, which can be different for each run.
+          exec 9>"/tmp/gitea-github-mirror-${REPOSITORY//\//-}.lock"
+          flock 9
+
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          latest=$(git rev-parse refs/remotes/origin/main)
+          if [[ "$EVENT_NAME" == push && "$EVENT_SHA" != "$latest" ]]; then
+            echo 'Skipping superseded main push.'
+            exit 0
+          fi
+
+          # Keep credentials out of URLs, command-line arguments and git config.
+          git_github() {
+            git -c credential.helper= \
+              -c 'credential.helper=!f() { if [ "$1" = get ]; then printf "username=x-access-token\npassword=%s\n" "$GH_MIRROR_TOKEN"; fi; }; f' \
+              "$@"
+          }
+          destination="https://github.com/${REPOSITORY}.git"
+          remote_sha=$(git_github ls-remote "$destination" refs/heads/main | cut -f1)
+          if [[ "$remote_sha" == "$latest" ]]; then
+            echo 'GitHub main is already up to date.'
+            exit 0
+          fi
+
+          # Only fast-forward GitHub main; divergent history must fail.
+          git_github push "$destination" "$latest:refs/heads/main"
