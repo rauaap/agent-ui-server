@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import urllib.error
 import urllib.request
 from datetime import datetime
@@ -142,9 +143,13 @@ def _read(fetch: Callable[[], dict[str, Any]]) -> dict[str, Any]:
 
 
 async def collect_usage() -> dict[str, Any]:
-    """Both subscriptions, fetched concurrently off the event loop."""
-    claude_code, codex = await asyncio.gather(
-        asyncio.to_thread(_read, claude_code_usage),
-        asyncio.to_thread(_read, codex_usage),
-    )
-    return {"claude_code": claude_code, "codex": codex}
+    """Fetch only explicitly enabled subscriptions, concurrently off the event loop."""
+    subscriptions = {}
+    if os.environ.get("CLAUDE_SUB") == "1":
+        subscriptions["claude_code"] = claude_code_usage
+    if os.environ.get("CODEX_SUB") == "1":
+        subscriptions["codex"] = codex_usage
+    results = await asyncio.gather(*(
+        asyncio.to_thread(_read, fetch) for fetch in subscriptions.values()
+    ))
+    return dict(zip(subscriptions, results))

@@ -146,10 +146,28 @@ class SubscriptionFailureTests(unittest.TestCase):
 
 
 class CollectUsageTests(unittest.IsolatedAsyncioTestCase):
+    async def test_only_explicitly_enabled_subscriptions_are_fetched(self):
+        healthy = {"five_hour": None, "weekly": None, "error": None}
+        for env, expected in (
+            ({}, set()),
+            ({"CLAUDE_SUB": "1"}, {"claude_code"}),
+            ({"CODEX_SUB": "1"}, {"codex"}),
+            ({"CLAUDE_SUB": "1", "CODEX_SUB": "1"}, {"claude_code", "codex"}),
+            ({"CLAUDE_SUB": "0", "CODEX_SUB": "true"}, set()),
+        ):
+            with self.subTest(env=env), mock.patch.dict(usage.os.environ, env, clear=True), \
+                 mock.patch.object(usage, "claude_code_usage", return_value=healthy) as claude, \
+                 mock.patch.object(usage, "codex_usage", return_value=healthy) as codex:
+                result = await usage.collect_usage()
+                self.assertEqual(result, dict.fromkeys(expected, healthy))
+                self.assertEqual(claude.call_count, int("claude_code" in expected))
+                self.assertEqual(codex.call_count, int("codex" in expected))
+
     async def test_one_unauthenticated_subscription_does_not_hide_the_other(self):
         healthy = {"five_hour": {"used_percent": 1.0, "reset_at": 2},
                    "weekly": {"used_percent": 3.0, "reset_at": 4}, "error": None}
-        with mock.patch.object(usage, "claude_code_usage", return_value=healthy), \
+        with mock.patch.dict(usage.os.environ, {"CLAUDE_SUB": "1", "CODEX_SUB": "1"}), \
+             mock.patch.object(usage, "claude_code_usage", return_value=healthy), \
              mock.patch.object(usage, "CODEX_CREDENTIALS", Path("/nonexistent/auth.json")):
             result = await usage.collect_usage()
 
@@ -157,8 +175,9 @@ class CollectUsageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["codex"]["error"], "not authenticated")
         self.assertIsNone(result["codex"]["five_hour"])
 
-    async def test_both_subscriptions_are_always_present(self):
-        with mock.patch.object(usage, "CLAUDE_CREDENTIALS", Path("/nonexistent/a.json")), \
+    async def test_both_enabled_subscriptions_are_present_even_when_unauthenticated(self):
+        with mock.patch.dict(usage.os.environ, {"CLAUDE_SUB": "1", "CODEX_SUB": "1"}), \
+             mock.patch.object(usage, "CLAUDE_CREDENTIALS", Path("/nonexistent/a.json")), \
              mock.patch.object(usage, "CODEX_CREDENTIALS", Path("/nonexistent/b.json")):
             result = await usage.collect_usage()
 

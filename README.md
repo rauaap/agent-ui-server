@@ -469,9 +469,13 @@ the former is converted. Codex's five-hour window is rolling: until the first
 request of a window its reset is simply five hours out, and it firms up once
 usage starts.
 
-Both keys are always present. A plan that is unauthenticated or unreachable
-reports null windows and a reason in `error` instead of failing the request, so
-authenticating only one of the two still yields a useful response:
+Set `CLAUDE_SUB=1` and/or `CODEX_SUB=1` in the server environment to enable
+subscription usage fetching. Only enabled plans are fetched and included in the
+response; with neither enabled, the response is `{}`. Values other than `1`
+leave the subscription disabled.
+
+An enabled plan that is unauthenticated or unreachable reports null windows and
+a reason in `error` instead of failing the request:
 
 ```json
 {"codex": {"five_hour": null, "weekly": null, "error": "not authenticated"}}
