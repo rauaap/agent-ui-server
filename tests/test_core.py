@@ -116,10 +116,10 @@ class DatabaseTests(unittest.TestCase):
             database = Database(Path(tmpdir) / "sessions.db")
             session = make_session(database, "/projects/demo")
 
-            # Commands and writes default on; inter-agent approval stays off.
+            # All approval categories default on for new sessions.
             self.assertIs(session["auto_approve_write"], True)
             self.assertIs(session["auto_approve_command"], True)
-            self.assertIs(session["auto_approve_inter_agent_communication"], False)
+            self.assertIs(session["auto_approve_inter_agent_communication"], True)
 
             updated = database.set_auto_approve(session["id"], command=False)
             self.assertIs(updated["auto_approve_command"], False)
@@ -129,14 +129,19 @@ class DatabaseTests(unittest.TestCase):
             self.assertIs(updated["auto_approve_write"], False)
             self.assertIs(updated["auto_approve_command"], False)
 
+            database.set_auto_approve(
+                session["id"], inter_agent_communication=False
+            )
             database.close()
             database = Database(Path(tmpdir) / "sessions.db")
             persisted = database.require_session(session["id"])
+            self.assertIs(persisted["auto_approve_inter_agent_communication"], False)
             self.assertIs(persisted["auto_approve_write"], False)
             self.assertIs(persisted["auto_approve_command"], False)
             fresh = make_session(database, "/projects/demo")
             self.assertIs(fresh["auto_approve_write"], True)
             self.assertIs(fresh["auto_approve_command"], True)
+            self.assertIs(fresh["auto_approve_inter_agent_communication"], True)
 
             # A partial update leaves the untouched toggles alone.
             database.set_auto_approve(session["id"], command=True)

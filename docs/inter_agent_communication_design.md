@@ -181,7 +181,7 @@ its arguments. Denial or cancellation must not execute the operation.
 ### Auto-approval
 
 The sending session's `auto_approve_inter_agent_communication` toggle (default
-off) auto-approves all three tools, with one exception: a `message_session` or
+on) auto-approves all three tools, with one exception: a `message_session` or
 `read_session` targeting an unsandboxed or missing session always asks. Messaging
 an unsandboxed session would let a sandboxed sender run anything outside
 Bubblewrap, and reading it would show the sender host data. `start_session` needs no

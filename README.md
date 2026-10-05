@@ -33,7 +33,7 @@ The API can also be exercised directly with tools such as `curl` and
 - Normalizes provider-specific tool calls into a canonical action schema
 - Presents tool approvals and multiple-choice agent questions to clients
 - Supports per-session auto-approval for commands, file writes, and inter-agent communication
-  (commands and writes default on for new sessions; inter-agent communication defaults off).
+  (all default on for new sessions).
   Existing sessions keep their settings; sandbox bypass still requires explicit approval.
 - Creates and manages Git worktrees independently of sessions
 - Runs explicit one-shot shell commands without involving the agent
@@ -572,7 +572,7 @@ Claude and pi sessions expose three server-approved tools:
 Claude names these `mcp__agent_ui__message_session`, etc., on the existing SDK MCP
 server. Pi registers them in the bundled extension. Every call, including reads,
 requires approval; ordinary read/write/command auto-approval does not apply. The
-sending session's `auto_approve_inter_agent_communication` toggle (default off,
+sending session's `auto_approve_inter_agent_communication` toggle (default on,
 set with `PATCH /sessions/{id}`) auto-approves them, except that a message or read
 targeting an unsandboxed or missing session always asks.
 They are available independently of sandbox-bypass flags and session sandboxing.

@@ -1095,9 +1095,10 @@ class Database:
                 INSERT INTO sessions (
                     name, project_id, worktree_id, agent, model, reasoning_level,
                     agent_session_id, status, created_at, last_active_at, sandbox,
-                    auto_approve_write, auto_approve_command
+                    auto_approve_write, auto_approve_command,
+                    auto_approve_inter_agent_communication
                 )
-                VALUES (?, ?, ?, ?, ?, ?, NULL, 'idle', ?, ?, ?, 1, 1)
+                VALUES (?, ?, ?, ?, ?, ?, NULL, 'idle', ?, ?, ?, 1, 1, 1)
                 """,
                 (name, project_id, worktree_id, agent, model, reasoning_level,
                  now, now, int(sandbox)),
