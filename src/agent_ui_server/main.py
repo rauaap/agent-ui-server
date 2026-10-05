@@ -102,8 +102,8 @@ app.add_middleware(
 )
 db = Database(os.environ.get("SESSION_DB", "sessions.db"))
 adapters: dict[str, AgentAdapter] = {
-    "claude-code": ClaudeCodeAdapter(),
     "pi": PiAdapter(),
+    "claude-code": ClaudeCodeAdapter(),
 }
 
 
@@ -212,7 +212,7 @@ class CreateSessionRequest(BaseModel):
 
     name: str = Field(min_length=1, max_length=120)
     project_path: str = Field(min_length=1)
-    agent: str = "pi"
+    agent: str = Field(default_factory=lambda: next(iter(adapters)))
     model: str | None = Field(default=None, min_length=1)
     reasoning_level: str | None = Field(default=None, min_length=1)
     worktree_id: int | None = None
@@ -321,10 +321,10 @@ class CatalogAgent(BaseModel):
 async def list_agents() -> list[dict[str, Any]]:
     """Return registered agents and their startup model catalogs in picker order.
 
-    Labels come from adapters and the default from `CreateSessionRequest`.
+    Labels come from adapters; the first registered adapter is the default.
     Requests never refresh model discovery.
     """
-    default = CreateSessionRequest.model_fields["agent"].default
+    default = next(iter(adapters))
     return [
         {
             "id": agent_id,

@@ -2331,9 +2331,9 @@ class ListAgentsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [agent["id"] for agent in agents], list(main.adapters.keys())
         )
-        self.assertEqual([agent["id"] for agent in agents], ["claude-code", "pi"])
+        self.assertEqual([agent["id"] for agent in agents], ["pi", "claude-code"])
         self.assertEqual(
-            [agent["name"] for agent in agents], ["Claude Code", "Pi"]
+            [agent["name"] for agent in agents], ["Pi", "Claude Code"]
         )
 
     async def test_session_for_removed_adapter_is_inert_but_deletable(self) -> None:
@@ -2368,7 +2368,7 @@ class ListAgentsTests(unittest.IsolatedAsyncioTestCase):
         defaults = [agent["id"] for agent in agents if agent["default"]]
 
         self.assertEqual(
-            defaults, [main.CreateSessionRequest.model_fields["agent"].default]
+            defaults, [main.CreateSessionRequest.model_fields["agent"].get_default(call_default_factory=True)]
         )
 
     async def test_every_adapter_carries_a_label(self) -> None:

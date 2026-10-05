@@ -286,7 +286,8 @@ FastAPI also exposes generated OpenAPI documentation at `/docs`.
 
 ### Agents and sessions
 
-Pi is the default harness for new sessions when `agent` is omitted.
+The first harness in the server's adapter registry is the default when `agent`
+is omitted. Pi is registered first.
 
 `GET /agents` returns agents and their models together, in picker order:
 

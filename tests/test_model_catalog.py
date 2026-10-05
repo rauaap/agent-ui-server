@@ -133,6 +133,16 @@ class SessionModelTests(unittest.IsolatedAsyncioTestCase):
         self.db.close()
         self.tmp.cleanup()
 
+    async def test_default_follows_registry_order(self):
+        for ids in (("claude-code", "pi"), ("pi",)):
+            registry = {key: self.main.adapters[key] for key in ids}
+            with patch.object(self.main, "adapters", registry):
+                request = self.main.CreateSessionRequest(name="default", project_path=self.tmp.name)
+                self.assertEqual(request.agent, ids[0])
+                agents = await self.main.list_agents()
+                self.assertEqual([a["id"] for a in agents if a["default"]], [ids[0]])
+                self.assertEqual([a["id"] for a in agents], list(ids))
+
     async def test_create_list_persist_and_default(self):
         session = await self.main.create_session(self.main.CreateSessionRequest(name="test", project_path=self.tmp.name, agent="pi", model="p/m"))
         self.assertEqual(session["model"], "p/m")
@@ -153,11 +163,11 @@ class SessionModelTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(caught.exception.status_code, status)
         with patch.object(self.main, "discover_catalog", AsyncMock()) as discover:
             expected = [
-                {"id": "claude-code", "name": "Claude Code", "default": False,
-                 "models": [], "models_error": "Unavailable"},
                 {"id": "pi", "name": "Pi", "default": True,
                  "models": [{"id": "p/m", "name": "M", "reasoning_levels": ["low", "high"]}],
                  "models_error": None},
+                {"id": "claude-code", "name": "Claude Code", "default": False,
+                 "models": [], "models_error": "Unavailable"},
             ]
             self.assertEqual(await self.main.list_agents(), expected)
             self.assertEqual(await self.main.list_agents(), expected)
@@ -170,9 +180,9 @@ class SessionModelTests(unittest.IsolatedAsyncioTestCase):
         self.catalog["claude-code"] = {"models": [], "error": None}
         self.catalog["pi"]["models"].append({"id": "p/second", "name": "Second", "reasoning_levels": []})
         agents = await self.main.list_agents()
-        self.assertEqual(agents[0]["models"], [])
-        self.assertIsNone(agents[0]["models_error"])
-        self.assertEqual(agents[1]["models"], self.catalog["pi"]["models"])
+        self.assertEqual(agents[1]["models"], [])
+        self.assertIsNone(agents[1]["models_error"])
+        self.assertEqual(agents[0]["models"], self.catalog["pi"]["models"])
 
     def test_openapi_catalog_schema_and_removed_models_endpoint(self):
         schema = self.main.app.openapi()
