@@ -212,7 +212,7 @@ time.sleep(60)
         # tool registration. No user prompt or inference request is sent.
         for enabled in (False, True):
             command = [shutil.which("pi"), "--mode", "rpc", "--no-session", "--no-extensions",
-                       "-e", PiAdapter.DEFAULT_EXTENSION, "--agent-ui-session-tools"]
+                       "-e", PiAdapter.DEFAULT_EXTENSION, "--agent-ui-session-tools", "--agent-ui-asset-tools"]
             if enabled:
                 command.append("--agent-ui-host-exec")
             process = await asyncio.create_subprocess_exec(
@@ -228,6 +228,7 @@ time.sleep(60)
                         envelope = PiAdapter._envelope(event.get("message"))
                         if envelope and envelope.get("kind") == "ready":
                             self.assertEqual(envelope.get("hostTool"), "bypass_sandbox" if enabled else None)
+                            self.assertEqual(envelope.get("assetTool"), "resolve_asset_link")
                             self.assertEqual(envelope.get("sessionTools"), [
                                 "message_session", "start_session", "read_session",
                             ])

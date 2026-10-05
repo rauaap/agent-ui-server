@@ -33,6 +33,26 @@ for (const enabled of [false, true]) {
     } };
     await handlers.get("session_start")({}, ctx);
     assert.equal(tools.has("bypass_sandbox"), enabled);
+    assert.equal(tools.has("resolve_asset_link"), sessionEnabled);
+    assert.equal(notices[0].assetTool, sessionEnabled ? "resolve_asset_link" : undefined);
+    if (sessionEnabled) {
+        const tool = tools.get("resolve_asset_link");
+        const args = { path: "/missing/report.html" };
+        assert.equal(tool.parameters.additionalProperties, false);
+        assert.equal(tool.annotations.readOnlyHint, true);
+        assert.equal(await handlers.get("tool_call")({ toolName: tool.name }, ctx), undefined);
+        for (const isError of [false, true]) {
+            ctx.ui.input = async (title) => {
+                assert.deepEqual(JSON.parse(title), {
+                    "agent-ui": 1, kind: "asset_tool", name: tool.name, toolCallId: "a1", arguments: args,
+                });
+                return JSON.stringify({ isError, content: [{ type: "text", text: "asset result" }] });
+            };
+            const execution = tool.execute("a1", args, undefined, undefined, ctx);
+            if (isError) await assert.rejects(execution, /asset result/);
+            else assert.deepEqual((await execution).content, [{ type: "text", text: "asset result" }]);
+        }
+    }
     const sessionNames = ["message_session", "start_session", "read_session"];
     assert.deepEqual(notices[0].sessionTools, sessionEnabled ? sessionNames : undefined);
     for (const name of sessionNames) {

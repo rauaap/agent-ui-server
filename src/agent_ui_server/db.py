@@ -221,6 +221,13 @@ class Database:
             # have to happen here or an older database would immediately lose
             # them while being upgraded on this same open.
             self._conn.execute("""
+                CREATE TABLE IF NOT EXISTS shared_asset_roots (
+                    asset_root TEXT PRIMARY KEY,
+                    path TEXT NOT NULL UNIQUE,
+                    project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE
+                )
+            """)
+            self._conn.execute("""
                 CREATE TABLE IF NOT EXISTS sandbox_network_allowlist (
                     ip TEXT NOT NULL,
                     port INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
@@ -904,6 +911,41 @@ class Database:
                 (path,),
             ).fetchone()
         return self._project_dict(row) if row else None
+
+    def list_shared_asset_roots(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [dict(row) for row in self._conn.execute(
+                "SELECT * FROM shared_asset_roots ORDER BY asset_root"
+            )]
+
+    def get_shared_asset_root(self, asset_root: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM shared_asset_roots WHERE asset_root = ?", (asset_root,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def create_shared_asset_root(self, asset_root: str, path: str, project_id: int | None) -> dict[str, Any]:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO shared_asset_roots VALUES (?, ?, ?)",
+                (asset_root, path, project_id),
+            )
+        return {"asset_root": asset_root, "path": path, "project_id": project_id}
+
+    def update_shared_asset_root(self, old_name: str, asset_root: str, path: str, project_id: int | None) -> dict[str, Any]:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE shared_asset_roots SET asset_root = ?, path = ?, project_id = ? WHERE asset_root = ?",
+                (asset_root, path, project_id, old_name),
+            )
+        return {"asset_root": asset_root, "path": path, "project_id": project_id}
+
+    def delete_shared_asset_root(self, asset_root: str) -> bool:
+        with self._lock, self._conn:
+            return self._conn.execute(
+                "DELETE FROM shared_asset_roots WHERE asset_root = ?", (asset_root,)
+            ).rowcount > 0
 
     def get_project_by_id(self, project_id: int) -> dict[str, Any] | None:
         """Look a project up by id — how sessions refer to one."""

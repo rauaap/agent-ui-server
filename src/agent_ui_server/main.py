@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sqlite3
 from collections import defaultdict
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -9,13 +10,14 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.routing import Match, Mount
 from starlette.types import Scope
 
 from . import git, shell
+from .shared_assets import ASSET_HEADERS, AssetFiles, CreateAssetRoot, UpdateAssetRoot, resolve_asset_link, root_object
 from .actions import auto_approval_setting
 from .agent import AgentAdapter, ClaudeCodeAdapter, PiAdapter
 from .db import Database
@@ -69,17 +71,25 @@ WEB_ROOT_MOUNT = "web"
 
 
 def is_web_root_request(scope: Scope) -> bool:
-    """Whether the router would serve this request from the web root.
+    """Whether the router would serve public desktop files or shared assets.
 
     The desktop client's files must load before it can ask for the token, and
     they are the client's public source, not data, so they need none. This
     mirrors Starlette's dispatch, where the first full match wins, so only the
-    web root's own requests are exempt: never another route or mount, and
-    nothing at all without WEB_ROOT.
+    web root's own requests and shared-asset GET/HEAD routes are exempt.
+    Shared documents remain public without WEB_ROOT; API routes do not.
     """
     for route in app.router.routes:
-        if route.matches(scope)[0] is Match.FULL:
-            return isinstance(route, Mount) and route.name == WEB_ROOT_MOUNT
+        match = route.matches(scope)[0]
+        if match is Match.PARTIAL and getattr(route, "endpoint", None) is serve_shared_asset:
+            return False
+        if match is Match.FULL:
+            return (
+                isinstance(route, Mount) and route.name == WEB_ROOT_MOUNT
+            ) or (
+                getattr(route, "endpoint", None) is serve_shared_asset
+                and scope.get("method") in {"GET", "HEAD"}
+            )
     return False
 
 
@@ -963,8 +973,10 @@ def read_session_operation(
 
 
 async def session_tool_operation(sender_id: int, name: str, args: dict[str, Any]) -> Any:
-    # Called only by the mandatory approved tool executor. Never expose sender_id
-    # as an HTTP or model-supplied field.
+    # Link resolution is read-only and ungated; session communication below
+    # is called only by the mandatory approved tool executor.
+    if name == "resolve_asset_link":
+        return resolve_asset_link(db, args["path"])
     require_session_or_404(sender_id)
     if name == "read_session":
         return read_session_operation(**args)
@@ -1868,6 +1880,52 @@ def mount_web_root(app: FastAPI) -> None:
         # A typo here would otherwise surface as 404s on every page load.
         raise RuntimeError(f"WEB_ROOT is not a directory: {web_root}")
     app.mount("/", StaticFiles(directory=web_root, html=True), name=WEB_ROOT_MOUNT)
+
+
+@app.post("/shared-asset-roots", status_code=201)
+async def create_shared_asset_root(payload: CreateAssetRoot) -> dict[str, Any]:
+    if payload.project_id is not None and db.get_project_by_id(payload.project_id) is None:
+        raise HTTPException(404, "Project not found")
+    try:
+        return root_object(db.create_shared_asset_root(**payload.model_dump()))
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(409, "Identifier or path already registered") from exc
+
+
+@app.get("/shared-asset-roots")
+async def list_shared_asset_roots() -> list[dict[str, Any]]:
+    return [root_object(row) for row in db.list_shared_asset_roots()]
+
+
+@app.patch("/shared-asset-roots/{asset_root}")
+async def update_shared_asset_root(asset_root: str, payload: UpdateAssetRoot) -> dict[str, Any]:
+    row = db.get_shared_asset_root(asset_root)
+    if row is None:
+        raise HTTPException(404, "Shared asset root not found")
+    row.update(payload.model_dump(exclude_unset=True))
+    if row["project_id"] is not None and db.get_project_by_id(row["project_id"]) is None:
+        raise HTTPException(404, "Project not found")
+    try:
+        return root_object(db.update_shared_asset_root(asset_root, **row))
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(409, "Identifier or path already registered") from exc
+
+
+@app.delete("/shared-asset-roots/{asset_root}", status_code=204)
+async def delete_shared_asset_root(asset_root: str) -> Response:
+    if not db.delete_shared_asset_root(asset_root):
+        raise HTTPException(404, "Shared asset root not found")
+    return Response(status_code=204)
+
+
+@app.api_route("/shared-assets/{asset_root}", methods=["GET", "HEAD"], include_in_schema=False)
+@app.api_route("/shared-assets/{asset_root}/{file_path:path}", methods=["GET", "HEAD"], include_in_schema=False)
+async def serve_shared_asset(request: Request, asset_root: str, file_path: str = "") -> Response:
+    row = db.get_shared_asset_root(asset_root)
+    if row is None:
+        raise HTTPException(404, headers=ASSET_HEADERS)
+    files = AssetFiles(directory=row["path"], check_dir=False)
+    return await files.get_response(file_path or ".", request.scope)
 
 
 mount_web_root(app)

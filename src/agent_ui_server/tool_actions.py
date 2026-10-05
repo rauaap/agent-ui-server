@@ -156,6 +156,7 @@ def _claude_task(arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 CLAUDE_TOOL_TRANSLATORS: dict[str, ToolTranslator] = {
+    "mcp__agent_ui__resolve_asset_link": partial(other_action, "resolve_asset_link"),
     "Bash": _claude_bash,
     "Read": _claude_read,
     "Edit": _claude_edit,

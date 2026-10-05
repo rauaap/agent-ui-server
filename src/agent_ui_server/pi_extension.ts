@@ -54,6 +54,7 @@ const READ_ONLY_TOOLS = new Set([
 
 const QUESTION_TOOL = "AskUserQuestion";
 const HOST_TOOL = "bypass_sandbox";
+const ASSET_TOOL = "resolve_asset_link";
 
 const ALLOW = "Allow";
 const DENY = "Deny";
@@ -218,6 +219,12 @@ async function requestServerTool(
 }
 
 export default function (pi: ExtensionAPI) {
+	pi.registerFlag("agent-ui-asset-tools", {
+		description: "Enable read-only shared asset link resolution (agent-ui RPC only)",
+		type: "boolean",
+		default: false,
+	});
+	let assetEnabled = false;
 	pi.registerFlag("agent-ui-session-tools", {
 		description: "Enable server-approved inter-session communication (agent-ui RPC only)",
 		type: "boolean",
@@ -268,6 +275,21 @@ export default function (pi: ExtensionAPI) {
 	 * prompt, turning that into a startup error.
 	 */
 	pi.on("session_start", (_event, ctx) => {
+		assetEnabled = pi.getFlag("agent-ui-asset-tools") === true;
+		if (assetEnabled) {
+			pi.registerTool({
+				name: ASSET_TOOL,
+				label: "Resolve asset link",
+				description: "Get a server-relative URL for a file or directory under a registered shared asset root.",
+				parameters: Type.Object({
+					path: Type.String({ description: "Absolute filesystem path to link." }),
+				}, { additionalProperties: false }),
+				annotations: { readOnlyHint: true, destructiveHint: false },
+				async execute(toolCallId, params, signal, _onUpdate, ctx) {
+					return requestServerTool("asset_tool", toolCallId, params, signal, ctx, ASSET_TOOL);
+				},
+			});
+		}
 		sessionEnabled = pi.getFlag("agent-ui-session-tools") === true;
 		if (sessionEnabled) {
 			for (const tool of SESSION_TOOLS) {
@@ -283,6 +305,7 @@ export default function (pi: ExtensionAPI) {
 		if (hostEnabled) registerHostTool();
 		ctx.ui.notify(envelope("ready", {
 			questionTool: QUESTION_TOOL, hostTool: hostEnabled ? HOST_TOOL : undefined,
+			assetTool: assetEnabled ? ASSET_TOOL : undefined,
 			sessionTools: sessionEnabled ? SESSION_TOOLS.map(tool => tool.name) : undefined,
 		}), "info");
 	});
@@ -298,6 +321,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("tool_call", async (event, ctx) => {
 		// Asking permission to ask the user a question would be circular.
 		if (event.toolName === QUESTION_TOOL) return;
+		if (assetEnabled && event.toolName === ASSET_TOOL) return;
 		// Host execution has a mandatory server-side gate, not this normal tool gate.
 		if (hostEnabled && event.toolName === HOST_TOOL) return;
 		if (sessionEnabled && SESSION_TOOLS.some(tool => tool.name === event.toolName)) return;

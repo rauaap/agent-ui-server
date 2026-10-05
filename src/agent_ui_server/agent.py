@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .actions import approval_request_event, tool_use_event
+from .asset_tools import NAME as ASSET_TOOL_NAME, execute_asset_tool, validate_asset_arguments
 from .session_tools import MODELS, SessionOperation, execute_session_tool, validate_session_arguments
 from .sandbox import claude_sandbox_command, pi_sandbox_command
 from .host_tools import (
@@ -393,6 +394,9 @@ class ClaudeCodeAdapter(AgentAdapter):
                              session_call=(lambda name, args, call_id: execute_session_tool(
                                  name, args, session_id, self.session_operation,
                                  lambda action: self._approve_server_action(session_id, action, call_id),
+                             )) if self.session_operation is not None else None,
+                             asset_call=(lambda args: execute_asset_tool(
+                                 args, session_id, self.session_operation,
                              )) if self.session_operation is not None else None)
             self.host_tools[session_id] = host
 
@@ -993,7 +997,7 @@ class PiAdapter(AgentAdapter):
             command.append("--agent-ui-host-exec")
         session_enabled = self.session_operation is not None
         if session_enabled:
-            command.append("--agent-ui-session-tools")
+            command.extend(["--agent-ui-session-tools", "--agent-ui-asset-tools"])
         if self.web_extension_path:
             command.extend(["-e", self.web_extension_path])
         if session.get("model") is not None:
@@ -1169,6 +1173,9 @@ class PiAdapter(AgentAdapter):
                         result = await execute_host_command(
                             args, session["working_dir"], lambda values: approve_host(values, tool_call_id),
                         )
+                    elif name == ASSET_TOOL_NAME:
+                        assert self.session_operation is not None
+                        result = await execute_asset_tool(args, session_id, self.session_operation)
                     else:
                         assert self.session_operation is not None
                         result = await execute_session_tool(
@@ -1277,6 +1284,8 @@ class PiAdapter(AgentAdapter):
                         ready.set_exception(RuntimeError("Pi extension did not register bypass_sandbox"))
                     elif session_enabled and envelope.get("sessionTools") != list(MODELS):
                         ready.set_exception(RuntimeError("Pi extension did not register session tools"))
+                    elif session_enabled and envelope.get("assetTool") != ASSET_TOOL_NAME:
+                        ready.set_exception(RuntimeError("Pi extension did not register resolve_asset_link"))
                     else:
                         ready.set_result(None)
                 return
@@ -1287,9 +1296,10 @@ class PiAdapter(AgentAdapter):
                     host_calls[call_id].cancel()
                 return
 
-            if kind in {"host_exec", "session_tool"}:
+            if kind in {"host_exec", "session_tool", "asset_tool"}:
                 try:
-                    name = "bypass_sandbox" if kind == "host_exec" else envelope.get("name")
+                    name = ("bypass_sandbox" if kind == "host_exec" else ASSET_TOOL_NAME
+                            if kind == "asset_tool" else envelope.get("name"))
                     enabled = host_enabled if kind == "host_exec" else session_enabled
                     if (not enabled or method != "input"
                             or self.processes.get(session_id) is not process):
@@ -1298,6 +1308,7 @@ class PiAdapter(AgentAdapter):
                     if not isinstance(call_id, str) or not call_id or call_id in host_calls:
                         raise ValueError("Invalid or duplicate host tool call id")
                     args = (validate_host_arguments(envelope.get("arguments")) if kind == "host_exec"
+                            else validate_asset_arguments(envelope.get("arguments")) if kind == "asset_tool"
                             else validate_session_arguments(name, envelope.get("arguments")))
                 except ValueError as exc:
                     await answer_dialog(dialog_id, json.dumps({

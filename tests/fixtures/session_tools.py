@@ -18,6 +18,7 @@ if pi:
     assert "--agent-ui-session-tools" in sys.argv
     write({"type": "extension_ui_request", "method": "notify", "message": json.dumps({
         "agent-ui": 1, "kind": "ready", "sessionTools": names,
+        "assetTool": "resolve_asset_link",
     })})
     while True:
         request = read()
@@ -30,7 +31,7 @@ if pi:
     write({"type": "tool_execution_start", "toolCallId": "call",
            "toolName": config["name"], "args": config["arguments"]})
     write({"type": "extension_ui_request", "method": "input", "id": "call", "title": json.dumps({
-        "agent-ui": 1, "kind": "session_tool", "toolCallId": "call",
+        "agent-ui": 1, "kind": "asset_tool" if config["name"] == "resolve_asset_link" else "session_tool", "toolCallId": "call",
         "name": config["name"], "arguments": config["arguments"],
     })})
     response = read()
@@ -58,7 +59,7 @@ else:
         }})
     mcp("list", "tools/list")
     tools = read()["response"]["response"]["mcp_response"]["result"]["tools"]
-    assert [t["name"] for t in tools] == names
+    assert [t["name"] for t in tools] == names + ["resolve_asset_link"]
     write({"type": "control_request", "request_id": "permission", "request": {
         "subtype": "can_use_tool", "tool_name": "mcp__agent_ui__" + config["name"],
         "input": config["arguments"],

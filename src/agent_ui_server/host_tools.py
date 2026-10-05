@@ -13,6 +13,7 @@ from typing import Any
 
 from .approvals import denial_message
 from .shell import BASH_TIMEOUT_SECONDS, run_command
+from .asset_tools import NAME as ASSET_TOOL_NAME, TOOL as ASSET_TOOL, validate_asset_arguments
 from .session_tools import TOOLS, validate_session_arguments
 from .sandbox import SandboxFilesystem
 
@@ -113,15 +114,17 @@ class HostTools:
                  approve: Callable[[dict[str, Any], str | None], Awaitable[Any]], *,
                  host_enabled: bool = True,
                  session_call: Callable[[str, dict[str, Any], str | None],
-                                        Awaitable[dict[str, Any]]] | None = None) -> None:
+                                        Awaitable[dict[str, Any]]] | None = None,
+                 asset_call: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None) -> None:
         self.process = process
         self.cwd = cwd
         self.approve = approve
         self.host_enabled = host_enabled
         self.session_call = session_call
+        self.asset_call = asset_call
         self.tool_names = ({"bypass_sandbox"} if host_enabled else set()) | (
             {tool["name"] for tool in TOOLS} if session_call else set()
-        )
+        ) | ({ASSET_TOOL_NAME} if asset_call else set())
         self.events: asyncio.Queue[bytes | dict[str, Any]] = asyncio.Queue()
         self.calls: dict[str, asyncio.Task[None]] = {}
         self.execution_lock = asyncio.Lock()
@@ -234,7 +237,8 @@ class HostTools:
         elif method == "ping":
             result = {}
         elif method == "tools/list":
-            result = {"tools": ([TOOL] if self.host_enabled else []) + (TOOLS if self.session_call else [])}
+            result = {"tools": ([TOOL] if self.host_enabled else []) + (TOOLS if self.session_call else [])
+                      + ([ASSET_TOOL] if self.asset_call else [])}
         elif method == "tools/call":
             params = message.get("params")
             if (not isinstance(params, dict) or not isinstance(params.get("name"), str)
@@ -247,12 +251,16 @@ class HostTools:
             tool_use_id = tool_use_id if isinstance(tool_use_id, str) and tool_use_id else None
             try:
                 args = (validate_host_arguments(params.get("arguments")) if name == "bypass_sandbox"
+                        else validate_asset_arguments(params.get("arguments")) if name == ASSET_TOOL_NAME
                         else validate_session_arguments(name, params.get("arguments")))
             except ValueError as exc:
                 return self.error(mid, -32602, str(exc))
             if name == "bypass_sandbox":
                 result = await execute_host_command(
                     args, self.cwd, lambda values: self.approve(values, tool_use_id))
+            elif name == ASSET_TOOL_NAME:
+                assert self.asset_call is not None
+                result = await self.asset_call(args)
             else:
                 assert self.session_call is not None
                 result = await self.session_call(name, args, tool_use_id)

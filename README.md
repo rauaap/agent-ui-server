@@ -92,6 +92,8 @@ src/agent_ui_server/
 ├── agent.py          # AgentAdapter, Claude Code adapter, Pi adapter
 ├── actions.py        # validated canonical action/event models
 ├── tool_actions.py   # provider-specific action projections
+├── shared_assets.py  # root validation, link resolution, contained serving
+├── asset_tools.py    # ungated resolve_asset_link tool validation/execution
 ├── pi_extension.ts   # Pi approval gate and AskUserQuestion tool
 ├── pi_web_search/    # vendored pi-web-search; Pi's web_search and url_context
 ├── usage.py          # subscription usage percentages from Claude and Codex
@@ -111,7 +113,7 @@ tests/
 ## Security model
 
 The intended deployment binds uvicorn to a WireGuard interface and permits
-only trusted peers to reach it. On top of that, every client must present a
+only trusted peers to reach it. On top of that, API operations require a
 shared token. The server generates it on first start in
 `~/.config/agent-ui-server/token` (mode `0600`; `AUTH_TOKEN_FILE` overrides the
 path) and prints where it is, never the token itself:
@@ -133,8 +135,8 @@ is readable by other users, or holds fewer than 32 characters.
 
 Clients send the token as `Authorization: Bearer <token>`. Browsers can't set
 headers on a WebSocket, so WebSockets also accept `?token=<token>`, which the
-server strips before the endpoint or access log sees it. Only the static web client
-under `WEB_ROOT` loads without the token. Enter the token once in each
+server strips before the endpoint or access log sees it. The static web client
+under `WEB_ROOT` and shared-asset GET/HEAD routes load without the token. Enter the token once in each
 client's settings; see [docs/auth_client_handoff.md](docs/auth_client_handoff.md).
 To rotate it, delete the file, restart, and enter the new token in each
 client.
@@ -525,6 +527,32 @@ commands are unaffected. Validation errors on updates return `400`; malformed
 request shapes return FastAPI's usual `422`.
 
 See [the design](docs/sandbox_paths_design.md) for mount rules and lifecycle details.
+
+### Shared assets
+
+Register directories with `POST /shared-asset-roots` using
+`{"asset_root":"notes","path":"/absolute/directory","project_id":null}`.
+List with `GET /shared-asset-roots`, edit or rename with
+`PATCH /shared-asset-roots/{asset_root}`, and unregister with `DELETE` at the
+same URL. Configuration requires the API token. Paths are normalized without
+creating directories; project association only organizes settings. Project
+deletion unregisters its roots, but root operations never remove files.
+
+`GET` and `HEAD /shared-assets/notes/` serve `index.html`; nested URLs serve
+files and directory indexes directly, without directory listings or SPA fallback.
+Changes appear on browser reload. The ungated `resolve_asset_link(path)` tool
+available in both backends returns an encoded server-relative URL, choosing the
+deepest registered directory, without checking file existence or sandbox access.
+Registration does not grant agents filesystem access: configure existing sandbox
+paths separately when needed.
+
+**Anyone who can reach the server can read every file in a registered directory,
+without a token.** Host checks still apply. Documents receive
+`Content-Security-Policy: sandbox allow-scripts; object-src 'none'`, giving them an
+opaque origin and isolating application storage. This restricts forms, popups,
+downloads, and enclosing-page navigation, but is not a network firewall. Some
+JavaScript/browser APIs and companion-file fetches are restricted. Traversal and
+escaping symlinks are rejected. See [the full design](docs/shared_assets_design.md).
 
 ### Inter-agent communication
 
