@@ -193,9 +193,8 @@ replies flow back to the sender, so the trust decision is whether this sender ma
 reach other sessions (and what they have seen) without asking. There are no
 project-level permissions. Cross-project messaging is allowed.
 
-These capabilities are independent of sandbox bypass: their availability must
-not depend on `CLAUDE_HOST_EXEC`, `PI_HOST_EXEC`, or whether the calling session
-is sandboxed. The agent requests an operation through its harness transport; the
+These capabilities are independent of sandbox bypass: their availability does
+not depend on whether the calling session is sandboxed. The agent requests an operation through its harness transport; the
 server executes it internally. No HTTP loopback, API token exposure, or sandbox
 network access is needed.
 

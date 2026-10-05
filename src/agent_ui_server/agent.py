@@ -333,10 +333,7 @@ class ClaudeCodeAdapter(AgentAdapter):
             }),
             "--verbose",
         ]
-        host_enabled = (
-            os.environ.get("CLAUDE_HOST_EXEC") == "1"
-            and session.get("sandbox", True)
-        )
+        host_enabled = session.get("sandbox", True)
         if host_enabled or self.session_operation is not None:
             command.extend(["--mcp-config", json.dumps({
                 "mcpServers": {"agent_ui": {"type": "sdk", "name": "agent_ui"}}
@@ -992,7 +989,7 @@ class PiAdapter(AgentAdapter):
             # arguments the user just approved.
             "--no-extensions",
         ]
-        host_enabled = os.environ.get("PI_HOST_EXEC") == "1" and session.get("sandbox", True)
+        host_enabled = session.get("sandbox", True)
         if host_enabled:
             command.append("--agent-ui-host-exec")
         session_enabled = self.session_operation is not None

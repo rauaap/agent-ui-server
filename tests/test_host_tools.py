@@ -226,7 +226,7 @@ class HostToolTests(unittest.IsolatedAsyncioTestCase):
                             session["agent_session_id"] = "previous-session"
                         _ = [e async for e in self.adapter.start_turn(session, "hello")]
                         argv = spawn.call_args.args
-                        expected = enabled and sandbox is not False
+                        expected = sandbox is not False
                         self.assertEqual("--append-system-prompt" in argv, expected)
                         if expected:
                             guidance = argv[argv.index("--append-system-prompt") + 1]

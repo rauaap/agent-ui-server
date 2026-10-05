@@ -261,6 +261,10 @@ class ClaudeSandboxAdapterTests(unittest.IsolatedAsyncioTestCase):
             stub = Path(tmp) / "claude"
             stub.write_text('''#!/usr/bin/python3
 import json, sys
+init = json.loads(sys.stdin.readline())
+assert init['request']['subtype'] == 'initialize'
+print(json.dumps({'type':'control_response','response':{
+    'subtype':'success','request_id':init['request_id'],'response':{}}}), flush=True)
 prompt = json.loads(sys.stdin.readline())
 assert prompt['type'] == 'user'
 assert '--resume' in sys.argv and 'resume-id' in sys.argv
@@ -278,7 +282,7 @@ else:
             stub.chmod(0o755)
             adapter = ClaudeCodeAdapter(executable=str(stub))
             session = {"id": 789, "working_dir": tmp, "agent_session_id": "resume-id", "sandbox": True}
-            with mock.patch("agent_ui_server.agent.claude_sandbox_command", side_effect=lambda command, cwd: command) as wrap:
+            with mock.patch("agent_ui_server.agent.claude_sandbox_command", side_effect=lambda command, cwd, **kwargs: command) as wrap:
                 async with asyncio.timeout(10):
                     for prompt in ("finish", "wait"):
                         events = []

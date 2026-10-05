@@ -605,17 +605,14 @@ Deletion cascades queue membership along with scrollback.
 See the [queue/client contract](docs/message_queue_client_handoff.md) and the
 [original inter-agent design](docs/inter_agent_communication_design.md).
 
-### Experimental sandbox-bypass tools
+### Sandbox-bypass tools
 
-Enable either or both tools in the server environment:
+Sandboxed sessions always receive a sandbox-bypass tool requiring explicit approval:
 
-| Setting | Tool in sandboxed sessions |
-| --- | --- |
-| `CLAUDE_HOST_EXEC=1` | Claude: `mcp__agent_ui__bypass_sandbox(command, reason, timeout_seconds?)` |
-| `PI_HOST_EXEC=1` | Pi: `bypass_sandbox(command, reason, timeout_seconds?)` |
+- Claude: `mcp__agent_ui__bypass_sandbox(command, reason, timeout_seconds?)`
+- Pi: `bypass_sandbox(command, reason, timeout_seconds?)`
 
-Both settings default to disabled. Non-sandboxed sessions receive neither tool
-nor its system-prompt guidance.
+Non-sandboxed sessions receive neither tool nor its system-prompt guidance.
 
 Pi registers its tool in the bundled extension and forwards requests/results over
 the existing extension UI RPC bridge. There is no MCP layer. Registration is

@@ -87,12 +87,10 @@ class PiHostToolTests(unittest.IsolatedAsyncioTestCase):
             events = await self.collect([{"command": "echo nope", "reason": "test", "cwd": "/"}])
             self.assertFalse(any(e["type"] == "approval_request" for e in events))
             self.assertTrue(self.results(events)[0]["isError"])
-            for sandbox, enabled in ((False, "1"), (True, "0")):
-                self.session["sandbox"] = sandbox
-                with mock.patch.dict(os.environ, {"PI_HOST_EXEC": enabled}):
-                    events = await self.collect()
-                self.assertFalse(any(e["type"] == "approval_request" for e in events))
-                self.assertTrue(self.results(events)[0]["isError"])
+            self.session["sandbox"] = False
+            events = await self.collect()
+            self.assertFalse(any(e["type"] == "approval_request" for e in events))
+            self.assertTrue(self.results(events)[0]["isError"])
             run.assert_not_awaited()
 
     async def test_nonzero_exit_and_parallel_requests(self):
@@ -180,7 +178,7 @@ time.sleep(60)
                         session["sandbox"] = sandbox
                     _ = [e async for e in self.adapter.start_turn(session, "test")]
                     argv = spawn.call_args.args
-                    expected = enabled and sandbox is not False
+                    expected = sandbox is not False
                     self.assertEqual("--agent-ui-host-exec" in argv, expected)
                     self.assertEqual("--append-system-prompt" in argv, expected)
                     if expected:
