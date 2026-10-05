@@ -286,12 +286,14 @@ FastAPI also exposes generated OpenAPI documentation at `/docs`.
 
 ### Agents and sessions
 
+Pi is the default harness for new sessions when `agent` is omitted.
+
 `GET /agents` returns agents and their models together, in picker order:
 
 ```json
 [
   {
-    "id": "claude-code", "name": "Claude Code", "default": true,
+    "id": "claude-code", "name": "Claude Code", "default": false,
     "models": [
       {"id": "claude-opus-5-5", "name": "Opus 5.5",
        "reasoning_levels": ["low", "medium", "high", "xhigh", "max"]},
@@ -300,7 +302,7 @@ FastAPI also exposes generated OpenAPI documentation at `/docs`.
     "models_error": null
   },
   {
-    "id": "pi", "name": "Pi", "default": false,
+    "id": "pi", "name": "Pi", "default": true,
     "models": [
       {"id": "openai-codex/gpt-5.5", "name": "gpt-5.5",
        "reasoning_levels": ["off", "minimal", "low", "medium", "high", "xhigh"]}

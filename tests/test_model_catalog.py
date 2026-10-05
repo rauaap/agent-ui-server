@@ -143,6 +143,7 @@ class SessionModelTests(unittest.IsolatedAsyncioTestCase):
         finally:
             reopened.close()
         default = await self.main.create_session(self.main.CreateSessionRequest(name="default", project_path=self.tmp.name))
+        self.assertEqual(default["agent"], "pi")
         self.assertIsNone(default["model"])
 
     async def test_validation_and_no_refresh(self):
@@ -152,9 +153,9 @@ class SessionModelTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(caught.exception.status_code, status)
         with patch.object(self.main, "discover_catalog", AsyncMock()) as discover:
             expected = [
-                {"id": "claude-code", "name": "Claude Code", "default": True,
+                {"id": "claude-code", "name": "Claude Code", "default": False,
                  "models": [], "models_error": "Unavailable"},
-                {"id": "pi", "name": "Pi", "default": False,
+                {"id": "pi", "name": "Pi", "default": True,
                  "models": [{"id": "p/m", "name": "M", "reasoning_levels": ["low", "high"]}],
                  "models_error": None},
             ]

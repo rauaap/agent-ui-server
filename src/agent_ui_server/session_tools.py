@@ -28,7 +28,7 @@ class StartSession(Arguments):
     name: str = Field(min_length=1, max_length=120, description="Display name for the new session.")
     project_path: str = Field(min_length=1, description="Path of an existing registered project.")
     message: str = Field(min_length=1, description="Message to send.")
-    agent: str | None = Field(default=None, description="Agent backend: claude-code (default) or pi.")
+    agent: str | None = Field(default=None, description="Agent backend: pi (default) or claude-code.")
     model: str | None = Field(default=None, min_length=1, description="Model ID from the selected agent's models in GET /agents; omit to use the harness default.")
     reasoning_level: str | None = Field(default=None, min_length=1, description="One of the chosen model's reasoning_levels in GET /agents; requires model. Omit to use the harness default.")
     worktree_id: int | None = Field(default=None, ge=1, description="Existing worktree ID; omit to use the project directory.")

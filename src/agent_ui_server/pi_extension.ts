@@ -180,7 +180,7 @@ const SESSION_TOOLS = [
 			name: Type.String({ minLength: 1, maxLength: 120, description: "Display name for the new session." }),
 			project_path: Type.String({ minLength: 1, description: "Path of an existing registered project." }),
 			message: Type.String({ minLength: 1, description: "Message to send." }),
-			agent: Type.Optional(Type.Union([Type.String(), Type.Null()], { description: "Agent backend: claude-code (default) or pi." })),
+			agent: Type.Optional(Type.Union([Type.String(), Type.Null()], { description: "Agent backend: pi (default) or claude-code." })),
 			model: Type.Optional(Type.Union([Type.String({ minLength: 1 }), Type.Null()], { description: "Model ID from the selected agent's models in GET /agents; omit to use the harness default." })),
 			reasoning_level: Type.Optional(Type.Union([Type.String({ minLength: 1 }), Type.Null()], { description: "One of the chosen model's reasoning_levels in GET /agents; requires model. Omit to use the harness default." })),
 			worktree_id: Type.Optional(Type.Union([Type.Integer({ minimum: 1 }), Type.Null()], { description: "Existing worktree ID; omit to use the project directory." })),

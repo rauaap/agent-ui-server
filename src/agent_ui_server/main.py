@@ -212,7 +212,7 @@ class CreateSessionRequest(BaseModel):
 
     name: str = Field(min_length=1, max_length=120)
     project_path: str = Field(min_length=1)
-    agent: str = "claude-code"
+    agent: str = "pi"
     model: str | None = Field(default=None, min_length=1)
     reasoning_level: str | None = Field(default=None, min_length=1)
     worktree_id: int | None = None
