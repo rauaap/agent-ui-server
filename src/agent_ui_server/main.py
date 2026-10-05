@@ -19,7 +19,7 @@ from starlette.types import Scope
 from . import git, shell
 from .shared_assets import ASSET_HEADERS, AssetFiles, CreateAssetRoot, UpdateAssetRoot, resolve_asset_link, root_object
 from .actions import auto_approval_setting
-from .agent import AgentAdapter, ClaudeCodeAdapter, PiAdapter
+from .agent_registry import adapters
 from .db import Database
 from .file_tree import (
     FileTreeError,
@@ -101,10 +101,6 @@ app.add_middleware(
     is_public=is_web_root_request,
 )
 db = Database(os.environ.get("SESSION_DB", "sessions.db"))
-adapters: dict[str, AgentAdapter] = {
-    "pi": PiAdapter(),
-    "claude-code": ClaudeCodeAdapter(),
-}
 
 
 @dataclass(eq=False)

@@ -21,7 +21,13 @@ for (const enabled of [false, true]) {
   for (const sessionEnabled of [false, true]) {
     const tools = new Map(), handlers = new Map(), notices = [];
     const api = {
-        registerFlag() {}, getFlag: (name) => name === "agent-ui-host-exec" ? enabled : sessionEnabled,
+        registerFlag() {}, getFlag: (name) => {
+            if (name === "agent-ui-harness-description") {
+                return serverTools.find(tool => tool.name === "start_session")?.inputSchema.properties.agent.description
+                    ?? "Agent backend: test-harness. Omit to use test-harness (default).";
+            }
+            return name === "agent-ui-host-exec" ? enabled : sessionEnabled;
+        },
         registerTool: (tool) => tools.set(tool.name, tool),
         on: (name, callback) => handlers.set(name, callback),
     };

@@ -73,7 +73,7 @@ class SessionOperationTests(unittest.IsolatedAsyncioTestCase):
         self.events = []
         for patch in (
             mock.patch.object(main, "db", self.db),
-            mock.patch.object(main, "adapters", {"claude-code": self.adapter, "pi": self.adapter}),
+            mock.patch.object(main, "adapters", {"pi": self.adapter, "claude-code": self.adapter}),
             mock.patch.object(main, "running_tasks", {}),
             mock.patch.object(main, "stream_locks", defaultdict(asyncio.Lock)),
             mock.patch.object(main, "turn_lock", asyncio.Lock()),

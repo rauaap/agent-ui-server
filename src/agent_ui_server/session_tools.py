@@ -28,7 +28,7 @@ class StartSession(Arguments):
     name: str = Field(min_length=1, max_length=120, description="Display name for the new session.")
     project_path: str = Field(min_length=1, description="Path of an existing registered project.")
     message: str = Field(min_length=1, description="Message to send.")
-    agent: str | None = Field(default=None, description="Agent backend: pi (default) or claude-code.")
+    agent: str | None = Field(default=None, description="Agent backend; omit to use the server default.")
     model: str | None = Field(default=None, min_length=1, description="Model ID from the selected agent's models in GET /agents; omit to use the harness default.")
     reasoning_level: str | None = Field(default=None, min_length=1, description="One of the chosen model's reasoning_levels in GET /agents; requires model. Omit to use the harness default.")
     worktree_id: int | None = Field(default=None, ge=1, description="Existing worktree ID; omit to use the project directory.")
@@ -50,10 +50,22 @@ DESCRIPTIONS = {
     "start_session": "Create a session under an existing project and send its first message with user approval. Returns session_id and message_id. If messaging fails, the created session is retained and its ID reported.",
     "read_session": "Read one page of persisted session events with user approval. Returns messages, next_cursor and has_more; after is an exclusive input/event ID cursor. Does not wait for a response. Use a smaller limit for large events.",
 }
-TOOLS = [
-    {"name": name, "description": DESCRIPTIONS[name], "inputSchema": model.model_json_schema()}
-    for name, model in MODELS.items()
-]
+def agent_description() -> str:
+    # Import lazily: the registry instantiates adapters that import this module.
+    from .agent_registry import adapters
+
+    choices = ", ".join(adapters)
+    return f"Agent backend: {choices}. Omit to use {next(iter(adapters))} (default)."
+
+
+def session_tool_schemas() -> list[dict[str, Any]]:
+    tools = [
+        {"name": name, "description": DESCRIPTIONS[name], "inputSchema": model.model_json_schema()}
+        for name, model in MODELS.items()
+    ]
+    start = next(tool for tool in tools if tool["name"] == "start_session")
+    start["inputSchema"]["properties"]["agent"]["description"] = agent_description()
+    return tools
 
 
 def validate_session_arguments(name: str, args: Any) -> dict[str, Any]:

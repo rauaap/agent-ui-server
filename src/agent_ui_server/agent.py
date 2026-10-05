@@ -14,7 +14,7 @@ from typing import Any
 
 from .actions import approval_request_event, tool_use_event
 from .asset_tools import NAME as ASSET_TOOL_NAME, execute_asset_tool, validate_asset_arguments
-from .session_tools import MODELS, SessionOperation, execute_session_tool, validate_session_arguments
+from .session_tools import MODELS, SessionOperation, agent_description, execute_session_tool, validate_session_arguments
 from .sandbox import claude_sandbox_command, pi_sandbox_command
 from .host_tools import (
     HostTools, execute_host_command, pi_sandbox_guidance, sandbox_guidance,
@@ -994,7 +994,10 @@ class PiAdapter(AgentAdapter):
             command.append("--agent-ui-host-exec")
         session_enabled = self.session_operation is not None
         if session_enabled:
-            command.extend(["--agent-ui-session-tools", "--agent-ui-asset-tools"])
+            command.extend([
+                "--agent-ui-session-tools", "--agent-ui-asset-tools",
+                "--agent-ui-harness-description", agent_description(),
+            ])
         if self.web_extension_path:
             command.extend(["-e", self.web_extension_path])
         if session.get("model") is not None:

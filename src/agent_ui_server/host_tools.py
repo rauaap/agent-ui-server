@@ -14,7 +14,7 @@ from typing import Any
 from .approvals import denial_message
 from .shell import BASH_TIMEOUT_SECONDS, run_command
 from .asset_tools import NAME as ASSET_TOOL_NAME, TOOL as ASSET_TOOL, validate_asset_arguments
-from .session_tools import TOOLS, validate_session_arguments
+from .session_tools import MODELS, session_tool_schemas, validate_session_arguments
 from .sandbox import SandboxFilesystem
 
 SERVER = "agent_ui"
@@ -123,7 +123,7 @@ class HostTools:
         self.session_call = session_call
         self.asset_call = asset_call
         self.tool_names = ({"bypass_sandbox"} if host_enabled else set()) | (
-            {tool["name"] for tool in TOOLS} if session_call else set()
+            set(MODELS) if session_call else set()
         ) | ({ASSET_TOOL_NAME} if asset_call else set())
         self.events: asyncio.Queue[bytes | dict[str, Any]] = asyncio.Queue()
         self.calls: dict[str, asyncio.Task[None]] = {}
@@ -237,7 +237,7 @@ class HostTools:
         elif method == "ping":
             result = {}
         elif method == "tools/list":
-            result = {"tools": ([TOOL] if self.host_enabled else []) + (TOOLS if self.session_call else [])
+            result = {"tools": ([TOOL] if self.host_enabled else []) + (session_tool_schemas() if self.session_call else [])
                       + ([ASSET_TOOL] if self.asset_call else [])}
         elif method == "tools/call":
             params = message.get("params")

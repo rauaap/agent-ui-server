@@ -286,27 +286,28 @@ FastAPI also exposes generated OpenAPI documentation at `/docs`.
 
 ### Agents and sessions
 
-The first harness in the server's adapter registry is the default when `agent`
-is omitted. Pi is registered first.
+The first harness in `src/agent_ui_server/agent_registry.py` is the default when
+`agent` is omitted. Pi is registered first. The `start_session` tool's harness
+choices and default description are generated from the same registry.
 
 `GET /agents` returns agents and their models together, in picker order:
 
 ```json
 [
   {
+    "id": "pi", "name": "Pi", "default": true,
+    "models": [
+      {"id": "openai-codex/gpt-5.5", "name": "gpt-5.5",
+       "reasoning_levels": ["off", "minimal", "low", "medium", "high", "xhigh"]}
+    ],
+    "models_error": null
+  },
+  {
     "id": "claude-code", "name": "Claude Code", "default": false,
     "models": [
       {"id": "claude-opus-5-5", "name": "Opus 5.5",
        "reasoning_levels": ["low", "medium", "high", "xhigh", "max"]},
       {"id": "claude-haiku-4-5-20251001", "name": "Haiku 4.5", "reasoning_levels": []}
-    ],
-    "models_error": null
-  },
-  {
-    "id": "pi", "name": "Pi", "default": true,
-    "models": [
-      {"id": "openai-codex/gpt-5.5", "name": "gpt-5.5",
-       "reasoning_levels": ["off", "minimal", "low", "medium", "high", "xhigh"]}
     ],
     "models_error": null
   }

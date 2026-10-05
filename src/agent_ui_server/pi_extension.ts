@@ -164,7 +164,8 @@ const QUESTION_SCHEMA = Type.Object({
 	),
 });
 
-const SESSION_TOOLS = [
+function sessionTools(agentDescription: string) {
+	return [
 	{
 		name: "message_session",
 		description: "Submit a message with user approval. Busy recipients queue it for their next turn. Returns its persisted input ID immediately, not a response. The recipient sees your session ID and can reply.",
@@ -180,7 +181,7 @@ const SESSION_TOOLS = [
 			name: Type.String({ minLength: 1, maxLength: 120, description: "Display name for the new session." }),
 			project_path: Type.String({ minLength: 1, description: "Path of an existing registered project." }),
 			message: Type.String({ minLength: 1, description: "Message to send." }),
-			agent: Type.Optional(Type.Union([Type.String(), Type.Null()], { description: "Agent backend: pi (default) or claude-code." })),
+			agent: Type.Optional(Type.Union([Type.String(), Type.Null()], { description: agentDescription })),
 			model: Type.Optional(Type.Union([Type.String({ minLength: 1 }), Type.Null()], { description: "Model ID from the selected agent's models in GET /agents; omit to use the harness default." })),
 			reasoning_level: Type.Optional(Type.Union([Type.String({ minLength: 1 }), Type.Null()], { description: "One of the chosen model's reasoning_levels in GET /agents; requires model. Omit to use the harness default." })),
 			worktree_id: Type.Optional(Type.Union([Type.Integer({ minimum: 1 }), Type.Null()], { description: "Existing worktree ID; omit to use the project directory." })),
@@ -195,7 +196,8 @@ const SESSION_TOOLS = [
 			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000, default: 200, description: "Maximum events to return; defaults to 200." })),
 		}, { additionalProperties: false }),
 	},
-];
+	];
+}
 
 async function requestServerTool(
 	kind: string, toolCallId: string, params: unknown,
@@ -231,6 +233,11 @@ export default function (pi: ExtensionAPI) {
 		default: false,
 	});
 	let sessionEnabled = false;
+	let registeredSessionTools: ReturnType<typeof sessionTools> = [];
+	pi.registerFlag("agent-ui-harness-description", {
+		description: "Available harnesses and default supplied by the agent-ui server",
+		type: "string",
+	});
 	pi.registerFlag("agent-ui-host-exec", {
 		description: "Enable server-approved execution outside Bubblewrap (agent-ui RPC only)",
 		type: "boolean",
@@ -292,7 +299,10 @@ export default function (pi: ExtensionAPI) {
 		}
 		sessionEnabled = pi.getFlag("agent-ui-session-tools") === true;
 		if (sessionEnabled) {
-			for (const tool of SESSION_TOOLS) {
+			const description = pi.getFlag("agent-ui-harness-description");
+			if (typeof description !== "string" || !description) throw new Error("Missing harness description");
+			registeredSessionTools = sessionTools(description);
+			for (const tool of registeredSessionTools) {
 				pi.registerTool({
 					...tool, label: tool.name, promptSnippet: tool.description,
 					async execute(toolCallId, params, signal, _onUpdate, ctx) {
@@ -306,7 +316,7 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.notify(envelope("ready", {
 			questionTool: QUESTION_TOOL, hostTool: hostEnabled ? HOST_TOOL : undefined,
 			assetTool: assetEnabled ? ASSET_TOOL : undefined,
-			sessionTools: sessionEnabled ? SESSION_TOOLS.map(tool => tool.name) : undefined,
+			sessionTools: sessionEnabled ? registeredSessionTools.map(tool => tool.name) : undefined,
 		}), "info");
 	});
 
@@ -324,7 +334,7 @@ export default function (pi: ExtensionAPI) {
 		if (assetEnabled && event.toolName === ASSET_TOOL) return;
 		// Host execution has a mandatory server-side gate, not this normal tool gate.
 		if (hostEnabled && event.toolName === HOST_TOOL) return;
-		if (sessionEnabled && SESSION_TOOLS.some(tool => tool.name === event.toolName)) return;
+		if (sessionEnabled && registeredSessionTools.some(tool => tool.name === event.toolName)) return;
 		if (READ_ONLY_TOOLS.has(event.toolName)) return;
 
 		// No dialog transport (print/json mode) means nobody can approve, so
