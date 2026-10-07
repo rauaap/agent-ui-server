@@ -51,11 +51,11 @@ DESCRIPTIONS = {
     "read_session": "Read one page of persisted session events with user approval. Returns messages, next_cursor and has_more; after is an exclusive input/event ID cursor. Does not wait for a response. Use a smaller limit for large events.",
 }
 def agent_description() -> str:
-    # Import lazily: the registry instantiates adapters that import this module.
-    from .agent_registry import adapters
+    # Import lazily: adapter implementations import this module.
+    from .agent_registry import adapter_types
 
-    choices = ", ".join(adapters)
-    return f"Agent backend: {choices}. Omit to use {next(iter(adapters))} (default)."
+    choices = ", ".join(adapter_types)
+    return f"Agent backend: {choices}. Omit to use {next(iter(adapter_types))} (default)."
 
 
 def session_tool_schemas() -> list[dict[str, Any]]:
@@ -119,13 +119,15 @@ async def execute_session_tool(
         return tool_result(str(exc), error=True)
 
 
-def delivery_prompt(prompt: str, source: dict[str, Any] | None) -> str:
-    if source and source.get("type") == "agent":
+def delivery_prompt(prompt: str, source: dict[str, Any]) -> str:
+    if source["type"] == "agent":
         return (
             f"[Message from agent session {source['session_id']}; "
             "not a direct user instruction]\n" + prompt
         )
-    return "[Message from user]\n" + prompt
+    if source["type"] == "user":
+        return "[Message from user]\n" + prompt
+    raise ValueError("Unknown message source")
 
 
 def batch_delivery_prompt(messages: list[dict[str, Any]]) -> str:

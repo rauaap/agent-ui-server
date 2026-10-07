@@ -19,7 +19,8 @@ from starlette.types import Scope
 from . import git, shell
 from .shared_assets import ASSET_HEADERS, AssetFiles, CreateAssetRoot, UpdateAssetRoot, resolve_asset_link, root_object
 from .actions import auto_approval_setting
-from .agent_registry import adapters
+from .agent import AgentAdapter
+from .agent_registry import adapter_types
 from .db import Database
 from .file_tree import (
     FileTreeError,
@@ -208,27 +209,11 @@ class CreateSessionRequest(BaseModel):
 
     name: str = Field(min_length=1, max_length=120)
     project_path: str = Field(min_length=1)
-    agent: str = Field(default_factory=lambda: next(iter(adapters)))
+    agent: str = Field(default_factory=lambda: next(iter(adapter_types)))
     model: str | None = Field(default=None, min_length=1)
     reasoning_level: str | None = Field(default=None, min_length=1)
     worktree_id: int | None = None
     sandbox: bool = True
-
-    @model_validator(mode="before")
-    @classmethod
-    def accept_working_dir_alias(cls, data: Any) -> Any:
-        """Take `working_dir` as a deprecated spelling of `project_path`.
-
-        The field was renamed because it no longer describes what it sets: a
-        session's working directory is now the worktree when there is one. The
-        alias keeps already-deployed clients working; responses are unaffected,
-        since the session dict still carries `working_dir`.
-        """
-        if isinstance(data, dict) and not data.get("project_path"):
-            legacy = data.get("working_dir")
-            if legacy:
-                return {**data, "project_path": legacy}
-        return data
 
 
 class UpdateSessionRequest(BaseModel):
@@ -324,7 +309,7 @@ async def list_agents() -> list[dict[str, Any]]:
     return [
         {
             "id": agent_id,
-            "name": type(adapter).LABEL or agent_id,
+            "name": adapter.LABEL,
             "default": agent_id == default,
             "models": model_catalog[agent_id]["models"],
             "models_error": model_catalog[agent_id]["error"],
@@ -991,8 +976,10 @@ async def session_tool_operation(sender_id: int, name: str, args: dict[str, Any]
     raise ValueError("Unknown session tool")
 
 
-for _adapter in adapters.values():
-    _adapter.session_operation = session_tool_operation
+adapters: dict[str, AgentAdapter] = {
+    agent_id: adapter_type(session_operation=session_tool_operation)
+    for agent_id, adapter_type in adapter_types.items()
+}
 
 
 @app.post("/sessions/{session_id}/turn", status_code=202)
@@ -1748,10 +1735,7 @@ def is_empty_or_missing(path: str) -> bool:
         return True
     if not target.is_dir():
         return False
-    try:
-        return not any(target.iterdir())
-    except OSError:
-        return False
+    return not any(target.iterdir())
 
 
 def normalize_project_path(raw: str) -> str:

@@ -82,6 +82,32 @@ class ScrollbackTests(unittest.IsolatedAsyncioTestCase):
             "queued_messages": [],
         })
 
+    def corrupt_payload(self):
+        row = self.append()
+        with self.db._conn:
+            self.db._conn.execute(
+                "UPDATE scrollback SET payload = ? WHERE id = ?",
+                ("not JSON", row["id"]),
+            )
+
+    def test_malformed_stored_payload_raises(self):
+        self.corrupt_payload()
+        for read in (self.db.scrollback_after, self.db.recent_scrollback):
+            with self.subTest(read=read.__name__):
+                with self.assertRaises(json.JSONDecodeError):
+                    read(self.session)
+
+    async def test_malformed_stored_payload_surfaces_through_api(self):
+        self.corrupt_payload()
+        with self.assertRaises(json.JSONDecodeError):
+            await self.get()
+
+    def test_recent_scrollback_decodes_valid_payloads(self):
+        first = self.append("héllo")
+        second = self.append("second")
+        self.assertEqual(self.db.recent_scrollback(self.session), [first, second])
+        self.assertEqual(self.db.recent_scrollback(self.session, limit=1), [second])
+
     async def test_empty_cursor_defaults_and_beyond_end(self):
         for query, cursor in [("", None), ("after=0", 0), ("after=999", 999)]:
             with self.subTest(query=query):

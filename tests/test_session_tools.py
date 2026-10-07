@@ -231,13 +231,20 @@ class AutoApprovalTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TransportTests(unittest.IsolatedAsyncioTestCase):
+    def test_adapter_requires_session_operation(self):
+        for cls in (ClaudeCodeAdapter, PiAdapter):
+            with self.subTest(adapter=cls.__name__):
+                with self.assertRaises(TypeError):
+                    cls()
+                with self.assertRaises(TypeError):
+                    cls(session_operation=None)
+
     async def test_capability_independent_of_sandbox_and_host_flags(self):
         for cls, sandbox_fn, flag in (
             (ClaudeCodeAdapter, "claude_sandbox_command", "--mcp-config"),
-            (PiAdapter, "pi_sandbox_command", "--agent-ui-session-tools"),
+            (PiAdapter, "pi_sandbox_command", "--agent-ui-harness-description"),
         ):
-            adapter = cls()
-            adapter.session_operation = mock.AsyncMock()
+            adapter = cls(session_operation=mock.AsyncMock())
             for sandbox in (False, True):
                 for host in ("0", "1"):
                     with self.subTest(adapter=cls.__name__, sandbox=sandbox, host=host), mock.patch.dict(
@@ -258,9 +265,6 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         fixture = str(Path(__file__).parent / "fixtures/session_tools.py")
         for cls in (ClaudeCodeAdapter, PiAdapter):
             with self.subTest(adapter=cls.__name__), tempfile.TemporaryDirectory() as tmp:
-                adapter = cls(executable=fixture)
-                if isinstance(adapter, PiAdapter):
-                    adapter.web_extension_path = ""
                 started, cancelled = asyncio.Event(), asyncio.Event()
 
                 async def operation(*args):
@@ -270,7 +274,9 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                     finally:
                         cancelled.set()
 
-                adapter.session_operation = operation
+                adapter = cls(session_operation=operation, executable=fixture)
+                if isinstance(adapter, PiAdapter):
+                    adapter.web_extension_path = ""
                 session = {"id": 7, "working_dir": tmp, "sandbox": False}
 
                 async def consume():
@@ -301,8 +307,7 @@ print(json.dumps({"type":"extension_ui_request", "method":"notify", "id":"ready"
 time.sleep(60)
 ''')
             stub.chmod(0o755)
-            adapter = PiAdapter(executable=str(stub), web_extension_path="")
-            adapter.session_operation = mock.AsyncMock()
+            adapter = PiAdapter(session_operation=mock.AsyncMock(), executable=str(stub), web_extension_path="")
             async with asyncio.timeout(5):
                 events = [e async for e in adapter.start_turn(
                     {"id": 7, "working_dir": tmp, "sandbox": False}, "hi",
@@ -317,11 +322,10 @@ time.sleep(60)
                 for name in MODELS:
                     for behavior in ("allow", "deny", "cancel", "invalid"):
                         with self.subTest(adapter=cls.__name__, name=name, behavior=behavior):
-                            adapter = cls(executable=fixture)
+                            operation = mock.AsyncMock(return_value={"test": "result"})
+                            adapter = cls(session_operation=operation, executable=fixture)
                             if isinstance(adapter, PiAdapter):
                                 adapter.web_extension_path = ""
-                            operation = mock.AsyncMock(return_value={"test": "result"})
-                            adapter.session_operation = operation
                             session = {"id": 7, "working_dir": tmp, "sandbox": False}
                             args = dict(CALLS[name])
                             if behavior == "invalid":

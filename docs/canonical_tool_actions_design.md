@@ -448,13 +448,12 @@ ours.
 | `Bash` | `command`; copy `command` exactly, copy non-empty optional `description`, copy millisecond `timeout` to `timeout_ms`, set `shell` to `bash` |
 | `Read` | `read`; `file_path` → `path`, copy optional `offset` and `limit` |
 | `Edit` | `edit`; `file_path` → `path`, create one edit from `old_string`/`new_string`, copy optional `replace_all` |
-| `MultiEdit` | `edit`; `file_path` → `path`, map ordered `edits[].old_string`/`new_string` and optional `replace_all`; historical compatibility |
 | `Write` | `write`; `file_path` → `path`, copy `content` exactly |
 | `Glob` | `search` with mode `files`; `pattern` → `query`, copy optional `path` |
 | `Grep` | `search` with mode `content`; `pattern` → `query`, copy optional `path` and `glob`, `head_limit` → `limit` |
 | `WebFetch` | `web` with operation `fetch`; copy `url` and optional `prompt` |
 | `WebSearch` | `web` with operation `search`; copy `query` |
-| `Task` | `task`; same fields as `Agent`; historical/provider alias |
+| `Task` | `task`; advertised delegation name, same fields as `Agent` |
 | `Agent` | `task`; copy `description` and optional `prompt`, `subagent_type` → `agent` |
 | `NotebookEdit` | `other`; notebook-specific normalization and UI are out of scope |
 | unrecognized tool | `other` |
@@ -468,10 +467,10 @@ turns the complete native call into `other`.
 Claude's `AskUserQuestion` remains a `question` event and must not also emit a
 `tool_use`, matching current behavior.
 
-Claude Code 2.1.261 did not advertise `MultiEdit` in its system-init tool list,
-so its mapping is retained for old sessions rather than treated as a current
-built-in. The same version advertised `Task` but emitted the native name `Agent`
-for a forced delegation call; the adapter accepts both names.
+Claude Code 2.1.261 did not advertise `MultiEdit` in its system-init tool list;
+that historical name is treated as an unrecognized tool. The same version
+advertised `Task` but emitted the native name `Agent` for a forced delegation
+call; the adapter accepts both current names.
 
 The assistant tool block contains the call ID. The following permission request
 contains `request.tool_use_id`; the adapter uses that value to retrieve the
@@ -494,12 +493,9 @@ cached action and emits it as the approval's `call_id` and `action`.
 Pi `grep.ignoreCase`, `literal`, and `context` are deliberately omitted because
 they control execution/output details that have no specialized client UI.
 
-Pi 0.85.1's current `edit` schema already accepts multiple replacements in
-`edits`; older Pi sessions may contain its legacy top-level `oldText` / `newText`
-shape, which Pi's own `prepareArguments` upgrades before execution. The adapter
-should accept both defensively because `tool_execution_start.args` is the
-prepared payload in current Pi but old resumed sessions must not produce an
-unrenderable card if that behavior changes.
+Pi's current `edit` schema accepts multiple replacements in `edits`.
+Only that current shape is translated; historical top-level `oldText` / `newText`
+arguments are displayed as `other`, without compatibility normalization.
 
 Pi already supplies `toolCallId` on `tool_execution_start`, and the bundled
 permission extension carries that same ID in its approval envelope. The adapter
@@ -608,8 +604,7 @@ For every assistant `tool_use` or `server_tool_use` block other than
 `AskUserQuestion`:
 
 1. Read the native name, object input, and block `id`.
-2. Use the native ID as `call_id`; generate a UUID only if it is absent or
-   empty.
+2. Use the required native ID as `call_id`; do not invent missing IDs.
 3. Normalize and validate the action once.
 4. Cache it under `(agent_ui_session_id, call_id)` and emit canonical
    `tool_use`.
@@ -622,24 +617,24 @@ it for `updatedInput`.
 For a `can_use_tool` permission request, `request_id` remains the control
 request's ID and `call_id` is `request.tool_use_id`. Reuse the cached action. On
 a cache miss, normalize `request.tool_name` and `request.input`; if that is not
-valid, use `other`. If `tool_use_id` itself is absent, generate a non-empty
-`call_id` for the approval. Continue suppressing `AskUserQuestion` tool rows and
+valid, use `other`. Missing native permission fields surface an error.
+Continue suppressing `AskUserQuestion` tool rows and
 route those requests through the existing `question` flow unchanged.
 
 ### Pi adapter
 
-Keep two per-turn maps keyed by `toolCallId`: untouched native arguments for the
-extension response path, and normalized actions for wire events. On
-`tool_execution_start`, normalize `toolName` and prepared `args`, cache the
-action, and emit canonical `tool_use` with `call_id = toolCallId`. Continue
-suppressing the extension-provided `AskUserQuestion` tool row.
+Keep a per-turn map of normalized actions keyed by `toolCallId`. On
+`tool_execution_start`, normalize the required `toolName` and prepared `args`,
+cache the action, and emit canonical `tool_use` with the required native
+`call_id = toolCallId`. Continue suppressing the extension-provided
+`AskUserQuestion` tool row.
 
 The approval envelope already contains `toolCallId` and `toolName`. Keep the
 currently generated `perm_<uuid>` as `request_id`, set `call_id` to the envelope
-ID, and reuse the cached action. On a miss, normalize the retained native args;
-if they are unavailable or invalid, use `other`. The TypeScript extension
-protocol does not need to change. Clear both maps at turn cleanup. Do not assume
-multiple approvals are simultaneous or adjacent.
+ID, and reuse the required cached action. A missing entry is a protocol error:
+Pi emits `tool_execution_start` before the extension's approval dialog.
+Clear the map at turn cleanup. Do not assume multiple approvals are simultaneous
+or adjacent.
 
 ### Server orchestration
 
@@ -745,7 +740,7 @@ Provider normalization tests load the captured files in `tests/fixtures/`.
 
 - Fixture calls for `Bash`, `Read`, `Edit`, `Write`, `Glob`, `Grep`, `Agent`,
   `WebSearch`, and `WebFetch` map to their documented canonical actions.
-- A synthetic historical `MultiEdit` fixture maps every edit in order.
+- Historical `MultiEdit` calls remain `other`, with their complete arguments.
 - Both native `Task` and `Agent` names map to `task`.
 - Provider-only Grep, web, and Agent controls are omitted.
 - A tool block's native ID becomes `call_id`.
@@ -760,11 +755,13 @@ Provider normalization tests load the captured files in `tests/fixtures/`.
 
 - Every built-in call in the Pi fixture maps to its documented canonical action.
 - Lowercase names and camelCase edit fields produce the same actions as Claude.
-- Modern multi-edit and legacy top-level `oldText`/`newText` both normalize.
+- Current multi-edit calls normalize; historical top-level `oldText`/`newText`
+  arguments remain `other`.
 - `ls` with `{}` becomes `list` with no path or limit.
 - `toolCallId` is preserved.
-- The approval event reuses the cached action from `tool_execution_start`.
-- Cache-miss approval normalization and `other` fallback still emit an approval.
+- The approval event requires the cached action from `tool_execution_start`.
+  Missing correlation state surfaces an error; no empty-argument approval is
+  fabricated.
 - Bash and PowerShell timeout seconds are converted to milliseconds and differ
   only through canonical `shell` otherwise.
 - The captured sequential sibling-approval ordering preserves each distinct ID.

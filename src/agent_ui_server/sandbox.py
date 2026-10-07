@@ -452,8 +452,8 @@ def _claude_config() -> Path:
     """Keep atomic config writes inside the allowed config directory.
 
     CLAUDE_CONFIG_DIR relocates the normally home-level .claude.json as well
-    as credentials/sessions. Import legacy global state once; never overwrite
-    a config already used by another turn or a user-configured profile.
+    as credentials/sessions. Copy the host profile's global state once; never
+    overwrite a config already used by another turn or an explicit profile.
     """
     home = Path.home().resolve()
     override = os.environ.get("CLAUDE_CONFIG_DIR")

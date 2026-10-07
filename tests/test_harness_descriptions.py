@@ -3,17 +3,18 @@ from unittest import mock
 
 from agent_ui_server import agent_registry
 from agent_ui_server.agent import PiAdapter
-from agent_ui_server.host_tools import HostTools
+from agent_ui_server.host_tools import ServerTools
 from agent_ui_server.session_tools import agent_description, session_tool_schemas
 
 
 class HarnessDescriptionTests(unittest.IsolatedAsyncioTestCase):
     async def test_claude_schema_tracks_registry_and_default(self):
-        host = HostTools(mock.Mock(), "/project", mock.AsyncMock(),
-                         session_call=mock.AsyncMock())
+        host = ServerTools(mock.Mock(), "/project", mock.AsyncMock(),
+                         bypass_sandbox_enabled=False, session_call=mock.AsyncMock(),
+                         asset_call=mock.AsyncMock())
         for ids in (("pi", "claude-code"), ("claude-code",), ("custom", "pi")):
             with self.subTest(ids=ids), mock.patch.object(
-                agent_registry, "adapters", dict.fromkeys(ids)
+                agent_registry, "adapter_types", dict.fromkeys(ids)
             ):
                 result = await host.dispatch({
                     "jsonrpc": "2.0", "id": 1, "method": "tools/list",
@@ -24,9 +25,8 @@ class HarnessDescriptionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(agent_description(), expected)
 
     async def test_pi_receives_same_dynamic_description(self):
-        adapter = PiAdapter()
-        adapter.session_operation = mock.AsyncMock()
-        with mock.patch.object(agent_registry, "adapters", {"custom": None}), mock.patch(
+        adapter = PiAdapter(session_operation=mock.AsyncMock())
+        with mock.patch.object(agent_registry, "adapter_types", {"custom": None}), mock.patch(
             "agent_ui_server.agent.asyncio.create_subprocess_exec",
             side_effect=FileNotFoundError("test"),
         ) as spawn:

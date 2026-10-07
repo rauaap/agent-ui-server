@@ -232,8 +232,8 @@ class SandboxPathsAPITests(PathFixture, unittest.IsolatedAsyncioTestCase):
         self.assertIn("/sandbox-paths", routes)
 
     async def test_adapter_forwarding_and_disabled_bypass(self):
-        for adapter, wrapper in ((PiAdapter(executable="pi"), "pi_sandbox_command"),
-                                 (ClaudeCodeAdapter(executable="claude"), "claude_sandbox_command")):
+        for adapter, wrapper in ((PiAdapter(session_operation=mock.AsyncMock(), executable="pi"), "pi_sandbox_command"),
+                                 (ClaudeCodeAdapter(session_operation=mock.AsyncMock(), executable="claude"), "claude_sandbox_command")):
             session = {"id": 123, "working_dir": str(self.work), "sandbox_paths": [self.entry()],
                        "git_repository": str(self.work)}
             with mock.patch(f"agent_ui_server.agent.{wrapper}", side_effect=ValueError("unsafe")) as wrap, mock.patch(

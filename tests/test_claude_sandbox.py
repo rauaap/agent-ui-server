@@ -154,7 +154,7 @@ class ClaudeSandboxTests(unittest.TestCase):
         self.assertEqual(json.loads(imported.read_text())["testState"], 2)
         self.assertEqual(json.loads(original.read_text())["testState"], 1)
 
-    def test_legacy_config_and_explicit_profiles_are_not_overwritten(self):
+    def test_existing_config_and_explicit_profiles_are_not_overwritten(self):
         (self.home / ".claude.json").write_text('{"fromHome": true}')
         config = self.home / ".claude"
         config.mkdir()
@@ -224,7 +224,7 @@ pending.replace(config / '.claude.json')
 
 class ClaudeSandboxAdapterTests(unittest.IsolatedAsyncioTestCase):
     async def test_default_on_bypass_and_next_turn_rechecks(self):
-        adapter = ClaudeCodeAdapter(executable="claude")
+        adapter = ClaudeCodeAdapter(session_operation=mock.AsyncMock(), executable="claude")
         session = {"id": 456, "working_dir": "/project", "agent_session_id": "resume-id"}
         with mock.patch("agent_ui_server.agent.claude_sandbox_command", return_value=["bwrap", "wrapped"]) as wrap, mock.patch(
             "agent_ui_server.agent.asyncio.create_subprocess_exec", side_effect=FileNotFoundError("test spawn")
@@ -250,7 +250,7 @@ class ClaudeSandboxAdapterTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch("agent_ui_server.agent.claude_sandbox_command", side_effect=ValueError("unsafe")), mock.patch(
             "agent_ui_server.agent.asyncio.create_subprocess_exec"
         ) as spawn:
-            events = [event async for event in ClaudeCodeAdapter().start_turn({"id": 1, "working_dir": "/project"}, "go")]
+            events = [event async for event in ClaudeCodeAdapter(session_operation=mock.AsyncMock()).start_turn({"id": 1, "working_dir": "/project"}, "go")]
         spawn.assert_not_called()
         self.assertIn("unsafe", events[0]["message"])
 
@@ -269,7 +269,7 @@ prompt = json.loads(sys.stdin.readline())
 assert prompt['type'] == 'user'
 assert '--resume' in sys.argv and 'resume-id' in sys.argv
 print(json.dumps({'type':'control_request','request_id':'approval','request':{
-    'subtype':'can_use_tool','tool_name':'Bash','input':{'command':'echo ok'}}}), flush=True)
+    'subtype':'can_use_tool','tool_name':'Bash','tool_use_id':'call-bash','input':{'command':'echo ok'}}}), flush=True)
 answer = json.loads(sys.stdin.readline())
 assert answer['response']['response']['behavior'] == 'allow'
 if prompt['message']['content'] == 'wait':
@@ -280,7 +280,7 @@ else:
     print(json.dumps({'type':'result','session_id':'resumed-id'}), flush=True)
 ''')
             stub.chmod(0o755)
-            adapter = ClaudeCodeAdapter(executable=str(stub))
+            adapter = ClaudeCodeAdapter(session_operation=mock.AsyncMock(), executable=str(stub))
             session = {"id": 789, "working_dir": tmp, "agent_session_id": "resume-id", "sandbox": True}
             with mock.patch("agent_ui_server.agent.claude_sandbox_command", side_effect=lambda command, cwd, **kwargs: command) as wrap:
                 async with asyncio.timeout(10):

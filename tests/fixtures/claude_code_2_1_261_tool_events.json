@@ -8,7 +8,7 @@
       "Assistant tool blocks carry id, name, and input.",
       "Permission requests correlate through request.tool_use_id.",
       "The current runtime emits Agent for delegation even when prompted to use the advertised Task tool.",
-      "MultiEdit was not present in the system init tool list; its mapping is retained for historical events."
+      "MultiEdit was not present in the system init tool list."
     ]
   },
   "assistant_events": {

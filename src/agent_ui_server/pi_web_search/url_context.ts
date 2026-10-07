@@ -31,7 +31,7 @@ export async function urlContext(
     try {
         const config = getConfig(model);
         if (config.kind !== "google") {
-            return formatResult(
+            const result = formatResult(
                 `url_context currently requires a Google Gemini-compatible model. Current model: ${model.id} (${model.provider}/${model.api}).\n\nUse web_search for cross-provider web search, or switch to Gemini for provider-native URL context retrieval.`,
                 {
                     error: "unsupported_provider",
@@ -41,6 +41,7 @@ export async function urlContext(
                     grounded: false,
                 }
             );
+            return { ...result, isError: true };
         }
         
         let contents: any[] = [];

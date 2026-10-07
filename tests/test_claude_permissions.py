@@ -34,7 +34,7 @@ class ClaudePermissionTests(unittest.IsolatedAsyncioTestCase):
                 "agent_ui_server.agent.asyncio.create_subprocess_exec",
                 side_effect=FileNotFoundError("test"),
             ) as spawn:
-                adapter = ClaudeCodeAdapter()
+                adapter = ClaudeCodeAdapter(session_operation=mock.AsyncMock())
                 _ = [event async for event in adapter.start_turn(
                     {"id": 1, "working_dir": "/project", "sandbox": sandbox}, "hello"
                 )]
@@ -45,7 +45,7 @@ class ClaudePermissionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(argv[argv.index("--permission-mode") + 1], "default")
 
     async def test_reads_discovery_and_bookkeeping_are_allowed_without_ui_events(self):
-        for event_type in ("control_request", "sdk_control_request"):
+        for event_type in ("control_request",):
             for tool in (
                 "Read", "Glob", "Grep", "WebSearch", "WebFetch", "LSP",
                 "ToolSearch", "ListMcpResourcesTool", "ReadMcpResourceTool",
@@ -54,7 +54,7 @@ class ClaudePermissionTests(unittest.IsolatedAsyncioTestCase):
                 "TodoWrite", "EnterPlanMode", "ReportFindings",
             ):
                 with self.subTest(tool=tool, event_type=event_type):
-                    adapter = ClaudeCodeAdapter()
+                    adapter = ClaudeCodeAdapter(session_operation=mock.AsyncMock())
                     process = self.process()
                     request = self.request(tool, event_type)
                     events = [event async for event in adapter._events_from_json(1, process, request)]
@@ -79,7 +79,7 @@ class ClaudePermissionTests(unittest.IsolatedAsyncioTestCase):
             "TaskFuture", "ReadFuture",
         ):
             with self.subTest(tool=tool):
-                adapter = ClaudeCodeAdapter()
+                adapter = ClaudeCodeAdapter(session_operation=mock.AsyncMock())
                 process = self.process()
                 stream = adapter._events_from_json(1, process, self.request(tool))
                 event = await anext(stream)
@@ -92,7 +92,7 @@ class ClaudePermissionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(adapter.pending_approvals, {})
 
     async def test_tool_discovery_does_not_approve_discovered_tool(self):
-        adapter = ClaudeCodeAdapter()
+        adapter = ClaudeCodeAdapter(session_operation=mock.AsyncMock())
         process = self.process()
         self.assertEqual([event async for event in adapter._events_from_json(
             1, process, self.request("ToolSearch")
@@ -105,7 +105,7 @@ class ClaudePermissionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([event async for event in stream], [])
 
     async def test_read_response_failure_surfaces_error(self):
-        adapter = ClaudeCodeAdapter()
+        adapter = ClaudeCodeAdapter(session_operation=mock.AsyncMock())
         events = [event async for event in adapter._events_from_json(
             1, SimpleNamespace(stdin=None), self.request("Read")
         )]

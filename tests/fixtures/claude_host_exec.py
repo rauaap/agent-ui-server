@@ -32,6 +32,7 @@ assert tool["name"] == "bypass_sandbox"
 assert "_meta" not in tool
 write({"type": "control_request", "request_id": "permission", "request": {
     "subtype": "can_use_tool", "tool_name": "mcp__agent_ui__bypass_sandbox",
+    "tool_use_id": "toolu_host",
     "input": {"command": "printf prototype", "reason": "test"},
 }})
 assert read()["response"]["response"]["behavior"] == "allow"

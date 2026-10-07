@@ -2,7 +2,7 @@
 
 from .agent import AgentAdapter, ClaudeCodeAdapter, PiAdapter
 
-adapters: dict[str, AgentAdapter] = {
-    "pi": PiAdapter(),
-    "claude-code": ClaudeCodeAdapter(),
+adapter_types: dict[str, type[AgentAdapter]] = {
+    "pi": PiAdapter,
+    "claude-code": ClaudeCodeAdapter,
 }

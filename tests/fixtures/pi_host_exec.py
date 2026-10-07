@@ -13,7 +13,8 @@ def envelope(kind, **payload):
 
 
 emit({"type": "extension_ui_request", "id": "ready", "method": "notify",
-      "message": envelope("ready", hostTool=(
+      "message": envelope("ready", sessionTools=["message_session", "start_session", "read_session"],
+                          assetTool="resolve_asset_link", hostTool=(
           "bypass_sandbox" if "--agent-ui-host-exec" in sys.argv else None))})
 pending = set()
 for line in sys.stdin:

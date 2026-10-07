@@ -97,7 +97,7 @@ src/agent_ui_server/
 ├── pi_extension.ts   # Pi approval gate and AskUserQuestion tool
 ├── pi_web_search/    # vendored pi-web-search; Pi's web_search and url_context
 ├── usage.py          # subscription usage percentages from Claude and Codex
-├── db.py             # SQLite schema, migrations, transcript storage
+├── db.py             # SQLite schema and transcript storage
 ├── file_tree.py      # snapshots, patches, ignore rules, inotify lifecycle
 ├── git.py            # bounded Git worktree operations
 ├── network_guard.py  # shared-token auth, Host and WebSocket Origin checks
@@ -1085,8 +1085,8 @@ persisted `running` or `awaiting_approval` session to `idle`, because subprocess
 handles, pending interactions, tasks, and subscribers are intentionally
 in-memory and cannot survive a restart.
 
-Older database shapes are migrated on open. Back up `sessions.db` before
-upgrading if its history matters.
+Fresh databases are created with the current schema. Existing databases must
+already use that schema; older shapes are not migrated on open.
 
 ## Development
 

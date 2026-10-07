@@ -1,6 +1,5 @@
 import type { ExtensionContext, AgentToolUpdateCallback } from "@earendil-works/pi-coding-agent";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { getEnvApiKey } from "@earendil-works/pi-ai/compat";
 import { TextEncoder, TextDecoder } from "util";
 
 // --- Provider Configuration ---
@@ -51,40 +50,14 @@ export function getConfig(model: Model<Api>): ProviderConfig {
     return { kind };
 }
 
-// --- Auth Compatibility Layer ---
+// --- Authentication ---
 
 type ResolvedAuth = 
     | { ok: true; apiKey?: string; headers?: Record<string, string>; baseUrl?: string; }
     | { ok: false; error: string; };
 
-function getEnvAuth(model: Model<Api>): Extract<ResolvedAuth, { ok: true }> | undefined {
-    const apiKey = getEnvApiKey(model.provider);
-    return apiKey ? { ok: true, apiKey } : undefined;
-}
-
-/**
- * Get API key and headers for a model.
- */
 async function getAuth(ctx: ExtensionContext, model: Model<Api>): Promise<ResolvedAuth> {
-    const resolved = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-    if (!resolved.ok) return resolved;
-
-    // pi-coding-agent 0.80.1+ returns { ok: true } from getApiKeyAndHeaders()
-    // when auth only comes from provider env vars such as ANTHROPIC_API_KEY.
-    // The main agent still works because pi-ai's streamSimple() performs its own
-    // getEnvApiKey() fallback, but this extension calls fetch() directly, so it
-    // must mirror that fallback while preserving explicit model/auth headers.
-    const envAuth = !resolved.apiKey && !hasAuthHeader(resolved.headers) ? getEnvAuth(model) : undefined;
-    return envAuth ? { ...resolved, apiKey: envAuth.apiKey } : resolved;
-}
-
-function hasAuthHeader(headers?: Record<string, string>): boolean {
-    if (!headers) return false;
-    return Object.entries(headers).some(([name, value]) => {
-        if (!value) return false;
-        const normalized = name.toLowerCase();
-        return normalized === "authorization" || normalized === "x-api-key" || normalized === "x-goog-api-key";
-    });
+    return ctx.modelRegistry.getApiKeyAndHeaders(model);
 }
 
 // --- Streaming API Call ---
@@ -160,12 +133,7 @@ async function readSseEvents(
         currentEventName = "";
         if (!raw || raw === "[DONE]") return false;
 
-        let data: any;
-        try {
-            data = JSON.parse(raw);
-        } catch {
-            return false;
-        }
+        const data = JSON.parse(raw);
         return await onEvent({ event: eventName, data }) === true;
     };
 
@@ -243,45 +211,6 @@ function trimTrailingSlash(value: string): string {
 
 function isOpenAICodexModel(model: Model<Api>): boolean {
     return model.api === "openai-codex-responses";
-}
-
-function resolveGitHubCopilotBaseUrl(
-    model: Model<Api>,
-    auth: Extract<ResolvedAuth, { ok: true }>,
-): string {
-    if (model.provider !== "github-copilot") return model.baseUrl;
-
-    // Modern pi versions expose the credential-specific Copilot endpoint
-    // resolved by the provider. Prefer it so GitHub Enterprise Server and any
-    // future provider-owned routing continue to work without token parsing here.
-    if (typeof auth.baseUrl === "string" && auth.baseUrl.trim()) {
-        return auth.baseUrl;
-    }
-
-    // Compatibility fallback for older pi versions whose extension auth API
-    // returned the Copilot token but not its resolved base URL.
-    if (!auth.apiKey) return model.baseUrl;
-    const proxyEndpoints = auth.apiKey
-        .split(";")
-        .filter((field) => field.startsWith("proxy-ep="))
-        .map((field) => field.slice("proxy-ep=".length));
-    if (proxyEndpoints.length !== 1) return model.baseUrl;
-
-    const proxyHost = proxyEndpoints[0].toLowerCase();
-    const labels = proxyHost.split(".");
-    const isValidLabel = (label: string) =>
-        label.length > 0
-        && label.length <= 63
-        && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label);
-    const isCopilotProxyHost = proxyHost.length <= 253
-        && labels.length >= 4
-        && labels[0] === "proxy"
-        && labels.at(-2) === "githubcopilot"
-        && labels.at(-1) === "com"
-        && labels.every(isValidLabel);
-    if (!isCopilotProxyHost) return model.baseUrl;
-
-    return `https://api.${labels.slice(1).join(".")}`;
 }
 
 function resolveOpenAIResponsesUrl(model: Model<Api>, baseUrl = model.baseUrl): string {
@@ -446,13 +375,12 @@ async function resolveGoogleGroundingRedirectUrls(searchResults: SearchResultDet
 
     const resolved = new Map<string, string>();
     await Promise.all(redirectUrls.slice(0, 20).map(async (url) => {
-        try {
-            const response = await fetch(url, { method: "HEAD", redirect: "manual", signal });
-            const location = response.headers.get("location");
-            if (location) resolved.set(url, location);
-        } catch {
-            // Ignore redirect resolution failures and keep the original URL.
+        const response = await fetch(url, { method: "HEAD", redirect: "manual", signal });
+        if (response.status >= 400) {
+            throw new Error(`API error (${response.status}): ${await response.text()}`);
         }
+        const location = response.headers.get("location");
+        if (location) resolved.set(url, location);
     }));
 
     if (resolved.size === 0) return;
@@ -580,7 +508,7 @@ async function callGoogleStream(
         throw new Error(auth.error || "Failed to get API key and headers");
     }
 
-    const req = config.buildRequest(model, body);
+    const req = config.buildRequest({ ...model, baseUrl: auth.baseUrl ?? model.baseUrl }, body);
 
     // Handle auth
     if (auth.headers) {
@@ -717,7 +645,7 @@ async function callOpenAIStream(
         requestBody.parallel_tool_calls = true;
     }
 
-    const baseUrl = resolveGitHubCopilotBaseUrl(model, auth);
+    const baseUrl = auth.baseUrl ?? model.baseUrl;
     const response = await fetch(resolveOpenAIResponsesUrl(model, baseUrl), {
         method: "POST",
         headers: requestHeaders,
@@ -903,7 +831,7 @@ async function callAnthropicStream(
         }
     }
 
-    const maxTokens = Math.min(Math.max(1024, Math.floor(model.maxTokens / 3) || 4096), 8192);
+    const maxTokens = Math.min(Math.max(1024, Math.floor(model.maxTokens / 3)), 8192);
     const requestBody = {
         model: model.id,
         max_tokens: maxTokens,
@@ -912,7 +840,7 @@ async function callAnthropicStream(
         stream: true,
     };
 
-    const response = await fetch(resolveAnthropicMessagesUrl(model.baseUrl), {
+    const response = await fetch(resolveAnthropicMessagesUrl(auth.baseUrl ?? model.baseUrl), {
         method: "POST",
         headers,
         body: JSON.stringify(requestBody),

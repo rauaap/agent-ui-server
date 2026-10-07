@@ -15,6 +15,11 @@ from agent_ui_server.file_tree import FileTreeError, FileTreeManager, scan_tree
 
 
 class FileTreeScanTests(unittest.TestCase):
+    def test_mountinfo_read_failure_surfaces(self) -> None:
+        with patch("builtins.open", side_effect=PermissionError("mountinfo denied")):
+            with self.assertRaisesRegex(PermissionError, "mountinfo denied"):
+                file_tree._mount_points()
+
     def scan_paths(self, root: Path) -> list[str]:
         result = scan_tree(str(root))
         try:

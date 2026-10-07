@@ -11,7 +11,7 @@ from unittest import mock
 
 from agent_ui_server.actions import auto_approval_setting
 from agent_ui_server.agent import ApprovalDecision, ClaudeCodeAdapter
-from agent_ui_server.host_tools import HostTools, SANDBOX_GUIDANCE, TOOL_NAME
+from agent_ui_server.host_tools import ServerTools, SANDBOX_GUIDANCE, TOOL_NAME
 from agent_ui_server.sandbox import SandboxFilesystem, SandboxMount
 
 
@@ -22,14 +22,16 @@ def fake_sandbox(command, cwd, *, system_prompt=None, **kwargs):
 
 class HostToolTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.adapter = ClaudeCodeAdapter()
+        self.adapter = ClaudeCodeAdapter(session_operation=mock.AsyncMock())
         self.process = SimpleNamespace(
             stdin=SimpleNamespace(write=mock.Mock(), drain=mock.AsyncMock()),
             stdout=asyncio.StreamReader(),
         )
-        self.host = HostTools(self.process, "/project",
-                              lambda args, call_id: self.adapter._approve_host(1, args, call_id))
-        self.adapter.host_tools[1] = self.host
+        self.host = ServerTools(self.process, "/project",
+                              lambda args, call_id: self.adapter._approve_host(1, args, call_id),
+                              bypass_sandbox_enabled=True, session_call=mock.AsyncMock(),
+                              asset_call=mock.AsyncMock())
+        self.adapter.server_tools[1] = self.host
 
     async def asyncTearDown(self):
         await self.host.close()
@@ -61,6 +63,19 @@ class HostToolTests(unittest.IsolatedAsyncioTestCase):
                               (self.request(name="other", arguments={}), -32602)):
             self.assertEqual((await self.host.dispatch(request))["error"]["code"], code)
         self.assertEqual(self.adapter.pending_approvals, {})
+
+    async def test_session_and_asset_discovery_independent_of_bypass(self):
+        for enabled in (False, True):
+            tools = ServerTools(self.process, "/project", mock.AsyncMock(),
+                                bypass_sandbox_enabled=enabled,
+                                session_call=mock.AsyncMock(), asset_call=mock.AsyncMock())
+            try:
+                result = await tools.dispatch(self.request("tools/list"))
+                names = [tool["name"] for tool in result["result"]["tools"]]
+                self.assertEqual(names, (["bypass_sandbox"] if enabled else []) +
+                                 ["message_session", "start_session", "read_session", "resolve_asset_link"])
+            finally:
+                await tools.close()
 
     async def test_approval_required_and_result_returned(self):
         for behavior in ("allow", "deny"):
@@ -100,7 +115,7 @@ class HostToolTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_native_permission_does_not_double_prompt(self):
         event = {"type": "control_request", "request_id": "p1", "request": {
-            "subtype": "can_use_tool", "tool_name": TOOL_NAME, "input": {},
+            "subtype": "can_use_tool", "tool_name": TOOL_NAME, "input": {}, "tool_use_id": "toolu_host",
         }}
         self.assertEqual([e async for e in self.adapter._events_from_json(1, self.process, event)], [])
         reply = json.loads(self.process.stdin.write.call_args.args[0])
@@ -157,7 +172,7 @@ class HostToolTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_initialization_failure(self):
         self.process.stdout.feed_eof()
-        with self.assertRaisesRegex(RuntimeError, "before host-tool initialization"):
+        with self.assertRaisesRegex(RuntimeError, "before server-tool initialization"):
             await self.host.start()
 
     async def test_control_envelope(self):
@@ -180,7 +195,7 @@ class HostToolTests(unittest.IsolatedAsyncioTestCase):
     async def test_end_to_end_subprocess_pipes(self):
         fixture = str(Path(__file__).parent / "fixtures" / "claude_host_exec.py")
         for behavior in ("allow", "deny"):
-            adapter = ClaudeCodeAdapter(executable=fixture)
+            adapter = ClaudeCodeAdapter(session_operation=mock.AsyncMock(), executable=fixture)
             # Exercise the sandboxed-session branch without requiring Bubblewrap
             # to launch the simulated Claude peer in this protocol test.
             with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
@@ -203,7 +218,7 @@ class HostToolTests(unittest.IsolatedAsyncioTestCase):
                 if behavior == "allow":
                     self.assertEqual(json.loads(output["content"][0]["text"])["stdout"], "prototype")
                 self.assertEqual(events[-1], {"type": "done"})
-                self.assertEqual(adapter.host_tools, {})
+                self.assertEqual(adapter.server_tools, {})
                 self.assertEqual(adapter.pending_approvals, {})
 
     async def test_host_tool_and_guidance_gated_on_fresh_and_resumed_turns(self):
@@ -235,7 +250,7 @@ class HostToolTests(unittest.IsolatedAsyncioTestCase):
                             for phrase in (TOOL_NAME, "Bubblewrap", "ToolSearch",
                                            "dangerouslyDisableSandbox", "user approval"):
                                 self.assertIn(phrase, guidance)
-                        self.assertEqual("--mcp-config" in argv, expected)
+                        self.assertIn("--mcp-config", argv)
                         self.assertEqual("--resume" in argv, resumed)
 
     async def test_adapter_launch_configuration(self):

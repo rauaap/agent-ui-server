@@ -1,5 +1,6 @@
 import math
 import unittest
+from unittest import mock
 
 from pydantic import ValidationError
 
@@ -109,7 +110,7 @@ class ProviderNormalizationTests(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "programming error"):
             action_or_other("tool", {}, {"tool": broken})
 
-    def test_pi_timeout_conversion_and_legacy_edit(self):
+    def test_pi_timeout_conversion(self):
         self.assertEqual(
             action_or_other(
                 "bash",
@@ -118,14 +119,18 @@ class ProviderNormalizationTests(unittest.TestCase):
             )["timeout_ms"],
             2500.0,
         )
-        self.assertEqual(
-            action_or_other(
-                "edit",
-                {"path": "a", "oldText": "x", "newText": "y"},
-                PI_TOOL_TRANSLATORS,
-            )["edits"],
-            [{"old_text": "x", "new_text": "y"}],
-        )
+
+    def test_historical_edit_shapes_are_not_translated(self):
+        for name, arguments, translators in (
+            ("edit", {"path": "a", "oldText": "x", "newText": "y"}, PI_TOOL_TRANSLATORS),
+            ("MultiEdit", {"file_path": "a", "edits": [
+                {"old_string": "x", "new_string": "y"},
+            ]}, CLAUDE_TOOL_TRANSLATORS),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(action_or_other(name, arguments, translators), {
+                    "kind": "other", "name": name, "arguments": arguments,
+                })
 
     def test_pi_web_tools_match_claude_web_shapes(self):
         """The vendored pi-web-search tools normalize like Claude's web tools.
@@ -179,7 +184,7 @@ class ProviderNormalizationTests(unittest.TestCase):
         )
 
     def test_claude_permission_reuses_session_scoped_cached_action(self):
-        adapter = ClaudeCodeAdapter(executable="claude")
+        adapter = ClaudeCodeAdapter(session_operation=mock.AsyncMock(), executable="claude")
         tool = adapter._tool_use_event({
             "id": "c1", "name": "Bash", "input": {"command": "exact command"}
         }, session_id=7)

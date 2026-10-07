@@ -177,18 +177,13 @@ def _decode_mount_field(value: str) -> str:
 
 
 def _mount_points() -> set[str]:
-    try:
-        with open("/proc/self/mountinfo", encoding="utf-8") as mountinfo:
-            result: set[str] = set()
-            for line in mountinfo:
-                fields = line.split()
-                if len(fields) >= 5:
-                    result.add(os.path.normpath(_decode_mount_field(fields[4])))
-            return result
-    except OSError:
-        # Linux normally has mountinfo. Duplicate inode detection still prevents
-        # cycles if procfs is deliberately unavailable.
-        return set()
+    with open("/proc/self/mountinfo", encoding="utf-8") as mountinfo:
+        result: set[str] = set()
+        for line in mountinfo:
+            fields = line.split()
+            if len(fields) >= 5:
+                result.add(os.path.normpath(_decode_mount_field(fields[4])))
+        return result
 
 
 def _compile_ignore(root: str) -> pathspec.PathSpec:

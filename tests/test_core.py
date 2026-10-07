@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path, PurePosixPath
 from typing import Any
+from unittest import mock
 from unittest.mock import patch
 
 import asyncio
@@ -537,461 +538,7 @@ class ArchiveTableTests(unittest.TestCase):
         self.assertEqual(self.database.unarchive_project(self.project["id"]), 1)
 
 
-class MigrationTests(unittest.TestCase):
-    """Opening a pre-worktree database rebuilds it around a real foreign key."""
-
-    LEGACY_SESSIONS = """
-        CREATE TABLE sessions (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            working_dir TEXT NOT NULL,
-            agent TEXT NOT NULL,
-            agent_session_id TEXT,
-            status TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            last_active_at TEXT NOT NULL,
-            auto_approve_write INTEGER NOT NULL DEFAULT 0,
-            auto_approve_command INTEGER NOT NULL DEFAULT 0
-        )
-    """
-    LEGACY_PROJECTS = """
-        CREATE TABLE projects (
-            path TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )
-    """
-    LEGACY_SCROLLBACK = """
-        CREATE TABLE scrollback (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            ts TEXT NOT NULL,
-            type TEXT NOT NULL,
-            payload TEXT NOT NULL,
-            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
-        )
-    """
-
-    def build_legacy(
-        self,
-        path: Path,
-        projects: list[tuple[str, str]],
-        sessions: list[tuple[str, str, str]],
-    ) -> None:
-        """Write a database in the old shape: path-keyed projects, no FK."""
-        conn = sqlite3.connect(path)
-        with conn:
-            for statement in (
-                self.LEGACY_SESSIONS,
-                self.LEGACY_PROJECTS,
-                self.LEGACY_SCROLLBACK,
-            ):
-                conn.execute(statement)
-            for project_path, name in projects:
-                conn.execute(
-                    "INSERT INTO projects (path, name, created_at) VALUES (?, ?, ?)",
-                    (project_path, name, "2026-01-01T00:00:00Z"),
-                )
-            for session_id, name, working_dir in sessions:
-                conn.execute(
-                    """
-                    INSERT INTO sessions (
-                        id, name, working_dir, agent, agent_session_id, status,
-                        created_at, last_active_at,
-                        auto_approve_write, auto_approve_command
-                    )
-                    VALUES (?, ?, ?, 'claude-code', 'resume-1', 'idle',
-                            ?, ?, 1, 0)
-                    """,
-                    (
-                        session_id,
-                        name,
-                        working_dir,
-                        "2026-01-02T00:00:00Z",
-                        "2026-01-03T00:00:00Z",
-                    ),
-                )
-                conn.execute(
-                    "INSERT INTO scrollback (session_id, ts, type, payload) "
-                    "VALUES (?, ?, 'input', ?)",
-                    (session_id, "2026-01-03T00:00:00Z", '{"text":"hello"}'),
-                )
-        conn.close()
-
-    def sessions_by_name(self, database: Database) -> dict[str, dict]:
-        """Migrated sessions keyed by name.
-
-        The legacy ids in these fixtures are uuid-shaped strings, and the
-        migration renumbers them, so a test cannot ask for `"s1"` afterwards.
-        Name is the only field that survives a migration unchanged and is
-        unique within each fixture.
-        """
-        return {session["name"]: session for session in database.list_sessions()}
-
-    def test_sessions_keep_their_data_and_gain_a_project_id(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "sessions.db"
-            self.build_legacy(
-                path,
-                projects=[("/p/demo", "demo")],
-                sessions=[("s1", "one", "/p/demo"), ("s2", "two", "/p/demo")],
-            )
-
-            database = Database(path)
-
-            project = database.get_project("/p/demo")
-            self.assertTrue(project["id"])
-            self.assertEqual(project["session_count"], 2)
-            sessions = self.sessions_by_name(database)
-            self.assertEqual(set(sessions), {"one", "two"})
-            for session in sessions.values():
-                self.assertEqual(session["project_id"], project["id"])
-                self.assertEqual(session["working_dir"], "/p/demo")
-                # Nothing here was created by us, so no worktree row is minted
-                # and the cwd falls through to the project directory.
-                self.assertIsNone(session["worktree_id"])
-                # The rest of the row rides through untouched.
-                self.assertEqual(session["agent_session_id"], "resume-1")
-                self.assertIs(session["auto_approve_write"], True)
-                self.assertEqual(session["created_at"], "2026-01-02T00:00:00Z")
-            database.close()
-
-    def test_orphan_session_is_adopted_into_a_new_project(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "sessions.db"
-            # A session created at a path no project row matched: invisible in
-            # the UI before, holding scrollback rows nothing could reach.
-            self.build_legacy(
-                path,
-                projects=[],
-                sessions=[("s1", "orphan", "/p/nowhere")],
-            )
-
-            database = Database(path)
-
-            projects = database.list_projects()
-            self.assertEqual([p["path"] for p in projects], ["/p/nowhere"])
-            self.assertEqual(projects[0]["name"], "nowhere")
-            self.assertEqual(projects[0]["session_count"], 1)
-            self.assertEqual(
-                self.sessions_by_name(database)["orphan"]["project_id"],
-                projects[0]["id"],
-            )
-            database.close()
-
-    def test_unnormalised_working_dir_joins_the_existing_project(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "sessions.db"
-            # `create_session` never normalised working_dir while
-            # `create_project` did, so both spellings mean one project.
-            self.build_legacy(
-                path,
-                projects=[("/p/demo", "demo")],
-                sessions=[("s1", "slashed", "/p/demo/")],
-            )
-
-            database = Database(path)
-
-            self.assertEqual(len(database.list_projects()), 1)
-            project = database.get_project("/p/demo")
-            self.assertEqual(project["session_count"], 1)
-            session = self.sessions_by_name(database)["slashed"]
-            self.assertEqual(session["project_id"], project["id"])
-            # The trailing slash does not survive: the cwd is no longer stored
-            # on the session at all, it is read from the project it resolved
-            # to. Same directory, one spelling.
-            self.assertEqual(session["working_dir"], "/p/demo")
-            database.close()
-
-    def test_scrollback_survives_and_still_cascades(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "sessions.db"
-            self.build_legacy(
-                path,
-                projects=[("/p/demo", "demo")],
-                sessions=[("s1", "one", "/p/demo")],
-            )
-
-            database = Database(path)
-
-            session_id = self.sessions_by_name(database)["one"]["id"]
-            rows = database.recent_scrollback(session_id)
-            self.assertEqual([row["payload"] for row in rows], [{"text": "hello"}])
-            # The rename must not have left scrollback's foreign key pointing
-            # at a table that no longer exists.
-            database.delete_session(session_id)
-            self.assertEqual(database.recent_scrollback(session_id), [])
-            database.close()
-
-    def test_reopening_a_migrated_database_changes_nothing(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "sessions.db"
-            self.build_legacy(
-                path,
-                projects=[("/p/demo", "demo")],
-                sessions=[("s1", "one", "/p/demo")],
-            )
-
-            database = Database(path)
-            first = database.get_project("/p/demo")
-            database.close()
-
-            database = Database(path)
-            self.assertEqual(database.get_project("/p/demo"), first)
-            self.assertEqual(len(database.list_projects()), 1)
-            self.assertEqual(
-                self.sessions_by_name(database)["one"]["project_id"], first["id"]
-            )
-            database.close()
-
-    def test_database_predating_the_projects_table_migrates_too(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "sessions.db"
-            conn = sqlite3.connect(path)
-            with conn:
-                # Old enough to have neither projects nor the renamed resume
-                # column: it has to migrate through both steps.
-                conn.execute(
-                    """
-                    CREATE TABLE sessions (
-                        id TEXT PRIMARY KEY,
-                        name TEXT NOT NULL,
-                        working_dir TEXT NOT NULL,
-                        agent TEXT NOT NULL,
-                        claude_session_id TEXT,
-                        status TEXT NOT NULL,
-                        created_at TEXT NOT NULL,
-                        last_active_at TEXT NOT NULL
-                    )
-                    """
-                )
-                conn.execute(
-                    "INSERT INTO sessions VALUES "
-                    "('s1', 'one', '/p/ancient', 'claude-code', 'resume-1', "
-                    "'idle', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"
-                )
-            conn.close()
-
-            database = Database(path)
-
-            session = self.sessions_by_name(database)["one"]
-            self.assertEqual(session["agent_session_id"], "resume-1")
-            self.assertIs(session["auto_approve_write"], False)
-            self.assertIsNone(session["worktree_id"])
-            self.assertEqual(
-                [p["path"] for p in database.list_projects()], ["/p/ancient"]
-            )
-            self.assertEqual(
-                session["project_id"], database.get_project("/p/ancient")["id"]
-            )
-            database.close()
-
-    def test_uuid_ids_become_integers(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "sessions.db"
-            self.build_legacy(
-                path,
-                projects=[("/p/demo", "demo")],
-                sessions=[("s1", "one", "/p/demo"), ("s2", "two", "/p/demo")],
-            )
-
-            database = Database(path)
-
-            project = database.get_project("/p/demo")
-            self.assertIsInstance(project["id"], int)
-            sessions = self.sessions_by_name(database)
-            for session in sessions.values():
-                self.assertIsInstance(session["id"], int)
-                self.assertEqual(session["project_id"], project["id"])
-            # Renumbered in creation order, and each session keeps its own
-            # scrollback rather than inheriting another's.
-            self.assertLess(sessions["one"]["id"], sessions["two"]["id"])
-            for name in ("one", "two"):
-                rows = database.recent_scrollback(sessions[name]["id"])
-                self.assertEqual(
-                    [row["payload"] for row in rows], [{"text": "hello"}]
-                )
-            database.close()
-
-    V2_SCHEMA = """
-        CREATE TABLE projects (
-            id TEXT PRIMARY KEY,
-            path TEXT NOT NULL UNIQUE,
-            name TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE sessions (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-            working_dir TEXT NOT NULL,
-            owns_worktree INTEGER NOT NULL DEFAULT 0,
-            agent TEXT NOT NULL,
-            agent_session_id TEXT,
-            status TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            last_active_at TEXT NOT NULL,
-            auto_approve_write INTEGER NOT NULL DEFAULT 0,
-            auto_approve_command INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE TABLE scrollback (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            ts TEXT NOT NULL,
-            type TEXT NOT NULL,
-            payload TEXT NOT NULL,
-            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
-        );
-        INSERT INTO projects VALUES
-            ('p-uuid', '/p/demo', 'demo', '2026-01-01T00:00:00Z');
-        INSERT INTO sessions VALUES
-            ('s-uuid', 'one', 'p-uuid', '/p/demo', 0, 'claude-code', 'resume-1',
-             'idle', '2026-01-02T00:00:00Z', '2026-01-03T00:00:00Z', 1, 0);
-        INSERT INTO scrollback (session_id, ts, type, payload) VALUES
-            ('s-uuid', '2026-01-03T00:00:00Z', 'input', '{"text":"hello"}');
-    """
-
-    def test_scrollback_orphaned_before_the_migration_is_dropped(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "sessions.db"
-            # Seeded in the *v2* shape — project_id already there, ids still
-            # uuids — so `_migrate_v2` returns early and this exercises v3
-            # alone. `PRAGMA foreign_keys` is per connection, so a writer that
-            # never set it can leave scrollback pointing at a session that is
-            # gone; renumbering must drop that row rather than fail outright.
-            conn = sqlite3.connect(path)
-            with conn:
-                conn.executescript(self.V2_SCHEMA)
-                conn.execute(
-                    "INSERT INTO scrollback (session_id, ts, type, payload) "
-                    "VALUES ('vanished', '2026-01-03T00:00:00Z', 'input', '{}')"
-                )
-            conn.close()
-
-            database = Database(path)
-
-            session = self.sessions_by_name(database)["one"]
-            self.assertIsInstance(session["id"], int)
-            self.assertEqual(
-                [row["payload"] for row in database.recent_scrollback(session["id"])],
-                [{"text": "hello"}],
-            )
-            database.close()
-
-    V3_SCHEMA = """
-        CREATE TABLE projects (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            path TEXT NOT NULL UNIQUE,
-            name TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE sessions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-            working_dir TEXT NOT NULL,
-            owns_worktree INTEGER NOT NULL DEFAULT 0,
-            agent TEXT NOT NULL,
-            agent_session_id TEXT,
-            status TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            last_active_at TEXT NOT NULL,
-            auto_approve_write INTEGER NOT NULL DEFAULT 0,
-            auto_approve_command INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE TABLE scrollback (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id INTEGER NOT NULL,
-            ts TEXT NOT NULL,
-            type TEXT NOT NULL,
-            payload TEXT NOT NULL,
-            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
-        );
-        INSERT INTO projects VALUES
-            (1, '/p/demo', 'demo', '2026-01-01T00:00:00Z');
-        INSERT INTO sessions VALUES
-            (10, 'plain', 1, '/p/demo', 0, 'claude-code', 'resume-1',
-             'idle', '2026-01-02T00:00:00Z', '2026-01-03T00:00:00Z', 0, 0),
-            (11, 'owned', 1, '/p/demo-fix', 1, 'claude-code', 'resume-2',
-             'idle', '2026-01-02T00:00:00Z', '2026-01-04T00:00:00Z', 0, 0);
-        INSERT INTO scrollback (session_id, ts, type, payload) VALUES
-            (11, '2026-01-03T00:00:00Z', 'input', '{"text":"hello"}');
-    """
-
-    def test_owned_worktree_becomes_a_worktree_row(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "sessions.db"
-            # Seeded in the v3 shape, so v2 and v3 both return early and this
-            # exercises v4 alone.
-            conn = sqlite3.connect(path)
-            with conn:
-                conn.executescript(self.V3_SCHEMA)
-            conn.close()
-
-            database = Database(path)
-
-            worktrees = database.list_worktrees()
-            self.assertEqual([w["path"] for w in worktrees], ["/p/demo-fix"])
-            # Nothing recorded which branch it was cut on, so it stays unknown
-            # rather than being guessed at.
-            self.assertIsNone(worktrees[0]["branch"])
-            self.assertEqual(worktrees[0]["session_count"], 1)
-
-            sessions = self.sessions_by_name(database)
-            self.assertIsNone(sessions["plain"]["worktree_id"])
-            self.assertEqual(sessions["plain"]["working_dir"], "/p/demo")
-            self.assertEqual(sessions["owned"]["worktree_id"], worktrees[0]["id"])
-            self.assertEqual(sessions["owned"]["working_dir"], "/p/demo-fix")
-            database.close()
-
-    def test_session_ids_and_scrollback_survive_v4(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "sessions.db"
-            conn = sqlite3.connect(path)
-            with conn:
-                conn.executescript(self.V3_SCHEMA)
-            conn.close()
-
-            database = Database(path)
-
-            # Unlike v3, this migration does not renumber, so scrollback is left
-            # alone entirely and the old ids still resolve.
-            self.assertEqual(
-                sorted(s["id"] for s in database.list_sessions()), [10, 11]
-            )
-            self.assertEqual(
-                [row["payload"] for row in database.recent_scrollback(11)],
-                [{"text": "hello"}],
-            )
-            database.close()
-
-    def test_two_sessions_owning_one_path_converge_on_one_worktree(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "sessions.db"
-            # Not reachable through the old API, but `worktrees.path` is UNIQUE,
-            # so a database that somehow holds the pair must migrate rather than
-            # fail on the second insert.
-            conn = sqlite3.connect(path)
-            with conn:
-                conn.executescript(self.V3_SCHEMA)
-                conn.execute(
-                    "INSERT INTO sessions VALUES "
-                    "(12, 'twin', 1, '/p/demo-fix', 1, 'claude-code', NULL, "
-                    "'idle', '2026-01-02T00:00:00Z', '2026-01-05T00:00:00Z', 0, 0)"
-                )
-            conn.close()
-
-            database = Database(path)
-
-            worktrees = database.list_worktrees()
-            self.assertEqual(len(worktrees), 1)
-            self.assertEqual(worktrees[0]["session_count"], 2)
-            sessions = self.sessions_by_name(database)
-            self.assertEqual(
-                sessions["owned"]["worktree_id"], sessions["twin"]["worktree_id"]
-            )
-            database.close()
-
+class DatabaseConstraintTests(unittest.TestCase):
     def test_deleting_a_project_takes_its_worktrees_whatever_the_order(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             database = Database(Path(tmpdir) / "sessions.db")
@@ -1047,69 +594,6 @@ class MigrationTests(unittest.TestCase):
             # AUTOINCREMENT, not a bare rowid: a client holding the deleted
             # session's URL must not land on its replacement.
             self.assertNotEqual(second["id"], first["id"])
-    def test_legacy_database_gains_the_archive_columns(self) -> None:
-        # Every rebuild recreates its tables in the pre-archive shape, so the
-        # archive columns have to be added after them rather than before.
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "sessions.db"
-            self.build_legacy(
-                path,
-                projects=[("/p/demo", "demo")],
-                sessions=[("s1", "one", "/p/demo")],
-            )
-
-            database = Database(path)
-
-            migrated = self.sessions_by_name(database)["one"]
-            self.assertIsNone(migrated["archived_at"])
-            session_columns = {
-                row["name"]
-                for row in database._conn.execute("PRAGMA table_info(sessions)")
-            }
-            self.assertIn("detached_working_dir", session_columns)
-            project = database.get_project("/p/demo")
-            self.assertIsNone(project["archived_at"])
-            self.assertEqual(project["session_count"], 1)
-            self.assertEqual(project["archived_session_count"], 0)
-
-            # And the migrated rows are fully usable, cascade mark included.
-            self.assertEqual(database.archive_project(project["id"]), 1)
-            self.assertEqual(database.unarchive_project(project["id"]), 1)
-            self.assertIsNone(database.get_session(migrated["id"])["archived_at"])
-            database.close()
-
-    def test_pre_archive_database_is_upgraded_in_place(self) -> None:
-        # Already through every rebuild, so nothing but the new columns is
-        # missing: the ALTERs must run without triggering another rebuild.
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "sessions.db"
-            database = Database(path)
-            project = database.create_project("/p/demo", "demo")
-            session = database.create_session(
-                name="one",
-                project_id=project["id"],
-                agent="claude-code",
-            )
-            database.close()
-
-            conn = sqlite3.connect(path)
-            with conn:
-                for table, column in (
-                    ("projects", "archived_at"),
-                    ("sessions", "archived_at"),
-                    ("sessions", "archived_with_project"),
-                    ("sessions", "detached_working_dir"),
-                ):
-                    conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
-            conn.close()
-
-            database = Database(path)
-
-            self.assertIsNone(database.get_session(session["id"])["archived_at"])
-            self.assertEqual(
-                database.get_project("/p/demo")["archived_session_count"], 0
-            )
-            self.assertEqual(database.archive_project(project["id"]), 1)
             database.close()
 
 
@@ -1367,13 +851,10 @@ class CreateSessionTests(SessionEndpointTestCase):
         self.assertEqual(session["project_id"], project["id"])
         self.assertIsNone(session["worktree_id"])
 
-    async def test_working_dir_is_accepted_as_a_deprecated_alias(self) -> None:
+    async def test_working_dir_alias_is_rejected(self) -> None:
         project = self.make_project(repo=False)
-
-        session = await self.create(name="legacy", working_dir=project["path"])
-
-        self.assertEqual(session["working_dir"], project["path"])
-        self.assertEqual(session["project_id"], project["id"])
+        with self.assertRaises(ValueError):
+            await self.create(name="legacy", working_dir=project["path"])
 
     async def test_unregistered_project_is_404(self) -> None:
         with self.assertRaises(HTTPException) as caught:
@@ -2387,7 +1868,7 @@ class ListAgentsTests(unittest.IsolatedAsyncioTestCase):
 
 class ClaudeCodeAdapterParsingTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.adapter = ClaudeCodeAdapter(executable="claude")
+        self.adapter = ClaudeCodeAdapter(session_operation=mock.AsyncMock(), executable="claude")
 
     def test_assistant_text_blocks_become_output_events(self) -> None:
         events = self.adapter._assistant_events(
@@ -2420,10 +1901,10 @@ class ClaudeCodeAdapterParsingTests(unittest.TestCase):
     def test_permission_request_normalizes_to_approval_event(self) -> None:
         event = self.adapter._approval_request_event(
             {
-                "type": "sdk_control_request",
+                "type": "control_request",
+                "request_id": "perm_1",
                 "request": {
-                    "subtype": "permission",
-                    "request_id": "perm_1",
+                    "subtype": "can_use_tool",
                     "tool_name": "Bash",
                     "tool_use_id": "call-approval-1",
                     "input": {"command": "rm -rf /tmp/demo"},
@@ -2489,6 +1970,7 @@ class ClaudeCodeAdapterParsingTests(unittest.TestCase):
                 "request": {
                     "subtype": "can_use_tool",
                     "tool_name": "Read",
+                    "tool_use_id": "call-read",
                     "input": {"file_path": "/projects/demo/a.txt"},
                 },
             }
@@ -2525,8 +2007,9 @@ class ClaudeCodeAdapterParsingTests(unittest.TestCase):
             ],
         )
 
-    def test_normalize_questions_defaults_to_empty(self) -> None:
-        self.assertEqual(_normalize_questions(None), [])
+    def test_normalize_questions_rejects_missing_questions(self) -> None:
+        with self.assertRaises(TypeError):
+            _normalize_questions(None)
 
     def test_assistant_events_omit_askuserquestion_tool_use(self) -> None:
         events = self.adapter._assistant_events(
@@ -2566,7 +2049,7 @@ class ClaudeCodeAdapterParsingTests(unittest.TestCase):
 
 class PiAdapterParsingTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.adapter = PiAdapter(executable="pi")
+        self.adapter = PiAdapter(session_operation=mock.AsyncMock(), executable="pi")
 
     def test_bundled_extension_ships_with_the_package(self) -> None:
         path = Path(PiAdapter.DEFAULT_EXTENSION)
@@ -2602,23 +2085,23 @@ class PiAdapterParsingTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("PI_WEB_SEARCH", None)
             self.assertEqual(
-                PiAdapter(executable="pi").web_extension_path,
+                PiAdapter(session_operation=mock.AsyncMock(), executable="pi").web_extension_path,
                 PiAdapter.DEFAULT_WEB_EXTENSION,
             )
         self.assertEqual(
-            PiAdapter(executable="pi", web_extension_path="/tmp/other.ts")
+            PiAdapter(session_operation=mock.AsyncMock(), executable="pi", web_extension_path="/tmp/other.ts")
             .web_extension_path,
             "/tmp/other.ts",
         )
         # Empty means "no web access", and must not fall back to the default.
         self.assertEqual(
-            PiAdapter(executable="pi", web_extension_path="").web_extension_path, ""
+            PiAdapter(session_operation=mock.AsyncMock(), executable="pi", web_extension_path="").web_extension_path, ""
         )
         with mock.patch.dict(os.environ, {"PI_WEB_SEARCH": ""}):
-            self.assertEqual(PiAdapter(executable="pi").web_extension_path, "")
+            self.assertEqual(PiAdapter(session_operation=mock.AsyncMock(), executable="pi").web_extension_path, "")
         with mock.patch.dict(os.environ, {"PI_WEB_SEARCH": "/tmp/env.ts"}):
             self.assertEqual(
-                PiAdapter(executable="pi").web_extension_path, "/tmp/env.ts"
+                PiAdapter(session_operation=mock.AsyncMock(), executable="pi").web_extension_path, "/tmp/env.ts"
             )
 
     def test_envelope_accepts_our_marker(self) -> None:
@@ -2645,7 +2128,7 @@ class PiAdapterParsingTests(unittest.TestCase):
             bindir = Path(tmp)
             (bindir / "pi").write_text("#!/bin/sh\n")
             (bindir / "pi").chmod(0o755)
-            adapter = PiAdapter(executable=str(bindir / "pi"))
+            adapter = PiAdapter(session_operation=mock.AsyncMock(), executable=str(bindir / "pi"))
             self.assertIsNone(adapter._bundled_node_dir())
 
             (bindir / "node").write_text("#!/bin/sh\n")
@@ -2670,7 +2153,9 @@ SCRIPT = json.loads(sys.argv[1])
 if SCRIPT.get("ready", True):
     emit({"type": "extension_ui_request", "id": "d0", "method": "notify",
           "notifyType": "info",
-          "message": json.dumps({"agent-ui": 1, "kind": "ready"})})
+          "message": json.dumps({"agent-ui": 1, "kind": "ready",
+                                 "sessionTools": ["message_session", "start_session", "read_session"],
+                                 "assetTool": "resolve_asset_link"})})
 
 for line in sys.stdin:
     line = line.strip()
@@ -2696,7 +2181,7 @@ for line in sys.stdin:
         stub = Path(self.tmp.name) / "pi"
         stub.write_text(self.STUB)
         stub.chmod(0o755)
-        adapter = PiAdapter(executable=str(stub))
+        adapter = PiAdapter(session_operation=mock.AsyncMock(), executable=str(stub))
         adapter._script = json.dumps(script)  # type: ignore[attr-defined]
 
         original = asyncio.create_subprocess_exec
@@ -2981,7 +2466,7 @@ class SendApprovalTests(unittest.IsolatedAsyncioTestCase):
         return future
 
     async def test_claude_deny_with_message(self) -> None:
-        adapter = ClaudeCodeAdapter(executable="claude")
+        adapter = ClaudeCodeAdapter(session_operation=mock.AsyncMock(), executable="claude")
         future = self._arm(adapter, "perm_1", adapter.OPTIONS)
 
         effective = await adapter.send_approval(
@@ -3528,7 +3013,7 @@ class SendAnswerTests(unittest.IsolatedAsyncioTestCase):
         return future
 
     async def test_send_answer_resolves_future(self) -> None:
-        adapter = ClaudeCodeAdapter(executable="claude")
+        adapter = ClaudeCodeAdapter(session_operation=mock.AsyncMock(), executable="claude")
         future = self._arm(adapter, "perm_1", self.QUESTIONS)
 
         result = await adapter.send_answer(
@@ -3539,7 +3024,7 @@ class SendAnswerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(future.result(), {"Which emoji do you want?": "Rocket"})
 
     async def test_send_answer_multiselect_accepts_label_list(self) -> None:
-        adapter = ClaudeCodeAdapter(executable="claude")
+        adapter = ClaudeCodeAdapter(session_operation=mock.AsyncMock(), executable="claude")
         questions = [
             {
                 "question": "Pick languages",
@@ -3560,18 +3045,18 @@ class SendAnswerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, {"Pick languages": ["Python", "Go"]})
 
     async def test_send_answer_unknown_request_id_raises(self) -> None:
-        adapter = ClaudeCodeAdapter(executable="claude")
+        adapter = ClaudeCodeAdapter(session_operation=mock.AsyncMock(), executable="claude")
         with self.assertRaises(KeyError):
             await adapter.send_answer({"id": "s1"}, "missing", {})
 
     async def test_send_answer_unknown_question_raises(self) -> None:
-        adapter = ClaudeCodeAdapter(executable="claude")
+        adapter = ClaudeCodeAdapter(session_operation=mock.AsyncMock(), executable="claude")
         self._arm(adapter, "perm_1", self.QUESTIONS)
         with self.assertRaises(ValueError):
             await adapter.send_answer({"id": "s1"}, "perm_1", {"Nope?": "Rocket"})
 
     async def test_send_answer_unknown_option_raises(self) -> None:
-        adapter = ClaudeCodeAdapter(executable="claude")
+        adapter = ClaudeCodeAdapter(session_operation=mock.AsyncMock(), executable="claude")
         self._arm(adapter, "perm_1", self.QUESTIONS)
         with self.assertRaises(ValueError):
             await adapter.send_answer(
@@ -3579,7 +3064,7 @@ class SendAnswerTests(unittest.IsolatedAsyncioTestCase):
             )
 
     async def test_write_question_response_allows_with_answers(self) -> None:
-        adapter = ClaudeCodeAdapter(executable="claude")
+        adapter = ClaudeCodeAdapter(session_operation=mock.AsyncMock(), executable="claude")
         process = _FakeProcess()
         tool_input = {"questions": self.QUESTIONS}
 
@@ -3598,7 +3083,7 @@ class SendAnswerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["updatedInput"]["questions"], self.QUESTIONS)
 
     async def test_unknown_request_id_raises(self) -> None:
-        adapter = ClaudeCodeAdapter(executable="claude")
+        adapter = ClaudeCodeAdapter(session_operation=mock.AsyncMock(), executable="claude")
         with self.assertRaises(KeyError):
             await adapter.send_approval({"id": "s1"}, "missing", "allow")
 

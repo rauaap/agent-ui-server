@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -22,6 +23,12 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
             return await original(sys.executable, "-c", script, **kwargs)
         with patch("agent_ui_server.model_catalog.asyncio.create_subprocess_exec", spawn):
             return await model_catalog.discover_models(agent, "fake")
+
+    async def test_unknown_agent_does_not_launch_pi(self):
+        with patch("agent_ui_server.model_catalog.asyncio.create_subprocess_exec", new_callable=AsyncMock) as spawn:
+            result = await model_catalog.discover_models("pi-typo", "fake")
+        spawn.assert_not_awaited()
+        self.assertEqual(result, {"models": [], "error": "Model discovery failed: 'pi-typo'"})
 
     async def test_claude_initialization_only(self):
         script = '''import json,sys
@@ -85,7 +92,7 @@ sys.stdin.read()
             result = await self.run_script("claude-code", "import time;time.sleep(10)")
         self.assertIsNotNone(result["error"])
         with patch.object(model_catalog, "_claude_models", AsyncMock(side_effect=RuntimeError("bad"))), patch.object(model_catalog, "_pi_models", AsyncMock(return_value=[])):
-            result = await model_catalog.discover_catalog({"claude-code": ClaudeCodeAdapter(), "pi": PiAdapter()})
+            result = await model_catalog.discover_catalog({"claude-code": ClaudeCodeAdapter(session_operation=AsyncMock()), "pi": PiAdapter(session_operation=AsyncMock())})
         self.assertIsNotNone(result["claude-code"]["error"])
         self.assertIsNone(result["pi"]["error"])
 
@@ -100,7 +107,8 @@ sys.stdin.read()
 
     async def test_launches_use_saved_model_and_reasoning_level_on_resume(self):
         for adapter, resume_flag, level_flag in [
-            (ClaudeCodeAdapter(), "--resume", "--effort"), (PiAdapter(), "--session", "--thinking"),
+            (ClaudeCodeAdapter(session_operation=AsyncMock()), "--resume", "--effort"),
+            (PiAdapter(session_operation=AsyncMock()), "--session", "--thinking"),
         ]:
             command = await self.launch_command(adapter, {
                 "agent_session_id": "resume-id", "model": "saved-model", "reasoning_level": "high",
@@ -136,7 +144,8 @@ class SessionModelTests(unittest.IsolatedAsyncioTestCase):
     async def test_default_follows_registry_order(self):
         for ids in (("claude-code", "pi"), ("pi",)):
             registry = {key: self.main.adapters[key] for key in ids}
-            with patch.object(self.main, "adapters", registry):
+            types = {key: self.main.adapter_types[key] for key in ids}
+            with patch.object(self.main, "adapters", registry), patch.object(self.main, "adapter_types", types):
                 request = self.main.CreateSessionRequest(name="default", project_path=self.tmp.name)
                 self.assertEqual(request.agent, ids[0])
                 agents = await self.main.list_agents()
@@ -227,12 +236,8 @@ class SessionModelTests(unittest.IsolatedAsyncioTestCase):
             await self.main.startup()
             discover.assert_awaited_once_with(self.main.adapters)
 
-    def test_legacy_database_migration(self):
+    def test_missing_model_column_fails_on_open(self):
         self.db._conn.execute("ALTER TABLE sessions DROP COLUMN model")
         self.db._conn.commit()
-        migrated = Database(self.path)
-        try:
-            session = migrated.create_session("legacy", self.project["id"], "pi")
-            self.assertIsNone(session["model"])
-        finally:
-            migrated.close()
+        with self.assertRaises(sqlite3.OperationalError):
+            Database(self.path)

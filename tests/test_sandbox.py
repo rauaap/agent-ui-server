@@ -32,12 +32,16 @@ from agent_ui_server.sandbox import (
 
 
 def bubblewrap_unavailable(stderr):
-    return any(message in stderr for message in (
-        "Operation not permitted", "No permissions to create",
-        "bwrap: setting up uid map: Read-only file system",
-        # pasta, inside an outer sandbox without a TUN device or real /proc.
-        "Failed to open() /dev/net/tun", "Couldn't configure user mappings",
-    ))
+    return any(
+        line.startswith("bwrap:") and any(message in line for message in (
+            "Operation not permitted", "No permissions to create",
+            "setting up uid map: Read-only file system",
+        ))
+        or any(message in line for message in (
+            "Failed to open() /dev/net/tun", "Couldn't configure user mappings",
+        ))
+        for line in stderr.splitlines()
+    )
 
 
 def require_sandbox(test):
@@ -156,16 +160,22 @@ class SandboxSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(session["sandbox"], True)
         self.assertIs((await self.patch(session["id"], sandbox=False))["sandbox"], False)
 
-    async def test_existing_database_migrates_to_true(self):
-        session = await self.create(sandbox=False)
-        # Simulate a pre-feature database, preserving the rest of the schema.
+    async def test_missing_sandbox_column_fails_on_open(self):
+        await self.create(sandbox=False)
         with sqlite3.connect(self.database.path) as conn:
             conn.execute("ALTER TABLE sessions DROP COLUMN sandbox")
-        migrated = Database(self.database.path)
-        try:
-            self.assertIs(migrated.require_session(session["id"])["sandbox"], True)
-        finally:
-            migrated.close()
+        with self.assertRaises(sqlite3.OperationalError):
+            Database(self.database.path)
+
+
+class SandboxAvailabilityTests(unittest.TestCase):
+    def test_child_permission_errors_are_not_sandbox_startup_skips(self):
+        self.assertFalse(bubblewrap_unavailable(
+            'Traceback (most recent call last):\nPermissionError: [Errno 1] Operation not permitted'
+        ))
+        self.assertTrue(bubblewrap_unavailable(
+            'bwrap: Creating new namespace failed: Operation not permitted'
+        ))
 
 
 class SandboxCommandTests(unittest.TestCase):
@@ -634,7 +644,10 @@ def reachable(port):
     except OSError:
         return False
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.sendto(b"blocked", (host, udp))
+try:
+    s.sendto(b"blocked", (host, udp))
+except PermissionError:
+    pass  # A rejected datagram is blocked, just like a silently dropped one.
 nft = shutil.which("nft", path="/usr/bin:/bin:/usr/sbin:/sbin")
 firewall = subprocess.run([nft, "flush", "ruleset"], capture_output=True)
 route = subprocess.run(["ip", "route", "del", "blackhole", "100.64.0.0/10"], capture_output=True)
@@ -721,12 +734,17 @@ class StopProcessTests(unittest.IsolatedAsyncioTestCase):
         else:
             self.fail("child survived stop_process")
 
+    def test_alive_handles_a_process_exiting_during_proc_read(self):
+        for error in (FileNotFoundError, ProcessLookupError):
+            with self.subTest(error=error), mock.patch.object(Path, "read_text", side_effect=error):
+                self.assertFalse(self.alive(1))
+
     @staticmethod
     def alive(pid):
         # A killed child can linger briefly as a zombie until it is reaped.
         try:
             return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             return False
 
     @staticmethod
@@ -765,7 +783,7 @@ class ScratchTests(unittest.TestCase):
 
 class SandboxAdapterTests(unittest.IsolatedAsyncioTestCase):
     async def test_default_wraps_false_bypasses_and_next_turn_rechecks(self):
-        adapter = PiAdapter(executable="pi")
+        adapter = PiAdapter(session_operation=mock.AsyncMock(), executable="pi")
         session = {"id": 123, "working_dir": "/project", "agent_session_id": "resume-id"}
         with mock.patch("agent_ui_server.agent.pi_sandbox_command", return_value=["bwrap", "wrapped"]) as wrap, mock.patch(
             "agent_ui_server.agent.asyncio.create_subprocess_exec", side_effect=FileNotFoundError("test spawn")
@@ -788,7 +806,7 @@ class SandboxAdapterTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(spawn.call_args.args[0], "pi")
 
     async def test_setup_failure_does_not_spawn_unsandboxed(self):
-        adapter = PiAdapter(executable="pi")
+        adapter = PiAdapter(session_operation=mock.AsyncMock(), executable="pi")
         with mock.patch("agent_ui_server.agent.pi_sandbox_command", side_effect=ValueError("unsafe")), mock.patch(
             "agent_ui_server.agent.asyncio.create_subprocess_exec"
         ) as spawn:

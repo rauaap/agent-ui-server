@@ -15,7 +15,8 @@ DISCOVERY_TIMEOUT = 30
 async def discover_models(agent: str, executable: str) -> dict[str, Any]:
     try:
         async with asyncio.timeout(DISCOVERY_TIMEOUT):
-            models = await (_claude_models(executable) if agent == "claude-code" else _pi_models(executable))
+            discover = {"claude-code": _claude_models, "pi": _pi_models}[agent]
+            models = await discover(executable)
         return {"models": models, "error": None}
     except TimeoutError:
         return {"models": [], "error": f"Model discovery timed out after {DISCOVERY_TIMEOUT} seconds"}

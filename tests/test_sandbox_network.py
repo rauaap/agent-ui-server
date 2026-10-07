@@ -86,8 +86,8 @@ class NetworkAPITests(unittest.IsolatedAsyncioTestCase):
 
     async def test_adapter_forwarding_and_disabled_bypass(self):
         entries = [{"ip": "100.64.0.10", "port": 443}]
-        for adapter, wrapper in ((PiAdapter(executable="pi"), "pi_sandbox_command"),
-                                 (ClaudeCodeAdapter(executable="claude"), "claude_sandbox_command")):
+        for adapter, wrapper in ((PiAdapter(session_operation=mock.AsyncMock(), executable="pi"), "pi_sandbox_command"),
+                                 (ClaudeCodeAdapter(session_operation=mock.AsyncMock(), executable="claude"), "claude_sandbox_command")):
             session = {"id": 123, "working_dir": self.temp.name,
                        "sandbox_network_allowlist": entries}
             with mock.patch(f"agent_ui_server.agent.{wrapper}", side_effect=ValueError("unsafe")) as wrap, \

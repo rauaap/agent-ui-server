@@ -24,7 +24,7 @@ class PiHostToolTests(unittest.IsolatedAsyncioTestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.session = {"id": 7, "working_dir": self.tmp.name, "sandbox": True}
-        self.adapter = PiAdapter(
+        self.adapter = PiAdapter(session_operation=mock.AsyncMock(),
             executable=str(Path(__file__).parent / "fixtures/pi_host_exec.py"), web_extension_path="",
         )
         for patch in (
@@ -52,7 +52,7 @@ class PiHostToolTests(unittest.IsolatedAsyncioTestCase):
                     await self.adapter.send_approval(self.session, event["request_id"], behavior,
                                                      message="not allowed" if behavior == "deny" else None)
         self.assertEqual(self.adapter.pending_approvals, {})
-        self.assertEqual(self.adapter.host_calls, {})
+        self.assertEqual(self.adapter.server_calls, {})
         return events
 
     @staticmethod
@@ -210,7 +210,7 @@ time.sleep(60)
         # tool registration. No user prompt or inference request is sent.
         for enabled in (False, True):
             command = [shutil.which("pi"), "--mode", "rpc", "--no-session", "--no-extensions",
-                       "-e", PiAdapter.DEFAULT_EXTENSION, "--agent-ui-session-tools", "--agent-ui-asset-tools",
+                       "-e", PiAdapter.DEFAULT_EXTENSION,
                        "--agent-ui-harness-description", agent_description()]
             if enabled:
                 command.append("--agent-ui-host-exec")

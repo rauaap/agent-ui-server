@@ -17,7 +17,7 @@ from .asset_tools import NAME as ASSET_TOOL_NAME, execute_asset_tool, validate_a
 from .session_tools import MODELS, SessionOperation, agent_description, execute_session_tool, validate_session_arguments
 from .sandbox import claude_sandbox_command, pi_sandbox_command
 from .host_tools import (
-    HostTools, execute_host_command, pi_sandbox_guidance, sandbox_guidance,
+    ServerTools, execute_host_command, pi_sandbox_guidance, sandbox_guidance,
     validate_host_arguments,
 )
 from .tool_actions import (
@@ -94,42 +94,23 @@ def _resolve_decision(
 
 
 def _normalize_questions(raw_questions: Any) -> list[dict[str, Any]]:
-    """Project an agent's question spec into the wire `questions` shape.
-
-    Every field is guarded with a default — the spec originates in model
-    output, so it is an untrusted passthrough however it reached us.
-
-    Shared by every adapter that supports questions: the wire shape is the
-    client's contract, not any one agent's.
-    """
+    """Project schema-validated native questions without dropping malformed items."""
     if not isinstance(raw_questions, list):
-        return []
-
-    normalized: list[dict[str, Any]] = []
-    for raw in raw_questions:
-        if not isinstance(raw, dict):
-            continue
-        options: list[dict[str, Any]] = []
-        raw_options = raw.get("options")
-        if isinstance(raw_options, list):
-            for opt in raw_options:
-                if not isinstance(opt, dict):
-                    continue
-                options.append(
-                    {
-                        "label": str(opt.get("label", "")),
-                        "description": str(opt.get("description", "")),
-                    }
-                )
-        normalized.append(
-            {
-                "question": str(raw.get("question", "")),
-                "header": str(raw.get("header", "")),
-                "multiSelect": bool(raw.get("multiSelect", False)),
-                "options": options,
-            }
-        )
-    return normalized
+        raise TypeError("questions must be a list")
+    if not raw_questions:
+        raise ValueError("questions must not be empty")
+    return [
+        {
+            "question": raw["question"],
+            "header": raw["header"],
+            "multiSelect": raw.get("multiSelect", False),
+            "options": [
+                {"label": option["label"], "description": option.get("description", "")}
+                for option in raw["options"]
+            ],
+        }
+        for raw in raw_questions
+    ]
 
 
 def _validate_answers(
@@ -184,7 +165,7 @@ def _signal_group(process: asyncio.subprocess.Process, sig: int) -> None:
     # it stays valid for the survivors after that leader has exited.
     try:
         os.killpg(process.pid, sig)
-    except (ProcessLookupError, PermissionError):
+    except ProcessLookupError:
         pass
 
 
@@ -211,12 +192,13 @@ async def stop_process(process: asyncio.subprocess.Process) -> int | None:
 
 
 class AgentAdapter(abc.ABC):
-    session_operation: SessionOperation | None = None
+    # Human-readable name surfaced by `GET /agents`.
+    LABEL: str
 
-    # Human-readable name for an agent picker, surfaced by `GET /agents`. It
-    # lives on the adapter so the id, the label and the implementation cannot
-    # drift apart; the endpoint falls back to the id if a subclass omits it.
-    LABEL = ""
+    def __init__(self, *, session_operation: SessionOperation) -> None:
+        if not callable(session_operation):
+            raise TypeError("session_operation must be callable")
+        self.session_operation = session_operation
 
     @abc.abstractmethod
     async def start_turn(
@@ -292,8 +274,9 @@ class ClaudeCodeAdapter(AgentAdapter):
         "EnterPlanMode", "ReportFindings",
     })
 
-    def __init__(self, executable: str | None = None) -> None:
-        self.executable = executable or os.environ.get("CLAUDE_BIN", "claude")
+    def __init__(self, executable: str | None = None, *, session_operation: SessionOperation) -> None:
+        super().__init__(session_operation=session_operation)
+        self.executable = os.environ.get("CLAUDE_BIN", "claude") if executable is None else executable
         self.processes: dict[int, asyncio.subprocess.Process] = {}
         self.pending_approvals: dict[str, asyncio.Future[ApprovalDecision]] = {}
         self.pending_sessions: dict[str, int] = {}
@@ -303,7 +286,7 @@ class ClaudeCodeAdapter(AgentAdapter):
         self.pending_questions: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self.pending_question_specs: dict[str, list[dict[str, Any]]] = {}
         self.tool_actions: dict[tuple[int, str], dict[str, Any]] = {}
-        self.host_tools: dict[int, HostTools] = {}
+        self.server_tools: dict[int, ServerTools] = {}
 
     async def start_turn(
         self,
@@ -333,11 +316,10 @@ class ClaudeCodeAdapter(AgentAdapter):
             }),
             "--verbose",
         ]
-        host_enabled = session.get("sandbox", True)
-        if host_enabled or self.session_operation is not None:
-            command.extend(["--mcp-config", json.dumps({
-                "mcpServers": {"agent_ui": {"type": "sdk", "name": "agent_ui"}}
-            })])
+        bypass_sandbox_enabled = session.get("sandbox", True)
+        command.extend(["--mcp-config", json.dumps({
+            "mcpServers": {"agent_ui": {"type": "sdk", "name": "agent_ui"}}
+        })])
         if session.get("model") is not None:
             command.extend(["--model", session["model"]])
         if session.get("reasoning_level") is not None:
@@ -349,7 +331,7 @@ class ClaudeCodeAdapter(AgentAdapter):
             if session.get("sandbox", True):
                 command = claude_sandbox_command(
                     command, session["working_dir"],
-                    **({"system_prompt": sandbox_guidance} if host_enabled else {}),
+                    **({"system_prompt": sandbox_guidance} if bypass_sandbox_enabled else {}),
                     **({"sandbox_network_allowlist": session["sandbox_network_allowlist"]}
                        if session.get("sandbox_network_allowlist") else {}),
                     **({"sandbox_paths": session["sandbox_paths"]} if session.get("sandbox_paths") else {}),
@@ -383,27 +365,31 @@ class ClaudeCodeAdapter(AgentAdapter):
         stderr_task = asyncio.create_task(self._collect_stderr(process.stderr))
         result_seen = False
         error_seen = False
-        host = None
-        if host_enabled or self.session_operation is not None:
-            host = HostTools(process, session["working_dir"],
-                             lambda args, call_id: self._approve_host(session_id, args, call_id),
-                             host_enabled=host_enabled,
-                             session_call=(lambda name, args, call_id: execute_session_tool(
-                                 name, args, session_id, self.session_operation,
-                                 lambda action: self._approve_server_action(session_id, action, call_id),
-                             )) if self.session_operation is not None else None,
-                             asset_call=(lambda args: execute_asset_tool(
-                                 args, session_id, self.session_operation,
-                             )) if self.session_operation is not None else None)
-            self.host_tools[session_id] = host
+        async def session_call(name: str, args: dict[str, Any], call_id: str | None) -> dict[str, Any]:
+            return await execute_session_tool(
+                name, args, session_id, self.session_operation,
+                lambda action: self._approve_server_action(session_id, action, call_id),
+            )
+
+        async def asset_call(args: dict[str, Any]) -> dict[str, Any]:
+            return await execute_asset_tool(args, session_id, self.session_operation)
+
+        tools = ServerTools(
+            process,
+            session["working_dir"],
+            lambda args, call_id: self._approve_host(session_id, args, call_id),
+            bypass_sandbox_enabled=bypass_sandbox_enabled,
+            session_call=session_call,
+            asset_call=asset_call,
+        )
+        self.server_tools[session_id] = tools
 
         try:
-            if host is not None:
-                await host.start()
+            await tools.start()
             await self._write_user_message(process, prompt)
             assert process.stdout is not None
             while True:
-                raw_line = await host.events.get() if host is not None else await process.stdout.readline()
+                raw_line = await tools.events.get()
                 if isinstance(raw_line, dict):
                     yield raw_line
                     continue
@@ -414,11 +400,7 @@ class ClaudeCodeAdapter(AgentAdapter):
                 if not line:
                     continue
 
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    yield {"type": "output", "text": line}
-                    continue
+                event = json.loads(line)
 
                 async for agent_event in self._events_from_json(
                     session_id,
@@ -443,10 +425,9 @@ class ClaudeCodeAdapter(AgentAdapter):
                     "message": "Claude Code exited without a result event.",
                 }
         finally:
-            if host is not None:
-                await host.close()
-                self.host_tools.pop(session_id, None)
-                await stop_process(process)
+            await tools.close()
+            self.server_tools.pop(session_id, None)
+            await stop_process(process)
             self.processes.pop(session_id, None)
             await self._clear_session_approvals(session_id, "Session ended")
             self._clear_tool_actions(session_id)
@@ -466,7 +447,7 @@ class ClaudeCodeAdapter(AgentAdapter):
         if future is None or self.pending_sessions.get(request_id) != session["id"]:
             raise KeyError(f"Unknown approval request: {request_id}")
 
-        options = self.pending_options.get(request_id, self.OPTIONS)
+        options = self.pending_options[request_id]
         decision = _resolve_decision(options, behavior, option_id, message)
         if not future.done():
             future.set_result(decision)
@@ -482,7 +463,7 @@ class ClaudeCodeAdapter(AgentAdapter):
         if future is None or self.pending_sessions.get(request_id) != session["id"]:
             raise KeyError(f"Unknown question request: {request_id}")
 
-        questions = self.pending_question_specs.get(request_id, [])
+        questions = self.pending_question_specs[request_id]
         validated = _validate_answers(questions, answers)
         if not future.done():
             future.set_result(validated)
@@ -491,24 +472,24 @@ class ClaudeCodeAdapter(AgentAdapter):
     async def _approve_host(
         self, session_id: int, args: dict[str, Any], call_id: str | None = None,
     ) -> ApprovalDecision:
-        host = self.host_tools[session_id]
+        tools = self.server_tools[session_id]
         return await self._approve_server_action(session_id, {
             "kind": "other", "name": "Execute outside sandbox",
-            "arguments": {**args, "cwd": host.cwd},
+            "arguments": {**args, "cwd": tools.cwd},
         }, call_id)
 
     async def _approve_server_action(
         self, session_id: int, action: dict[str, Any], call_id: str | None = None,
     ) -> ApprovalDecision:
-        host = self.host_tools[session_id]
-        request_id = "host_" + uuid.uuid4().hex
+        tools = self.server_tools[session_id]
+        request_id = "server_" + uuid.uuid4().hex
         future = asyncio.get_running_loop().create_future()
         self.pending_approvals[request_id] = future
         self.pending_sessions[request_id] = session_id
         self.pending_options[request_id] = self.OPTIONS
         # 'other' deliberately never inherits normal command auto-approval.
         try:
-            await host.events.put(approval_request_event(
+            await tools.events.put(approval_request_event(
                 request_id, call_id or request_id, action, _event_options(self.OPTIONS)))
             return await future
         finally:
@@ -518,9 +499,9 @@ class ClaudeCodeAdapter(AgentAdapter):
 
     async def stop(self, session: dict[str, Any]) -> None:
         session_id = session["id"]
-        host = self.host_tools.get(session_id)
-        if host is not None:
-            await host.close()
+        tools = self.server_tools.get(session_id)
+        if tools is not None:
+            await tools.close()
         await self._clear_session_approvals(session_id, "Session stopped")
         self._clear_tool_actions(session_id)
 
@@ -548,7 +529,7 @@ class ClaudeCodeAdapter(AgentAdapter):
             yield self._tool_use_event(event, session_id)
             return
 
-        if event_type in {"control_request", "sdk_control_request"}:
+        if event_type == "control_request":
             native = self._permission_parts(event)
             if native is None:
                 return
@@ -556,8 +537,8 @@ class ClaudeCodeAdapter(AgentAdapter):
 
             # Allow transport dispatch only; the host executor asks independently.
             if tool in self.AUTO_APPROVE_TOOLS or (
-                session_id in self.host_tools
-                and tool in {f"mcp__agent_ui__{name}" for name in self.host_tools[session_id].tool_names}
+                session_id in self.server_tools
+                and tool in {f"mcp__agent_ui__{name}" for name in self.server_tools[session_id].tool_names}
             ):
                 try:
                     await self._write_approval_response(
@@ -571,9 +552,7 @@ class ClaudeCodeAdapter(AgentAdapter):
             # surface it as a `question` event and answer it by writing the
             # user's pick into updatedInput.answers.
             if tool == self.QUESTION_TOOL:
-                questions = _normalize_questions(
-                    tool_input.get("questions") if isinstance(tool_input, dict) else None
-                )
+                questions = _normalize_questions(tool_input["questions"])
                 loop = asyncio.get_running_loop()
                 answer_future: asyncio.Future[dict[str, Any]] = loop.create_future()
                 self.pending_questions[request_id] = answer_future
@@ -646,11 +625,7 @@ class ClaudeCodeAdapter(AgentAdapter):
     def _assistant_events(
         self, event: dict[str, Any], session_id: int = 0
     ) -> list[AgentEvent]:
-        message = event.get("message")
-        if isinstance(message, dict):
-            content = message.get("content")
-        else:
-            content = event.get("content")
+        content = event["message"]["content"]
 
         if isinstance(content, str):
             return [{"type": "output", "text": content}] if content else []
@@ -670,61 +645,23 @@ class ClaudeCodeAdapter(AgentAdapter):
                         continue
                     events.append(self._tool_use_event(block, session_id))
 
-        if not events and event.get("text"):
-            events.append({"type": "output", "text": event["text"]})
-
         return events
 
     def _tool_use_event(
         self, event: dict[str, Any], session_id: int = 0
     ) -> AgentEvent:
-        nested = event.get("tool_use") if isinstance(event.get("tool_use"), dict) else {}
-        source = nested or event
-        name = source.get("tool") or source.get("tool_name") or source.get("name") or "tool"
-        arguments = source.get("input") if "input" in source else source.get("arguments", {})
-        call_id = source.get("id") or source.get("tool_use_id") or f"tool_{uuid.uuid4().hex}"
-        call_id = str(call_id)
-        action = action_or_other(name, arguments, CLAUDE_TOOL_TRANSLATORS)
+        call_id = event["id"]
+        action = action_or_other(event["name"], event["input"], CLAUDE_TOOL_TRANSLATORS)
         self.tool_actions[(session_id, call_id)] = action
         return tool_use_event(call_id, action)
 
     def _permission_parts(
         self, event: dict[str, Any]
     ) -> tuple[str, Any, Any, str] | None:
-        request = event.get("request")
-        if not isinstance(request, dict):
-            request = event.get("control_request")
-        if not isinstance(request, dict):
-            request = event
-
-        subtype = event.get("subtype") or request.get("subtype")
-        if subtype and subtype not in {"can_use_tool", "permission"}:
+        request = event["request"]
+        if request["subtype"] != "can_use_tool":
             return None
-
-        request_id = (
-            event.get("request_id")
-            or request.get("request_id")
-            or request.get("id")
-            or f"perm_{uuid.uuid4().hex}"
-        )
-        tool = (
-            event.get("tool")
-            or event.get("tool_name")
-            or request.get("tool")
-            or request.get("tool_name")
-            or request.get("name")
-            or "tool"
-        )
-        tool_input = (
-            event.get("input")
-            or event.get("tool_input")
-            or request.get("input")
-            or request.get("tool_input")
-            or {}
-        )
-
-        call_id = request.get("tool_use_id") or event.get("tool_use_id") or f"tool_{uuid.uuid4().hex}"
-        return str(request_id), tool, tool_input, str(call_id)
+        return event["request_id"], request["tool_name"], request["input"], request["tool_use_id"]
 
     def _approval_request_event(
         self, event: dict[str, Any], session_id: int = 0
@@ -867,10 +804,8 @@ class ClaudeCodeAdapter(AgentAdapter):
 
     async def _collect_stderr(
         self,
-        stream: asyncio.StreamReader | None,
+        stream: asyncio.StreamReader,
     ) -> str:
-        if stream is None:
-            return ""
         chunks: list[str] = []
         while True:
             raw_line = await stream.readline()
@@ -942,12 +877,14 @@ class PiAdapter(AgentAdapter):
         executable: str | None = None,
         extension_path: str | None = None,
         web_extension_path: str | None = None,
+        *,
+        session_operation: SessionOperation,
     ) -> None:
-        self.executable = executable or os.environ.get("PI_BIN", "pi")
+        super().__init__(session_operation=session_operation)
+        self.executable = os.environ.get("PI_BIN", "pi") if executable is None else executable
         self.extension_path = (
-            extension_path
-            or os.environ.get("PI_EXTENSION")
-            or self.DEFAULT_EXTENSION
+            os.environ.get("PI_EXTENSION", self.DEFAULT_EXTENSION)
+            if extension_path is None else extension_path
         )
         # Unlike the gate, the web extension is optional: an empty override
         # (argument or `PI_WEB_SEARCH=`) drops it and leaves Pi without web
@@ -958,7 +895,7 @@ class PiAdapter(AgentAdapter):
                 "PI_WEB_SEARCH", self.DEFAULT_WEB_EXTENSION
             )
         self.web_extension_path = web_extension_path
-        self.host_calls: dict[int, dict[str, asyncio.Task[None]]] = {}
+        self.server_calls: dict[int, dict[str, asyncio.Task[None]]] = {}
         self.processes: dict[int, asyncio.subprocess.Process] = {}
         self.pending_approvals: dict[str, asyncio.Future[ApprovalDecision]] = {}
         self.pending_sessions: dict[str, int] = {}
@@ -989,15 +926,10 @@ class PiAdapter(AgentAdapter):
             # arguments the user just approved.
             "--no-extensions",
         ]
-        host_enabled = session.get("sandbox", True)
-        if host_enabled:
+        bypass_sandbox_enabled = session.get("sandbox", True)
+        if bypass_sandbox_enabled:
             command.append("--agent-ui-host-exec")
-        session_enabled = self.session_operation is not None
-        if session_enabled:
-            command.extend([
-                "--agent-ui-session-tools", "--agent-ui-asset-tools",
-                "--agent-ui-harness-description", agent_description(),
-            ])
+        command.extend(["--agent-ui-harness-description", agent_description()])
         if self.web_extension_path:
             command.extend(["-e", self.web_extension_path])
         if session.get("model") is not None:
@@ -1011,7 +943,7 @@ class PiAdapter(AgentAdapter):
             if session.get("sandbox", True):
                 command = pi_sandbox_command(
                     command, session["working_dir"],
-                    **({"system_prompt": pi_sandbox_guidance} if host_enabled else {}),
+                    **({"system_prompt": pi_sandbox_guidance} if bypass_sandbox_enabled else {}),
                     **({"sandbox_network_allowlist": session["sandbox_network_allowlist"]}
                        if session.get("sandbox_network_allowlist") else {}),
                     **({"sandbox_paths": session["sandbox_paths"]} if session.get("sandbox_paths") else {}),
@@ -1049,22 +981,19 @@ class PiAdapter(AgentAdapter):
         queue: asyncio.Queue[AgentEvent | None] = asyncio.Queue()
         ready: asyncio.Future[None] = loop.create_future()
         resolvers: set[asyncio.Task[None]] = set()
-        host_calls: dict[str, asyncio.Task[None]] = {}
-        self.host_calls[session_id] = host_calls
-        host_lock = asyncio.Lock()
+        server_calls: dict[str, asyncio.Task[None]] = {}
+        self.server_calls[session_id] = server_calls
+        server_tool_lock = asyncio.Lock()
 
         # Per-turn correlation state.
-        #  tool_args   toolCallId -> arguments, captured from
-        #              tool_execution_start, which Pi emits before the approval
-        #              dialog. That ordering is why the dialog envelope only
-        #              needs to carry an id.
+        #  tool_actions toolCallId -> canonical action, captured from
+        #              tool_execution_start before the approval dialog.
         #  deny_reasons toolCallId -> the reason the client sent with a denial,
         #              held until the extension's follow-up `input` dialog asks
         #              for it.
         #  batches     toolCallId -> the question dialogs seen so far, held
         #              until all `count` have arrived so the whole set reaches
         #              the client as one `question` event.
-        tool_args: dict[str, dict[str, Any]] = {}
         tool_actions: dict[str, dict[str, Any]] = {}
         deny_reasons: dict[str, str] = {}
         batches: dict[str, dict[str, Any]] = {}
@@ -1147,7 +1076,7 @@ class PiAdapter(AgentAdapter):
             }, tool_call_id)
 
         async def approve_server_action(action: dict[str, Any], tool_call_id: str) -> ApprovalDecision:
-            request_id = "host_" + uuid.uuid4().hex
+            request_id = "server_" + uuid.uuid4().hex
             future = loop.create_future()
             self.pending_approvals[request_id] = future
             self.pending_sessions[request_id] = session_id
@@ -1164,20 +1093,18 @@ class PiAdapter(AgentAdapter):
                 self.pending_sessions.pop(request_id, None)
                 self.pending_options.pop(request_id, None)
 
-        async def resolve_host(
-            dialog_id: Any, tool_call_id: str, args: dict[str, Any], name: str = "bypass_sandbox",
+        async def resolve_server_tool(
+            dialog_id: Any, tool_call_id: str, args: dict[str, Any], name: str,
         ) -> None:
             try:
-                async with host_lock:
+                async with server_tool_lock:
                     if name == "bypass_sandbox":
                         result = await execute_host_command(
                             args, session["working_dir"], lambda values: approve_host(values, tool_call_id),
                         )
                     elif name == ASSET_TOOL_NAME:
-                        assert self.session_operation is not None
                         result = await execute_asset_tool(args, session_id, self.session_operation)
                     else:
-                        assert self.session_operation is not None
                         result = await execute_session_tool(
                             name, args, session_id, self.session_operation,
                             lambda action: approve_server_action(action, tool_call_id),
@@ -1280,11 +1207,11 @@ class PiAdapter(AgentAdapter):
 
             if kind == "ready":
                 if not ready.done():
-                    if host_enabled and envelope.get("hostTool") != "bypass_sandbox":
+                    if bypass_sandbox_enabled and envelope.get("hostTool") != "bypass_sandbox":
                         ready.set_exception(RuntimeError("Pi extension did not register bypass_sandbox"))
-                    elif session_enabled and envelope.get("sessionTools") != list(MODELS):
+                    elif envelope.get("sessionTools") != list(MODELS):
                         ready.set_exception(RuntimeError("Pi extension did not register session tools"))
-                    elif session_enabled and envelope.get("assetTool") != ASSET_TOOL_NAME:
+                    elif envelope.get("assetTool") != ASSET_TOOL_NAME:
                         ready.set_exception(RuntimeError("Pi extension did not register resolve_asset_link"))
                     else:
                         ready.set_result(None)
@@ -1292,21 +1219,21 @@ class PiAdapter(AgentAdapter):
 
             if kind == "host_cancel":
                 call_id = envelope.get("toolCallId")
-                if isinstance(call_id, str) and call_id in host_calls:
-                    host_calls[call_id].cancel()
+                if isinstance(call_id, str) and call_id in server_calls:
+                    server_calls[call_id].cancel()
                 return
 
             if kind in {"host_exec", "session_tool", "asset_tool"}:
                 try:
                     name = ("bypass_sandbox" if kind == "host_exec" else ASSET_TOOL_NAME
                             if kind == "asset_tool" else envelope.get("name"))
-                    enabled = host_enabled if kind == "host_exec" else session_enabled
+                    enabled = bypass_sandbox_enabled if kind == "host_exec" else True
                     if (not enabled or method != "input"
                             or self.processes.get(session_id) is not process):
                         raise ValueError("Server tool is not enabled for this session")
                     call_id = envelope.get("toolCallId")
-                    if not isinstance(call_id, str) or not call_id or call_id in host_calls:
-                        raise ValueError("Invalid or duplicate host tool call id")
+                    if not isinstance(call_id, str) or not call_id or call_id in server_calls:
+                        raise ValueError("Invalid or duplicate server tool call id")
                     args = (validate_host_arguments(envelope.get("arguments")) if kind == "host_exec"
                             else validate_asset_arguments(envelope.get("arguments")) if kind == "asset_tool"
                             else validate_session_arguments(name, envelope.get("arguments")))
@@ -1315,16 +1242,14 @@ class PiAdapter(AgentAdapter):
                         "isError": True, "content": [{"type": "text", "text": str(exc)}],
                     }))
                     return
-                task = asyncio.create_task(resolve_host(dialog_id, call_id, args, name))
-                host_calls[call_id] = task
-                task.add_done_callback(lambda _, key=call_id: host_calls.pop(key, None))
+                task = asyncio.create_task(resolve_server_tool(dialog_id, call_id, args, name))
+                server_calls[call_id] = task
+                task.add_done_callback(lambda _, key=call_id: server_calls.pop(key, None))
                 return
 
             if kind == "approval":
-                tool_call_id = str(
-                    envelope.get("toolCallId") or f"tool_{uuid.uuid4().hex}"
-                )
-                tool = str(envelope.get("toolName") or "tool")
+                tool_call_id = envelope["toolCallId"]
+                action = tool_actions[tool_call_id]
                 request_id = f"perm_{uuid.uuid4().hex}"
                 future: asyncio.Future[ApprovalDecision] = loop.create_future()
                 self.pending_approvals[request_id] = future
@@ -1332,13 +1257,6 @@ class PiAdapter(AgentAdapter):
                 self.pending_options[request_id] = self.OPTIONS
 
                 await flush_text()
-                action = tool_actions.get(tool_call_id)
-                if action is None:
-                    action = action_or_other(
-                        tool,
-                        tool_args.get(tool_call_id, {}),
-                        PI_TOOL_TRANSLATORS,
-                    )
                 await queue.put(
                     approval_request_event(
                         request_id,
@@ -1391,15 +1309,12 @@ class PiAdapter(AgentAdapter):
                 return
 
             if kind == "message_update":
-                event = message.get("assistantMessageEvent") or {}
-                event_type = event.get("type")
+                event = message["assistantMessageEvent"]
+                event_type = event["type"]
                 if event_type == "text_delta":
-                    text_buf.append(str(event.get("delta") or ""))
+                    text_buf.append(event["delta"])
                 elif event_type == "text_end":
-                    # text_end carries the whole block; the accumulated deltas
-                    # are the fallback if it ever arrives without one.
-                    content = event.get("content")
-                    text = content if isinstance(content, str) else "".join(text_buf)
+                    text = event["content"]
                     text_buf.clear()
                     if text.strip():
                         await queue.put({"type": "output", "text": text})
@@ -1407,13 +1322,9 @@ class PiAdapter(AgentAdapter):
                 return
 
             if kind == "tool_execution_start":
-                tool = str(message.get("toolName") or "tool")
-                args = message.get("args")
-                args = args if isinstance(args, dict) else {}
-                tool_call_id = str(
-                    message.get("toolCallId") or f"tool_{uuid.uuid4().hex}"
-                )
-                tool_args[tool_call_id] = args
+                tool = message["toolName"]
+                args = message["args"]
+                tool_call_id = message["toolCallId"]
                 # The question tool is surfaced as a `question` event, so don't
                 # also emit a tool_use bubble for it.
                 if tool == self.QUESTION_TOOL:
@@ -1474,13 +1385,12 @@ class PiAdapter(AgentAdapter):
                     line = raw_line.decode("utf-8", errors="replace").strip()
                     if not line:
                         continue
-                    try:
-                        message = json.loads(line)
-                    except json.JSONDecodeError:
-                        await queue.put({"type": "output", "text": line})
-                        continue
-                    if isinstance(message, dict):
-                        await handle_message(message)
+                    message = json.loads(line)
+                    await handle_message(message)
+            except Exception as exc:
+                if not ready.done():
+                    ready.set_exception(exc)
+                await queue.put({"type": "error", "message": str(exc)})
             finally:
                 # Fail the handshake rather than let it wait out the timeout
                 # when the process dies early.
@@ -1534,8 +1444,8 @@ class PiAdapter(AgentAdapter):
             # Stop reading before cancelling host calls, so no new work can arrive.
             reader_task.cancel()
             await asyncio.gather(reader_task, return_exceptions=True)
-            await self._cancel_host_calls(session_id)
-            self.host_calls.pop(session_id, None)
+            await self._cancel_server_calls(session_id)
+            self.server_calls.pop(session_id, None)
             self.processes.pop(session_id, None)
             await self._clear_session_approvals(session_id, "Session ended")
             await self._terminate(process)
@@ -1559,7 +1469,7 @@ class PiAdapter(AgentAdapter):
         if future is None or self.pending_sessions.get(request_id) != session["id"]:
             raise KeyError(f"Unknown approval request: {request_id}")
 
-        options = self.pending_options.get(request_id, self.OPTIONS)
+        options = self.pending_options[request_id]
         decision = _resolve_decision(options, behavior, option_id, message)
         if not future.done():
             future.set_result(decision)
@@ -1575,14 +1485,14 @@ class PiAdapter(AgentAdapter):
         if future is None or self.pending_sessions.get(request_id) != session["id"]:
             raise KeyError(f"Unknown question request: {request_id}")
 
-        questions = self.pending_question_specs.get(request_id, [])
+        questions = self.pending_question_specs[request_id]
         validated = _validate_answers(questions, answers)
         if not future.done():
             future.set_result(validated)
         return validated
 
-    async def _cancel_host_calls(self, session_id: int) -> None:
-        tasks = list(self.host_calls.get(session_id, {}).values())
+    async def _cancel_server_calls(self, session_id: int) -> None:
+        tasks = list(self.server_calls.get(session_id, {}).values())
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -1591,7 +1501,7 @@ class PiAdapter(AgentAdapter):
         session_id = session["id"]
         # Revoke dispatch before cancelling so buffered requests cannot start work.
         process = self.processes.pop(session_id, None)
-        await self._cancel_host_calls(session_id)
+        await self._cancel_server_calls(session_id)
         await self._clear_session_approvals(session_id, "Session stopped")
         if process is not None:
             await self._terminate(process)
@@ -1667,15 +1577,13 @@ class PiAdapter(AgentAdapter):
         """Collect stderr without hanging if the stream is still open."""
         try:
             return await asyncio.wait_for(asyncio.shield(task), timeout=1)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
+        except asyncio.TimeoutError:
             return ""
 
     async def _collect_stderr(
         self,
-        stream: asyncio.StreamReader | None,
+        stream: asyncio.StreamReader,
     ) -> str:
-        if stream is None:
-            return ""
         chunks: list[str] = []
         while True:
             raw_line = await stream.readline()

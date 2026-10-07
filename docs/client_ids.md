@@ -52,13 +52,10 @@ is not a function` on a number. Truncating an id was a uuid-era habit and is now
 pointless anyway — an integer id is already short. If you want a fallback label,
 use `String(id)` or just render the id whole.
 
-**4. Persisted ids do not survive the migration.** The move to integers
-*renumbered* every row; it did not preserve the old values. Anything a client
-saved before it — a localStorage tab list, a bookmarked URL, an Android
-notification preference set — refers to ids that no longer exist. That is fine
-as long as your restore path **fails closed**: check a restored id against the
-current session list and drop it if absent, rather than assuming it resolves.
-Do not write a migration for this; it self-corrects after one use.
+**4. Cached ids can be stale.** A localStorage tab list, bookmarked URL, or
+Android notification preference can refer to a session that has been deleted.
+Check restored ids against the current session list and drop absent ones rather
+than assuming they resolve.
 
 **5. Ids are never reused.** The columns are `INTEGER PRIMARY KEY
 AUTOINCREMENT`, not bare rowids, so deleting session 7 does not free the number
@@ -109,9 +106,8 @@ That is load-bearing behaviour resting on a library detail. Two things follow:
 - **Do not extend the pattern blindly.** If you add another id-bearing field,
   convert deliberately rather than leaning on `optString` to guess.
 
-Note this coercion is also what lets the app talk to a *pre-migration* server,
-where ids are still uuid strings — any replacement should keep strings passing
-through untouched.
+Server IDs are numeric. Do not preserve compatibility with old UUID-based
+servers when making this conversion explicit.
 
 Verifying the coercion claim needs a JVM; there was no Java toolchain on the
 machine where this was written, so it is read from org.json's implementation

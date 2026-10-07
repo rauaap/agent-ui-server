@@ -1,6 +1,6 @@
 # Client hand-off: first-class worktrees
 
-Status: **server side implemented** (schema, `_migrate_v4`, endpoints, tests,
+Status: **server side implemented** (schema, endpoints, tests,
 README). This is the client-side spec, for an implementing agent working in a
 client repo — the Android app
 ([rauaap/agent-ui-server-android](https://github.com/rauaap/agent-ui-server-android))
@@ -52,7 +52,7 @@ and `"error"`.
   [client_ids.md](client_ids.md) before comparing, storing or rendering one —
   the number/string distinction has sharp edges in a browser.
 - `branch` is the branch the worktree was **created on**, and may be `null` for
-  worktrees carried over by the server's migration. It is not live state: an
+  records imported in the past. It is not live state: an
   agent working in the worktree can switch branches and nothing here updates.
   Label it accordingly ("created on `fix-login`"), or omit it when `null` rather
   than rendering "null".

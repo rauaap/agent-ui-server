@@ -93,14 +93,6 @@ def _claude_edit(arguments: dict[str, Any]) -> dict[str, Any]:
     )
 
 
-def _claude_multi_edit(arguments: dict[str, Any]) -> dict[str, Any]:
-    return canonical_action(
-        "edit",
-        path=arguments.get("file_path"),
-        edits=_claude_edit_entries(arguments.get("edits")),
-    )
-
-
 def _claude_write(arguments: dict[str, Any]) -> dict[str, Any]:
     return canonical_action(
         "write",
@@ -160,7 +152,6 @@ CLAUDE_TOOL_TRANSLATORS: dict[str, ToolTranslator] = {
     "Bash": _claude_bash,
     "Read": _claude_read,
     "Edit": _claude_edit,
-    "MultiEdit": _claude_multi_edit,
     "Write": _claude_write,
     "Glob": _claude_glob,
     "Grep": _claude_grep,
@@ -200,14 +191,6 @@ def _pi_read(arguments: dict[str, Any]) -> dict[str, Any]:
 
 def _pi_edit(arguments: dict[str, Any]) -> dict[str, Any]:
     raw_edits = arguments.get("edits")
-    if raw_edits is None and ("oldText" in arguments or "newText" in arguments):
-        raw_edits = [
-            {
-                "oldText": arguments.get("oldText"),
-                "newText": arguments.get("newText"),
-            }
-        ]
-
     edits: Any = raw_edits
     if isinstance(raw_edits, list):
         edits = [

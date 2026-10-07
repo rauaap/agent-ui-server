@@ -43,7 +43,7 @@ function readWebSearchModelConfig(): WebSearchModelConfig {
     try {
         raw = readFileSync(path, "utf8");
     } catch (error: any) {
-        if (error?.code === "ENOENT") return { status: "missing", path };
+        if (error?.code === "ENOENT" && !process.env.PI_WEB_SEARCH_CONFIG) return { status: "missing", path };
         return { status: "invalid", path, error: error?.message || String(error) };
     }
 
@@ -59,7 +59,7 @@ function readWebSearchModelConfig(): WebSearchModelConfig {
     }
 
     const provider = parsed.provider;
-    const modelId = parsed.model ?? parsed.modelId;
+    const modelId = parsed.model;
     if (typeof provider !== "string" || provider.trim() === "") {
         return { status: "invalid", path, error: "Missing required string field: provider" };
     }
@@ -71,13 +71,9 @@ function readWebSearchModelConfig(): WebSearchModelConfig {
 }
 
 function getAvailableSupportedModels(ctx: ExtensionContext): string[] {
-    try {
-        return ctx.modelRegistry.getAvailable()
-            .filter(isSupportedSearchModel)
-            .map(describeModel);
-    } catch {
-        return [];
-    }
+    return ctx.modelRegistry.getAvailable()
+        .filter(isSupportedSearchModel)
+        .map(describeModel);
 }
 
 export async function getModel(ctx: ExtensionContext): Promise<Model<Api> | undefined> {
@@ -110,6 +106,7 @@ export function missingConfigResult(ctx: ExtensionContext): AgentToolResult<any>
             : ` Configure and select a supported provider: ${supportedList}.`;
         const msg = `The current model ${describeModel(ctx.model)} does not support native web search. pi-web-search will not switch to another configured model automatically to avoid unexpected API costs.${availableHint}`;
         return {
+            isError: true,
             content: [{ type: "text", text: `Failed: ${msg}` }],
             details: {
                 error: "unsupported_model",
@@ -125,6 +122,7 @@ export function missingConfigResult(ctx: ExtensionContext): AgentToolResult<any>
         : ` Configure and select a supported provider: ${supportedList}.`;
     const msg = `No current model selected for web search.${availableHint}`;
     return {
+        isError: true,
         content: [{ type: "text", text: `Failed: ${msg}` }],
         details: {
             error: "missing_config",
@@ -137,11 +135,11 @@ export function missingConfigResult(ctx: ExtensionContext): AgentToolResult<any>
 export function missingWebSearchConfigResult(ctx: ExtensionContext): AgentToolResult<any> {
     const config = readWebSearchModelConfig();
     const availableSupportedModels = getAvailableSupportedModels(ctx);
-    const supportedList = SUPPORTED_PROVIDERS.join(", ");
 
     if (config.status === "invalid") {
         return {
-            content: [{ type: "text", text: `Failed: Invalid web search model config at ${config.path}: ${config.error}. Fix the file or remove it to use the current conversation model.` }],
+            isError: true,
+            content: [{ type: "text", text: `Failed: Invalid web search model config at ${config.path}: ${config.error}.` }],
             details: {
                 error: "invalid_config",
                 configPath: config.path,
@@ -155,7 +153,8 @@ export function missingWebSearchConfigResult(ctx: ExtensionContext): AgentToolRe
         const model = ctx.modelRegistry.find(config.provider, config.modelId);
         if (!model) {
             return {
-                content: [{ type: "text", text: `Failed: Configured web search model ${config.provider}/${config.modelId} from ${config.path} was not found. Fix the file or remove it to use the current conversation model.` }],
+                isError: true,
+                content: [{ type: "text", text: `Failed: Configured web search model ${config.provider}/${config.modelId} from ${config.path} was not found.` }],
                 details: {
                     error: "configured_model_not_found",
                     configPath: config.path,
@@ -167,7 +166,8 @@ export function missingWebSearchConfigResult(ctx: ExtensionContext): AgentToolRe
             };
         }
         return {
-            content: [{ type: "text", text: `Failed: Configured web search model ${describeModel(model)} from ${config.path} does not support native web search. Configure a model backed by ${supportedList}, or remove the file to use the current conversation model.` }],
+            isError: true,
+            content: [{ type: "text", text: `Failed: Configured web search model ${describeModel(model)} from ${config.path} does not support native web search.` }],
             details: {
                 error: "unsupported_model",
                 configPath: config.path,
@@ -183,5 +183,5 @@ export function missingWebSearchConfigResult(ctx: ExtensionContext): AgentToolRe
 }
 
 export function errorResult(e: Error): AgentToolResult<any> {
-    return { content: [{ type: "text", text: `Error: ${e.message}` }], details: { error: true } };
+    return { isError: true, content: [{ type: "text", text: `Error: ${e.message}` }], details: { error: true } };
 }

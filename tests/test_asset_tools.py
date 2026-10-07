@@ -32,13 +32,12 @@ class AssetToolTests(unittest.IsolatedAsyncioTestCase):
                     with self.subTest(adapter=cls.__name__, mode=mode), mock.patch.dict(
                         os.environ, {"CLAUDE_HOST_EXEC": "0", "PI_HOST_EXEC": "0"},
                     ):
-                        adapter = cls(executable=fixture)
+                        operation = mock.AsyncMock(return_value={"url": "/shared-assets/notes/report"})
+                        adapter = cls(session_operation=operation, executable=fixture)
                         if isinstance(adapter, PiAdapter):
                             adapter.web_extension_path = ""
-                        operation = mock.AsyncMock(return_value={"url": "/shared-assets/notes/report"})
                         if mode == "error":
                             operation.side_effect = ValueError("No registered root")
-                        adapter.session_operation = operation
                         args = {"path": "relative" if mode == "invalid" else "/missing/report"}
                         async with asyncio.timeout(5):
                             events = [event async for event in adapter.start_turn(

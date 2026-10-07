@@ -18,7 +18,6 @@ function schemaShape(value) {
 }
 
 for (const enabled of [false, true]) {
-  for (const sessionEnabled of [false, true]) {
     const tools = new Map(), handlers = new Map(), notices = [];
     const api = {
         registerFlag() {}, getFlag: (name) => {
@@ -26,7 +25,8 @@ for (const enabled of [false, true]) {
                 return serverTools.find(tool => tool.name === "start_session")?.inputSchema.properties.agent.description
                     ?? "Agent backend: test-harness. Omit to use test-harness (default).";
             }
-            return name === "agent-ui-host-exec" ? enabled : sessionEnabled;
+            if (name === "agent-ui-host-exec") return enabled;
+            throw new Error(`Unexpected flag: ${name}`);
         },
         registerTool: (tool) => tools.set(tool.name, tool),
         on: (name, callback) => handlers.set(name, callback),
@@ -39,9 +39,9 @@ for (const enabled of [false, true]) {
     } };
     await handlers.get("session_start")({}, ctx);
     assert.equal(tools.has("bypass_sandbox"), enabled);
-    assert.equal(tools.has("resolve_asset_link"), sessionEnabled);
-    assert.equal(notices[0].assetTool, sessionEnabled ? "resolve_asset_link" : undefined);
-    if (sessionEnabled) {
+    assert.equal(tools.has("resolve_asset_link"), true);
+    assert.equal(notices[0].assetTool, "resolve_asset_link");
+    {
         const tool = tools.get("resolve_asset_link");
         const args = { path: "/missing/report.html" };
         assert.equal(tool.parameters.additionalProperties, false);
@@ -60,10 +60,9 @@ for (const enabled of [false, true]) {
         }
     }
     const sessionNames = ["message_session", "start_session", "read_session"];
-    assert.deepEqual(notices[0].sessionTools, sessionEnabled ? sessionNames : undefined);
+    assert.deepEqual(notices[0].sessionTools, sessionNames);
     for (const name of sessionNames) {
-        assert.equal(tools.has(name), sessionEnabled);
-        if (!sessionEnabled) continue;
+        assert.equal(tools.has(name), true);
         const sessionTool = tools.get(name);
         const serverTool = serverTools.find(tool => tool.name === name);
         if (serverTool) {
@@ -85,6 +84,33 @@ for (const enabled of [false, true]) {
         }
         await assert.rejects(sessionTool.execute("s1", {}, undefined, undefined, { ...ctx, mode: "tui" }), /RPC/);
     }
+    const questionTool = tools.get(notices[0].questionTool);
+    const question = {
+        question: "  Which option?  ", header: " Choice ",
+        options: [{ label: " First ", description: " First choice " },
+                  { label: " Second ", description: " Second choice " }],
+    };
+    ctx.ui.select = async (title, labels) => {
+        assert.deepEqual(JSON.parse(title), {
+            "agent-ui": 1, kind: "question", toolCallId: "q1", index: 0, count: 1,
+            question: {
+                question: "Which option?", header: "Choice", multiSelect: false,
+                options: [{ label: "First", description: " First choice " },
+                          { label: "Second", description: " Second choice " }],
+            },
+        });
+        assert.deepEqual(labels, ["First", "Second"]);
+        return "First";
+    };
+    const answer = await questionTool.execute("q1", { questions: [question] }, undefined, undefined, ctx);
+    assert.deepEqual(answer.details.answers, { "Which option?": "First" });
+    ctx.ui.select = async () => { throw new Error("Invalid question reached UI"); };
+    await assert.rejects(questionTool.execute("q1", {
+        questions: [{ ...question, question: "  " }],
+    }, undefined, undefined, ctx), /Question must not be blank/);
+    await assert.rejects(questionTool.execute("q1", {
+        questions: [{ ...question, options: [{ label: "  ", description: "Blank" }, question.options[1]] }],
+    }, undefined, undefined, ctx), /label must not be blank/);
     if (!enabled) continue;
     const tool = tools.get("bypass_sandbox");
     const args = { command: "printf hello", reason: "test" };
@@ -111,5 +137,4 @@ for (const enabled of [false, true]) {
     await assert.rejects(execution, /cancelled/);
     assert.deepEqual(notices.at(-1), { "agent-ui": 1, kind: "host_cancel", toolCallId: "cancel" });
     await assert.rejects(tool.execute("c1", args, undefined, undefined, { ...ctx, mode: "tui" }), /RPC/);
-  }
 }

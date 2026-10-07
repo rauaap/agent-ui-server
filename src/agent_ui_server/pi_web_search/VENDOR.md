@@ -10,11 +10,10 @@ Provider-native web search for Pi, giving Pi sessions the `web_search` and
 | License | MIT |
 | Vendored | 2026-09-09 |
 
-The `.ts` files in this directory are copied verbatim from the published npm
-tarball (`pi-web-search-1.5.0.tgz`, `src/`), which is byte-identical to the
-upstream repository at that version. Keep them that way: local modifications
-turn every future update into a merge. Behavior that agent-ui-server needs to
-control belongs in `pi_extension.ts` or `PiAdapter` instead.
+The `.ts` files originated from the published npm tarball
+(`pi-web-search-1.5.0.tgz`, `src/`) and include local changes for provider routing,
+model selection, error handling, and the current Pi authentication API.
+Preserve these changes when updating from upstream; this is not a verbatim copy.
 
 ## Why vendored rather than installed
 
@@ -36,8 +35,8 @@ tar xzf pi-web-search-<version>.tgz
 cp package/src/*.ts src/agent_ui_server/pi_web_search/
 ```
 
-Then re-read the diff before committing. Two things matter to us: the tool
-names `web_search` and `url_context`, which `pi_extension.ts` allowlists and
+Then reapply the local changes and run `tests/test_pi_web_search.py` before
+committing. Two things matter to us: the tool names `web_search` and `url_context`, which `pi_extension.ts` allowlists and
 `tool_actions.py` translates, and the argument spellings `query` and `urls`,
 which those translators project into the canonical schema. A rename upstream is
 silent here — the gate would start prompting for an unrecognized tool and the

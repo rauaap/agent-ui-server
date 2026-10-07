@@ -15,7 +15,6 @@ def write(value):
 names = ["message_session", "start_session", "read_session"]
 pi = "--mode" in sys.argv
 if pi:
-    assert "--agent-ui-session-tools" in sys.argv
     write({"type": "extension_ui_request", "method": "notify", "message": json.dumps({
         "agent-ui": 1, "kind": "ready", "sessionTools": names,
         "assetTool": "resolve_asset_link",
@@ -62,7 +61,7 @@ else:
     assert [t["name"] for t in tools] == names + ["resolve_asset_link"]
     write({"type": "control_request", "request_id": "permission", "request": {
         "subtype": "can_use_tool", "tool_name": "mcp__agent_ui__" + config["name"],
-        "input": config["arguments"],
+        "input": config["arguments"], "tool_use_id": "toolu_call",
     }})
     assert read()["response"]["response"]["behavior"] == "allow"
     write({"type": "assistant", "message": {"content": [{

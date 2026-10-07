@@ -191,7 +191,7 @@ def _signal_group(process: asyncio.subprocess.Process, sig: int) -> None:
         return
     try:
         os.killpg(os.getpgid(process.pid), sig)
-    except (ProcessLookupError, PermissionError):
+    except ProcessLookupError:
         pass
 
 

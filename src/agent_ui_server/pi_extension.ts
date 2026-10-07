@@ -84,50 +84,20 @@ function envelope(kind: string, payload: Record<string, unknown>): string {
 }
 
 /**
- * Coerce the model's tool arguments into the shape PiAdapter expects.
- *
- * Tool input is validated against the schema before we see it, but it is still
- * model output: guard every field with a default rather than trusting it, the
- * same convention the Python side uses in `_normalize_questions`.
- *
- * `multiSelect` is forced false. One `select` yields one answer, so "pick all
- * that apply" cannot be expressed over this transport; the schema does not
- * offer the flag, and pinning it here keeps the adapter's event honest.
+ * Shape schema-validated arguments for PiAdapter without dropping invalid items.
+ * `multiSelect` is false because one `select` yields one answer.
  */
-function normalizeQuestions(raw: unknown): Question[] {
-	if (!Array.isArray(raw)) return [];
-
-	const questions: Question[] = [];
-	for (const entry of raw) {
-		if (typeof entry !== "object" || entry === null) continue;
-		const source = entry as Record<string, unknown>;
-
-		const options: QuestionOption[] = [];
-		if (Array.isArray(source.options)) {
-			for (const option of source.options) {
-				if (typeof option !== "object" || option === null) continue;
-				const fields = option as Record<string, unknown>;
-				const label = String(fields.label ?? "").trim();
-				// A label is the answer's identity — the adapter validates the
-				// client's pick against it — so an unlabelled option is dropped
-				// rather than turned into an unselectable empty string.
-				if (!label) continue;
-				options.push({ label, description: String(fields.description ?? "") });
-			}
-		}
-		if (options.length === 0) continue;
-
-		const question = String(source.question ?? "").trim();
-		if (!question) continue;
-
-		questions.push({
-			question,
-			header: String(source.header ?? "").trim(),
-			multiSelect: false,
-			options,
+function normalizeQuestions(raw: Omit<Question, "multiSelect">[]): Question[] {
+	return raw.map(source => {
+		const question = source.question.trim();
+		if (!question) throw new Error("Question must not be blank.");
+		const options = source.options.map(option => {
+			const label = option.label.trim();
+			if (!label) throw new Error("Option label must not be blank.");
+			return { label, description: option.description };
 		});
-	}
-	return questions;
+		return { question, header: source.header.trim(), multiSelect: false, options };
+	});
 }
 
 /**
@@ -221,18 +191,6 @@ async function requestServerTool(
 }
 
 export default function (pi: ExtensionAPI) {
-	pi.registerFlag("agent-ui-asset-tools", {
-		description: "Enable read-only shared asset link resolution (agent-ui RPC only)",
-		type: "boolean",
-		default: false,
-	});
-	let assetEnabled = false;
-	pi.registerFlag("agent-ui-session-tools", {
-		description: "Enable server-approved inter-session communication (agent-ui RPC only)",
-		type: "boolean",
-		default: false,
-	});
-	let sessionEnabled = false;
 	let registeredSessionTools: ReturnType<typeof sessionTools> = [];
 	pi.registerFlag("agent-ui-harness-description", {
 		description: "Available harnesses and default supplied by the agent-ui server",
@@ -282,41 +240,35 @@ export default function (pi: ExtensionAPI) {
 	 * prompt, turning that into a startup error.
 	 */
 	pi.on("session_start", (_event, ctx) => {
-		assetEnabled = pi.getFlag("agent-ui-asset-tools") === true;
-		if (assetEnabled) {
+		const description = pi.getFlag("agent-ui-harness-description");
+		if (typeof description !== "string" || !description) throw new Error("Missing harness description");
+		pi.registerTool({
+			name: ASSET_TOOL,
+			label: "Resolve asset link",
+			description: "Get a server-relative URL for a file or directory under a registered shared asset root.",
+			parameters: Type.Object({
+				path: Type.String({ description: "Absolute filesystem path to link." }),
+			}, { additionalProperties: false }),
+			annotations: { readOnlyHint: true, destructiveHint: false },
+			async execute(toolCallId, params, signal, _onUpdate, ctx) {
+				return requestServerTool("asset_tool", toolCallId, params, signal, ctx, ASSET_TOOL);
+			},
+		});
+		registeredSessionTools = sessionTools(description);
+		for (const tool of registeredSessionTools) {
 			pi.registerTool({
-				name: ASSET_TOOL,
-				label: "Resolve asset link",
-				description: "Get a server-relative URL for a file or directory under a registered shared asset root.",
-				parameters: Type.Object({
-					path: Type.String({ description: "Absolute filesystem path to link." }),
-				}, { additionalProperties: false }),
-				annotations: { readOnlyHint: true, destructiveHint: false },
+				...tool, label: tool.name, promptSnippet: tool.description,
 				async execute(toolCallId, params, signal, _onUpdate, ctx) {
-					return requestServerTool("asset_tool", toolCallId, params, signal, ctx, ASSET_TOOL);
+					return requestServerTool("session_tool", toolCallId, params, signal, ctx, tool.name);
 				},
 			});
-		}
-		sessionEnabled = pi.getFlag("agent-ui-session-tools") === true;
-		if (sessionEnabled) {
-			const description = pi.getFlag("agent-ui-harness-description");
-			if (typeof description !== "string" || !description) throw new Error("Missing harness description");
-			registeredSessionTools = sessionTools(description);
-			for (const tool of registeredSessionTools) {
-				pi.registerTool({
-					...tool, label: tool.name, promptSnippet: tool.description,
-					async execute(toolCallId, params, signal, _onUpdate, ctx) {
-						return requestServerTool("session_tool", toolCallId, params, signal, ctx, tool.name);
-					},
-				});
-			}
 		}
 		hostEnabled = pi.getFlag("agent-ui-host-exec") === true;
 		if (hostEnabled) registerHostTool();
 		ctx.ui.notify(envelope("ready", {
 			questionTool: QUESTION_TOOL, hostTool: hostEnabled ? HOST_TOOL : undefined,
-			assetTool: assetEnabled ? ASSET_TOOL : undefined,
-			sessionTools: sessionEnabled ? registeredSessionTools.map(tool => tool.name) : undefined,
+			assetTool: ASSET_TOOL,
+			sessionTools: registeredSessionTools.map(tool => tool.name),
 		}), "info");
 	});
 
@@ -331,10 +283,10 @@ export default function (pi: ExtensionAPI) {
 	pi.on("tool_call", async (event, ctx) => {
 		// Asking permission to ask the user a question would be circular.
 		if (event.toolName === QUESTION_TOOL) return;
-		if (assetEnabled && event.toolName === ASSET_TOOL) return;
+		if (event.toolName === ASSET_TOOL) return;
 		// Host execution has a mandatory server-side gate, not this normal tool gate.
 		if (hostEnabled && event.toolName === HOST_TOOL) return;
-		if (sessionEnabled && registeredSessionTools.some(tool => tool.name === event.toolName)) return;
+		if (registeredSessionTools.some(tool => tool.name === event.toolName)) return;
 		if (READ_ONLY_TOOLS.has(event.toolName)) return;
 
 		// No dialog transport (print/json mode) means nobody can approve, so
@@ -401,11 +353,9 @@ export default function (pi: ExtensionAPI) {
 			"Every option needs a label and a description explaining what picking it means.",
 		],
 		parameters: QUESTION_SCHEMA,
-		// Failures are raised, not returned: Pi's AgentToolResult carries only
-		// `content` and `details`, and its contract is to throw rather than
-		// encode an error in the content.
+		// Throw failures so Pi marks the result as an error.
 		async execute(toolCallId, params, signal, _onUpdate, ctx) {
-			const questions = normalizeQuestions(params?.questions);
+			const questions = normalizeQuestions(params.questions);
 			if (questions.length === 0) {
 				throw new Error("No valid questions were supplied.");
 			}

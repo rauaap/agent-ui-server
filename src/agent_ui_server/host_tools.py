@@ -109,27 +109,27 @@ async def execute_host_command(
     }
 
 
-class HostTools:
+class ServerTools:
     def __init__(self, process: Any, cwd: str,
                  approve: Callable[[dict[str, Any], str | None], Awaitable[Any]], *,
-                 host_enabled: bool = True,
+                 bypass_sandbox_enabled: bool,
                  session_call: Callable[[str, dict[str, Any], str | None],
-                                        Awaitable[dict[str, Any]]] | None = None,
-                 asset_call: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None) -> None:
+                                        Awaitable[dict[str, Any]]],
+                 asset_call: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]) -> None:
         self.process = process
         self.cwd = cwd
         self.approve = approve
-        self.host_enabled = host_enabled
+        self.bypass_sandbox_enabled = bypass_sandbox_enabled
         self.session_call = session_call
         self.asset_call = asset_call
-        self.tool_names = ({"bypass_sandbox"} if host_enabled else set()) | (
-            set(MODELS) if session_call else set()
-        ) | ({ASSET_TOOL_NAME} if asset_call else set())
+        self.tool_names = set(MODELS) | {ASSET_TOOL_NAME}
+        if bypass_sandbox_enabled:
+            self.tool_names.add("bypass_sandbox")
         self.events: asyncio.Queue[bytes | dict[str, Any]] = asyncio.Queue()
         self.calls: dict[str, asyncio.Task[None]] = {}
         self.execution_lock = asyncio.Lock()
         self.reader: asyncio.Task[None] | None = None
-        self.init_id = "host_init_" + uuid.uuid4().hex
+        self.init_id = "server_init_" + uuid.uuid4().hex
         self.initialized: asyncio.Future[None] = asyncio.get_running_loop().create_future()
 
     async def write(self, payload: dict[str, Any]) -> None:
@@ -158,14 +158,7 @@ class HostTools:
     async def _read(self) -> None:
         try:
             while line := await self.process.stdout.readline():
-                try:
-                    event = json.loads(line)
-                except (ValueError, UnicodeError):
-                    await self.events.put(line)
-                    continue
-                if not isinstance(event, dict):
-                    await self.events.put(line)
-                    continue
+                event = json.loads(line)
                 response = event.get("response", {})
                 if (event.get("type") == "control_response"
                         and response.get("request_id") == self.init_id):
@@ -174,7 +167,7 @@ class HostTools:
                             self.initialized.set_result(None)
                         else:
                             self.initialized.set_exception(RuntimeError(
-                                f"Claude host-tool initialization failed: {response}"))
+                                f"Claude server-tool initialization failed: {response}"))
                     continue
                 request = event.get("request", {})
                 request_id = event.get("request_id")
@@ -193,10 +186,12 @@ class HostTools:
                 else:
                     await self.events.put(line)
         except Exception as exc:
+            if not self.initialized.done():
+                self.initialized.set_exception(exc)
             await self.events.put({"type": "error", "message": str(exc)})
         finally:
             if not self.initialized.done():
-                self.initialized.set_exception(RuntimeError("Claude exited before host-tool initialization"))
+                self.initialized.set_exception(RuntimeError("Claude exited before server-tool initialization"))
             await self.events.put(b"")
 
     async def _respond(self, request_id: str, request: dict[str, Any]) -> None:
@@ -237,8 +232,8 @@ class HostTools:
         elif method == "ping":
             result = {}
         elif method == "tools/list":
-            result = {"tools": ([TOOL] if self.host_enabled else []) + (session_tool_schemas() if self.session_call else [])
-                      + ([ASSET_TOOL] if self.asset_call else [])}
+            result = {"tools": ([TOOL] if self.bypass_sandbox_enabled else [])
+                      + session_tool_schemas() + [ASSET_TOOL]}
         elif method == "tools/call":
             params = message.get("params")
             if (not isinstance(params, dict) or not isinstance(params.get("name"), str)
@@ -259,10 +254,8 @@ class HostTools:
                 result = await execute_host_command(
                     args, self.cwd, lambda values: self.approve(values, tool_use_id))
             elif name == ASSET_TOOL_NAME:
-                assert self.asset_call is not None
                 result = await self.asset_call(args)
             else:
-                assert self.session_call is not None
                 result = await self.session_call(name, args, tool_use_id)
         else:
             return self.error(mid, -32601, "Unknown method")
