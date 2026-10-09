@@ -339,19 +339,20 @@ sorted by provider and model, as `pi --list-models` prints it, then reversed. Cl
 an explicit ID; on discovery failure they show the error and block creation
 for that harness rather than offering a default/fallback choice.
 
-`POST /sessions` accepts `model` (string or null). Omitted/null means harness
-default. Explicit IDs must belong to
-the selected agent's catalog (`400` otherwise); discovery failure makes explicit
-selection unavailable (`503`). Session responses, including `GET /sessions`,
-include `model`. The selection is persisted and used on every turn/resume;
-resumes do not revalidate against the startup catalog. Existing sessions get
-`model: null`. `PATCH /sessions/{id}` rejects `model` with `422`: changing models
+`POST /sessions` accepts `model` (string or null). Omitted/null selects the
+first entry of the selected agent's catalog, exactly as clients do. Explicit IDs
+must belong to that catalog (`400` otherwise); unavailable discovery or an empty
+catalog prevents default selection (`503`). Session responses, including
+`GET /sessions`, include the selected `model` ID. The selection is persisted and
+used on every turn/resume; resumes do not revalidate against the startup catalog.
+`PATCH /sessions/{id}` rejects `model` with `422`: changing models
 is not supported. The agent-facing `start_session` tool accepts the same field.
 
 `POST /sessions` also accepts `reasoning_level` (string or null). Null means
 the harness picks: nothing is passed and clients show "Default". A level
-requires an explicit `model` and must be one of that model's
-`reasoning_levels` (`400` otherwise). It is passed as `--effort` to Claude Code
+must be one of the selected model's `reasoning_levels`, including when the
+model was chosen from the first catalog entry (`400` otherwise). It is passed as
+`--effort` to Claude Code
 and `--thinking` to Pi on every turn and resume. `PATCH /sessions/{id}` can set
 a different level from the same list, taking effect from the next turn, and
 broadcasts `{"type": "reasoning_level", "reasoning_level": "high"}`. Null in a

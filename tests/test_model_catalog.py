@@ -163,7 +163,24 @@ class SessionModelTests(unittest.IsolatedAsyncioTestCase):
             reopened.close()
         default = await self.main.create_session(self.main.CreateSessionRequest(name="default", project_path=self.tmp.name))
         self.assertEqual(default["agent"], "pi")
-        self.assertIsNone(default["model"])
+        self.assertEqual(default["model"], "p/m")
+
+    async def test_default_is_first_entry_and_is_persisted(self):
+        self.catalog["pi"]["models"].insert(0, {"id": "p/first", "name": "First", "reasoning_levels": []})
+        session = await self.main.create_session(self.main.CreateSessionRequest(name="first", project_path=self.tmp.name, agent="pi"))
+        self.assertEqual(session["model"], "p/first")
+        self.catalog["pi"]["models"].reverse()
+        self.assertEqual(self.db.require_session(session["id"])["model"], "p/first")
+        next_session = await self.main.create_session(self.main.CreateSessionRequest(name="next", project_path=self.tmp.name, agent="pi"))
+        self.assertEqual(next_session["model"], "p/m")
+
+    async def test_default_requires_available_nonempty_catalog(self):
+        for entry in ({"models": [], "error": None}, {"models": [], "error": "Unavailable"}):
+            self.catalog["pi"] = entry
+            with self.assertRaises(HTTPException) as caught:
+                await self.main.create_session(self.main.CreateSessionRequest(name="none", project_path=self.tmp.name, agent="pi"))
+            self.assertEqual(caught.exception.status_code, 503)
+        self.assertEqual(self.db.list_sessions(), [])
 
     async def test_validation_and_no_refresh(self):
         for agent, model, status in [("pi", "wrong", 400), ("claude-code", "opus", 503)]:
@@ -211,7 +228,9 @@ class SessionModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session["reasoning_level"], "high")
         default = await self.main.create_session(create(name="d", project_path=self.tmp.name, agent="pi", model="p/m"))
         self.assertIsNone(default["reasoning_level"])
-        for model, level in [(None, "high"), ("p/m", "max")]:
+        inferred = await self.main.create_session(create(name="inferred", project_path=self.tmp.name, agent="pi", reasoning_level="high"))
+        self.assertEqual((inferred["model"], inferred["reasoning_level"]), ("p/m", "high"))
+        for model, level in [(None, "max"), ("p/m", "max")]:
             with self.assertRaises(HTTPException) as caught:
                 await self.main.create_session(create(name="t", project_path=self.tmp.name, agent="pi", model=model, reasoning_level=level))
             self.assertEqual(caught.exception.status_code, 400)

@@ -806,6 +806,12 @@ class SessionEndpointTestCase(unittest.IsolatedAsyncioTestCase):
         self.main = main
         self._original_db = main.db
         main.db = self.database
+        catalog_patch = mock.patch.object(main, "model_catalog", {
+            agent: {"models": [{"id": "test-model", "name": "Test", "reasoning_levels": []}], "error": None}
+            for agent in main.adapters
+        })
+        catalog_patch.start()
+        self.addCleanup(catalog_patch.stop)
 
     def tearDown(self) -> None:
         self.main.db = self._original_db

@@ -74,6 +74,10 @@ class SessionOperationTests(unittest.IsolatedAsyncioTestCase):
         for patch in (
             mock.patch.object(main, "db", self.db),
             mock.patch.object(main, "adapters", {"pi": self.adapter, "claude-code": self.adapter}),
+            mock.patch.object(main, "model_catalog", {
+                agent: {"models": [{"id": f"{agent}/first", "name": "First", "reasoning_levels": []}], "error": None}
+                for agent in ("pi", "claude-code")
+            }),
             mock.patch.object(main, "running_tasks", {}),
             mock.patch.object(main, "stream_locks", defaultdict(asyncio.Lock)),
             mock.patch.object(main, "turn_lock", asyncio.Lock()),
@@ -113,6 +117,7 @@ class SessionOperationTests(unittest.IsolatedAsyncioTestCase):
         session = self.db.get_session(result["session_id"])
         self.assertTrue(session["sandbox"])
         self.assertEqual(session["agent"], "pi")
+        self.assertEqual(session["model"], "pi/first")
         followup = await main.session_tool_operation(self.sender["id"], "message_session", {
             "session_id": result["session_id"], "message": "second",
         })

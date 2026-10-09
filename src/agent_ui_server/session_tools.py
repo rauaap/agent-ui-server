@@ -29,8 +29,8 @@ class StartSession(Arguments):
     project_path: str = Field(min_length=1, description="Path of an existing registered project.")
     message: str = Field(min_length=1, description="Message to send.")
     agent: str | None = Field(default=None, description="Agent backend; omit to use the server default.")
-    model: str | None = Field(default=None, min_length=1, description="Model ID from the selected agent's models in GET /agents; omit to use the harness default.")
-    reasoning_level: str | None = Field(default=None, min_length=1, description="One of the chosen model's reasoning_levels in GET /agents; requires model. Omit to use the harness default.")
+    model: str | None = Field(default=None, min_length=1, description="Model ID from the selected agent's models in GET /agents; omit to use its first entry.")
+    reasoning_level: str | None = Field(default=None, min_length=1, description="One of the selected model's reasoning_levels in GET /agents. Omit to use the harness default level.")
     worktree_id: int | None = Field(default=None, ge=1, description="Existing worktree ID; omit to use the project directory.")
 
 

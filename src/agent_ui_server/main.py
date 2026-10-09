@@ -561,8 +561,7 @@ def catalog_model(agent: str, model_id: str) -> dict[str, Any]:
 def validate_reasoning_level(agent: str, model_id: str | None, level: str | None) -> None:
     """Accept only a level the startup catalog lists for the session's model.
 
-    Levels differ per model, so the harness-default model has none to check
-    against. Resumes pass the stored level on without revalidating.
+    Resumes pass the stored level on without revalidating.
     """
     if level is None:
         return
@@ -581,9 +580,14 @@ async def create_session_operation(payload: CreateSessionRequest) -> dict[str, A
     """
     if payload.agent not in adapters:
         raise HTTPException(status_code=400, detail="Unknown agent")
-    if payload.model is not None:
-        catalog_model(payload.agent, payload.model)
-    validate_reasoning_level(payload.agent, payload.model, payload.reasoning_level)
+    model_id = payload.model
+    if model_id is None:
+        catalog = model_catalog.get(payload.agent)
+        if catalog is None or catalog["error"] is not None or not catalog["models"]:
+            raise HTTPException(status_code=503, detail="Model discovery unavailable for this agent")
+        model_id = catalog["models"][0]["id"]
+    catalog_model(payload.agent, model_id)
+    validate_reasoning_level(payload.agent, model_id, payload.reasoning_level)
     name = payload.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="name cannot be empty")
@@ -624,7 +628,7 @@ async def create_session_operation(payload: CreateSessionRequest) -> dict[str, A
         name=name,
         project_id=project["id"],
         agent=payload.agent,
-        model=payload.model,
+        model=model_id,
         reasoning_level=payload.reasoning_level,
         worktree_id=payload.worktree_id,
         sandbox=payload.sandbox,
