@@ -58,7 +58,7 @@ def _row_to_session(row: sqlite3.Row) -> dict[str, Any]:
 
 class Database:
     def __init__(self, path: str | Path = "sessions.db") -> None:
-        self.path = Path(path)
+        self.path = Path(path) if str(path) == ":memory:" else Path(path).resolve()
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
@@ -226,6 +226,25 @@ class Database:
                 "SELECT id, project_id, path, writable FROM sandbox_paths LIMIT 0"
             )
             self._conn.execute("SELECT message_id FROM pending_inputs LIMIT 0")
+            self._conn.execute("""
+                CREATE TABLE IF NOT EXISTS images (
+                    id TEXT PRIMARY KEY,
+                    relative_path TEXT NOT NULL UNIQUE,
+                    mime_type TEXT NOT NULL,
+                    size INTEGER NOT NULL,
+                    width INTEGER NOT NULL,
+                    height INTEGER NOT NULL,
+                    uploaded_at TEXT NOT NULL
+                )
+            """)
+            self._conn.execute("""
+                CREATE TABLE IF NOT EXISTS message_images (
+                    message_id INTEGER NOT NULL REFERENCES scrollback(id) ON DELETE CASCADE,
+                    image_id TEXT NOT NULL REFERENCES images(id),
+                    position INTEGER NOT NULL,
+                    PRIMARY KEY (message_id, position)
+                )
+            """)
 
     def close(self) -> None:
         with self._lock:
@@ -915,13 +934,52 @@ class Database:
             "payload": payload,
         }
 
+    def insert_image(self, record: dict[str, Any]) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO images (id, relative_path, mime_type, size, width, height, uploaded_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (*(record[key] for key in ("id", "relative_path", "mime_type", "size", "width", "height")), utc_now()),
+            )
+
+    def get_image(self, image_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM images WHERE id = ?", (image_id,)).fetchone()
+            return dict(row) if row is not None else None
+
     def enqueue_input(
         self, session_id: int, text: str, source: dict[str, Any],
+        images: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Persist acceptance and pending membership in the same transaction."""
+        """Persist acceptance, ordered attachments and pending membership atomically."""
+        from .images import MAX_MESSAGE_IMAGES, MAX_TURN_IMAGE_BYTES, metadata
+
         with self._lock, self._conn:
-            row = self._append_scrollback(
-                session_id, "input", {"text": text, "source": source, "delivery": "queued"},
+            image_ids = images or []
+            if len(image_ids) > MAX_MESSAGE_IMAGES:
+                raise ValueError("Message exceeds 10 images")
+            records = []
+            for image_id in image_ids:
+                record = self.get_image(image_id)
+                if record is None:
+                    raise ValueError("Unknown image ID")
+                records.append(metadata(record))
+            pending_bytes = self._conn.execute(
+                "SELECT COALESCE(SUM(i.size), 0) FROM pending_inputs p "
+                "JOIN scrollback s ON s.id = p.message_id "
+                "JOIN message_images m ON m.message_id = p.message_id "
+                "JOIN images i ON i.id = m.image_id WHERE s.session_id = ?",
+                (session_id,),
+            ).fetchone()[0]
+            if pending_bytes + sum(image["size"] for image in records) > MAX_TURN_IMAGE_BYTES:
+                raise ValueError("Queued turn exceeds 20 MiB of images")
+            payload = {"text": text, "source": source, "delivery": "queued"}
+            if records:
+                payload["images"] = records
+            row = self._append_scrollback(session_id, "input", payload)
+            self._conn.executemany(
+                "INSERT INTO message_images (message_id, image_id, position) VALUES (?, ?, ?)",
+                [(row["id"], image_id, position) for position, image_id in enumerate(image_ids)],
             )
             self._conn.execute(
                 "INSERT INTO pending_inputs (message_id) VALUES (?)", (row["id"],),

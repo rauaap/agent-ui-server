@@ -132,6 +132,14 @@ def delivery_prompt(prompt: str, source: dict[str, Any]) -> str:
 
 def batch_delivery_prompt(messages: list[dict[str, Any]]) -> str:
     """Use identical sender labels for single inputs and multi-message turns."""
-    return "\n\n".join(
-        delivery_prompt(message["text"], message["source"]) for message in messages
-    )
+    parts = []
+    image_number = 1
+    for message in messages:
+        text = message["text"]
+        images = message.get("images", [])
+        if images:
+            numbers = ", ".join(f"image {number}" for number in range(image_number, image_number + len(images)))
+            text += ("\n" if text else "") + f"[Attachments: {numbers}]"
+            image_number += len(images)
+        parts.append(delivery_prompt(text, message["source"]))
+    return "\n\n".join(parts)

@@ -205,6 +205,7 @@ class AgentAdapter(abc.ABC):
         self,
         session: dict[str, Any],
         prompt: str,
+        *, images: list[dict[str, str]] | None = None,
     ) -> AsyncIterator[AgentEvent]:
         raise NotImplementedError
 
@@ -292,6 +293,7 @@ class ClaudeCodeAdapter(AgentAdapter):
         self,
         session: dict[str, Any],
         prompt: str,
+        *, images: list[dict[str, str]] | None = None,
     ) -> AsyncIterator[AgentEvent]:
         session_id = session["id"]
         existing = self.processes.get(session_id)
@@ -386,7 +388,7 @@ class ClaudeCodeAdapter(AgentAdapter):
 
         try:
             await tools.start()
-            await self._write_user_message(process, prompt)
+            await self._write_user_message(process, prompt, images=images)
             assert process.stdout is not None
             while True:
                 raw_line = await tools.events.get()
@@ -697,13 +699,20 @@ class ClaudeCodeAdapter(AgentAdapter):
         self,
         process: asyncio.subprocess.Process,
         prompt: str,
+        *, images: list[dict[str, str]] | None = None,
     ) -> None:
         if process.stdin is None:
             raise RuntimeError("Claude Code stdin is unavailable")
 
+        content: str | list[dict[str, Any]] = prompt
+        if images:
+            content = [
+                {"type": "image", "source": {"type": "base64", "media_type": image["mimeType"], "data": image["data"]}}
+                for image in images
+            ] + [{"type": "text", "text": prompt}]
         payload = {
             "type": "user",
-            "message": {"role": "user", "content": prompt},
+            "message": {"role": "user", "content": content},
         }
         process.stdin.write((json.dumps(payload) + "\n").encode("utf-8"))
         await process.stdin.drain()
@@ -907,6 +916,7 @@ class PiAdapter(AgentAdapter):
         self,
         session: dict[str, Any],
         prompt: str,
+        *, images: list[dict[str, str]] | None = None,
     ) -> AsyncIterator[AgentEvent]:
         session_id = session["id"]
         existing = self.processes.get(session_id)
@@ -1423,7 +1433,8 @@ class PiAdapter(AgentAdapter):
             # Asked before the prompt so the id is in hand even if the turn
             # fails: on a new session this is the only place we learn it.
             await write_msg({"id": "state", "type": "get_state"})
-            await write_msg({"id": "prompt", "type": "prompt", "message": prompt})
+            await write_msg({"id": "prompt", "type": "prompt", "message": prompt,
+                             **({"images": images} if images else {})})
 
             while True:
                 event = await queue.get()

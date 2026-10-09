@@ -224,13 +224,37 @@ Podman support.
 
 The provided Compose file bind-mounts:
 
-- `./sessions.db` at `/app/sessions.db`
+- `./data` at `/app/data`, with `SESSION_DB=/app/data/sessions.db`
 - `/home/wawa/projects` at `/projects`
 - `../agent-ui-desktop` at `/web` and serves it through `WEB_ROOT`
 
 Adjust those host paths for your machine. Project and worktree paths submitted
 to the API must use their paths *inside* the container, such as
 `/projects/my-project`.
+
+### Image attachments
+
+Pre-upload original binary JPEG, PNG, GIF or WebP bytes with authenticated
+`POST /images` and the matching `Content-Type`. The 201 response contains
+`id`, `mime_type`, `size`, `width` and `height`. Authenticated `GET /images/{id}`
+returns the unchanged original bytes with private immutable caching.
+
+Send ordered IDs using WebSocket `{"type":"input","text":"Describe","images":["id"]}`
+or HTTP `POST /sessions/{id}/turn` with `{"prompt":"Describe","images":["id"]}`.
+Text may be omitted for image-only messages. The selected model must expose
+`"image"` in its catalog `input` list; unknown models cannot accept attachments.
+Accepted inputs, pending queues, shipments and replay contain ordered metadata,
+never image bytes. Limits are 10 MiB per image, 10 occurrences per message and
+20 MiB of original image occurrences across a pending queued turn (including
+repeated IDs). Rejection does not delete uploaded images.
+
+Originals live in `images/` beside the configured database, with DB-relative
+file references. Persist or move the entire containing directory. Compose uses
+`./data/sessions.db` and `./data/images/`. Back up SQLite using its backup API or
+stop the server before copying its database and WAL files; images alone do not
+replace the database. Images are immutable and retained indefinitely, including
+unattached uploads and images from deleted sessions. No deletion/cleanup API is
+provided. Base64 is used only for native harness delivery.
 
 ### Configuration
 

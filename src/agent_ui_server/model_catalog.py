@@ -63,6 +63,7 @@ async def _pi_models(executable: str) -> list[dict[str, Any]]:
                     "id": f"{model['provider']}/{model['id']}",
                     "name": model["id"],
                     "reasoning_levels": levels,
+                    "input": model["input"],
                 })
             return catalog
         finally:
@@ -112,6 +113,7 @@ async def _claude_models(executable: str) -> list[dict[str, Any]]:
                         "name": model["displayName"],
                         # Absent for models without effort control, e.g. Haiku.
                         "reasoning_levels": model.get("supportedEffortLevels", []),
+                        "input": ["text", "image"],
                     })
                 return catalog
             raise RuntimeError("Claude exited before model discovery")

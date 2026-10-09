@@ -1,6 +1,8 @@
 sessions.db
 sessions.db-shm
 sessions.db-wal
+/data/
+/images/
 __pycache__/
 .pytest_cache/
 .env

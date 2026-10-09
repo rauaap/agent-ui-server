@@ -79,7 +79,7 @@ class SandboxSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(patch.stop)
         self.project = self.database.create_project(self.tmp.name, "project")
         catalog_patch = mock.patch.object(main, "model_catalog", {
-            agent: {"models": [{"id": "test-model", "name": "Test", "reasoning_levels": []}], "error": None}
+            agent: {"models": [{"id": "test-model", "name": "Test", "reasoning_levels": [], "input": ["text", "image"]}], "error": None}
             for agent in main.adapters
         })
         catalog_patch.start()

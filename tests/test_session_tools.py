@@ -75,7 +75,7 @@ class SessionOperationTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(main, "db", self.db),
             mock.patch.object(main, "adapters", {"pi": self.adapter, "claude-code": self.adapter}),
             mock.patch.object(main, "model_catalog", {
-                agent: {"models": [{"id": f"{agent}/first", "name": "First", "reasoning_levels": []}], "error": None}
+                agent: {"models": [{"id": f"{agent}/first", "name": "First", "reasoning_levels": [], "input": ["text", "image"]}], "error": None}
                 for agent in ("pi", "claude-code")
             }),
             mock.patch.object(main, "running_tasks", {}),

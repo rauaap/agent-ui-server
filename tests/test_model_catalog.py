@@ -38,8 +38,8 @@ print(json.dumps({'type':'control_response','response':{'subtype':'success','req
 sys.stdin.read()
 '''
         self.assertEqual(await self.run_script("claude-code", script), {
-            "models": [{"id": "claude-opus-5-5", "name": "Opus 5.5", "reasoning_levels": ["low", "max"]},
-                       {"id": "claude-haiku-4-5", "name": "Haiku 4.5", "reasoning_levels": []}], "error": None})
+            "models": [{"id": "claude-opus-5-5", "name": "Opus 5.5", "reasoning_levels": ["low", "max"], "input": ["text", "image"]},
+                       {"id": "claude-haiku-4-5", "name": "Haiku 4.5", "reasoning_levels": [], "input": ["text", "image"]}], "error": None})
 
     async def test_claude_missing_concrete_id_does_not_fall_back(self):
         script = '''import json,sys
@@ -53,7 +53,7 @@ sys.stdin.read()
 
     async def test_pi_rpc_metadata_only(self):
         script = '''import json,sys
-models=[{'provider':'openai','id':'old-model'},{'provider':'anthropic','id':'z-model'},{'provider':'openai','id':'new-model'}]
+models=[{'provider':'openai','id':'old-model','input':['text']},{'provider':'anthropic','id':'z-model','input':['text','image']},{'provider':'openai','id':'new-model','input':['text','image']}]
 levels={'old-model':['off','low'],'new-model':['low','high','max'],'z-model':['off']}
 selected=None
 print(json.dumps({'type':'extension_ui_request','id':'x'}),flush=True)
@@ -71,9 +71,9 @@ for line in sys.stdin:
     print(json.dumps({'type':'response','id':command['id'],'command':kind,'success':True,'data':data}),flush=True)
 '''
         self.assertEqual(await self.run_script("pi", script), {"models": [
-            {"id": "openai/old-model", "name": "old-model", "reasoning_levels": ["off", "low"]},
-            {"id": "openai/new-model", "name": "new-model", "reasoning_levels": ["low", "high", "max"]},
-            {"id": "anthropic/z-model", "name": "z-model", "reasoning_levels": ["off"]},
+            {"id": "openai/old-model", "name": "old-model", "reasoning_levels": ["off", "low"], "input": ["text"]},
+            {"id": "openai/new-model", "name": "new-model", "reasoning_levels": ["low", "high", "max"], "input": ["text", "image"]},
+            {"id": "anthropic/z-model", "name": "z-model", "reasoning_levels": ["off"], "input": ["text", "image"]},
         ], "error": None})
 
     async def test_pi_rpc_error_response(self):
@@ -131,7 +131,7 @@ class SessionModelTests(unittest.IsolatedAsyncioTestCase):
         self.project = self.db.create_project(self.tmp.name, "project")
         self.patch_db = patch.object(main, "db", self.db)
         self.patch_db.start()
-        self.catalog = {"pi": {"models": [{"id": "p/m", "name": "M", "reasoning_levels": ["low", "high"]}], "error": None}, "claude-code": {"models": [], "error": "Unavailable"}}
+        self.catalog = {"pi": {"models": [{"id": "p/m", "name": "M", "reasoning_levels": ["low", "high"], "input": ["text", "image"]}], "error": None}, "claude-code": {"models": [], "error": "Unavailable"}}
         self.patch_catalog = patch.object(main, "model_catalog", self.catalog)
         self.patch_catalog.start()
 
@@ -166,7 +166,7 @@ class SessionModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(default["model"], "p/m")
 
     async def test_default_is_first_entry_and_is_persisted(self):
-        self.catalog["pi"]["models"].insert(0, {"id": "p/first", "name": "First", "reasoning_levels": []})
+        self.catalog["pi"]["models"].insert(0, {"id": "p/first", "name": "First", "reasoning_levels": [], "input": ["text"]})
         session = await self.main.create_session(self.main.CreateSessionRequest(name="first", project_path=self.tmp.name, agent="pi"))
         self.assertEqual(session["model"], "p/first")
         self.catalog["pi"]["models"].reverse()
@@ -190,7 +190,7 @@ class SessionModelTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.main, "discover_catalog", AsyncMock()) as discover:
             expected = [
                 {"id": "pi", "name": "Pi", "default": True,
-                 "models": [{"id": "p/m", "name": "M", "reasoning_levels": ["low", "high"]}],
+                 "models": [{"id": "p/m", "name": "M", "reasoning_levels": ["low", "high"], "input": ["text", "image"]}],
                  "models_error": None},
                 {"id": "claude-code", "name": "Claude Code", "default": False,
                  "models": [], "models_error": "Unavailable"},
@@ -204,7 +204,7 @@ class SessionModelTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_empty_catalog_and_model_order(self):
         self.catalog["claude-code"] = {"models": [], "error": None}
-        self.catalog["pi"]["models"].append({"id": "p/second", "name": "Second", "reasoning_levels": []})
+        self.catalog["pi"]["models"].append({"id": "p/second", "name": "Second", "reasoning_levels": [], "input": ["text"]})
         agents = await self.main.list_agents()
         self.assertEqual(agents[1]["models"], [])
         self.assertIsNone(agents[1]["models_error"])
@@ -220,7 +220,7 @@ class SessionModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(agent["required"]), {"id", "name", "default", "models", "models_error"})
         self.assertEqual(agent["properties"]["models"]["items"]["$ref"], "#/components/schemas/CatalogModel")
         model = schema["components"]["schemas"]["CatalogModel"]
-        self.assertEqual(set(model["required"]), {"id", "name", "reasoning_levels"})
+        self.assertEqual(set(model["required"]), {"id", "name", "reasoning_levels", "input"})
 
     async def test_reasoning_level_create_validate_and_update(self):
         create = self.main.CreateSessionRequest
@@ -249,6 +249,11 @@ class SessionModelTests(unittest.IsolatedAsyncioTestCase):
         finally:
             reopened.close()
         self.assertEqual(validate_session_arguments("start_session", {"name": "n", "project_path": "/p", "message": "hi", "model": "p/m", "reasoning_level": "low"})["reasoning_level"], "low")
+
+    async def test_catalog_serialization_preserves_input(self):
+        agents = await self.main.list_agents()
+        serialized = [self.main.CatalogAgent.model_validate(agent).model_dump() for agent in agents]
+        self.assertEqual(serialized[0]["models"][0]["input"], ["text", "image"])
 
     async def test_startup_discovers_once(self):
         with patch.object(self.main, "load_auth_token"), patch.object(self.main, "discover_catalog", AsyncMock(return_value=self.catalog)) as discover:

@@ -12,7 +12,8 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, StrictStr, field_validator, model_validator
+from starlette.responses import FileResponse
 from starlette.routing import Match, Mount
 from starlette.types import Scope
 
@@ -22,6 +23,7 @@ from .actions import auto_approval_setting
 from .agent import AgentAdapter
 from .agent_registry import adapter_types
 from .db import Database
+from .images import FORMATS, ImageMetadata, native_images, upload_image
 from .file_tree import (
     FileTreeError,
     file_tree_manager,
@@ -263,11 +265,40 @@ class UpdateSessionRequest(BaseModel):
 
 
 class TurnRequest(BaseModel):
-    prompt: str = Field(min_length=1)
+    prompt: StrictStr = ""
+    images: list[StrictStr] = Field(default_factory=list, strict=True)
 
 
 class BashRequest(BaseModel):
     command: str = Field(min_length=1)
+
+
+@app.post(
+    "/images", status_code=201, response_model=ImageMetadata,
+    openapi_extra={"requestBody": {"required": True, "content": {
+        mime: {"schema": {"type": "string", "format": "binary"}} for mime in FORMATS
+    }}},
+)
+async def create_image(request: Request) -> dict[str, Any]:
+    return await upload_image(request, db)
+
+
+@app.get(
+    "/images/{image_id}", response_class=FileResponse,
+    responses={200: {"content": {
+        mime: {"schema": {"type": "string", "format": "binary"}} for mime in FORMATS
+    }}},
+)
+async def get_image(image_id: str) -> FileResponse:
+    record = db.get_image(image_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Unknown image")
+    return FileResponse(
+        db.path.resolve().parent / record["relative_path"],
+        media_type=record["mime_type"],
+        headers={"Content-Length": str(record["size"]),
+                 "Cache-Control": "private, max-age=31536000, immutable"},
+    )
 
 
 @app.on_event("startup")
@@ -297,6 +328,7 @@ async def shutdown() -> None:
 class CatalogModel(BaseModel):
     id: str
     name: str
+    input: list[str]
     # The harness's own vocabulary; empty when the model offers no choice.
     reasoning_levels: list[str]
 
@@ -1003,7 +1035,7 @@ adapters: dict[str, AgentAdapter] = {
 
 @app.post("/sessions/{session_id}/turn", status_code=202)
 async def start_turn(session_id: int, payload: TurnRequest) -> dict[str, str | int]:
-    message_id = await begin_turn(session_id, payload.prompt)
+    message_id = await begin_turn(session_id, payload.prompt, images=payload.images)
     return {"status": "accepted", "message_id": message_id}
 
 
@@ -1192,17 +1224,12 @@ async def receive_subscriber(
             message_type = message.get("type")
 
             if message_type == "input":
-                prompt = str(message.get("text", "")).strip()
-                if not prompt:
-                    if not await enqueue_local(
-                        session_id,
-                        subscriber,
-                        {"type": "error", "message": "Prompt cannot be empty"},
-                    ):
-                        return
-                    continue
                 try:
-                    await begin_turn(session_id, prompt)
+                    text = message.get("text", "")
+                    prompt = text.strip() if isinstance(text, str) else text
+                    if "images" in message and message["images"] is None:
+                        raise HTTPException(status_code=400, detail="Images must be a list of string IDs")
+                    await begin_turn(session_id, prompt, images=message.get("images", []))
                 except HTTPException as exc:
                     if not await enqueue_local(
                         session_id,
@@ -1278,10 +1305,17 @@ async def receive_subscriber(
 
 async def begin_turn(
     session_id: int, prompt: str, *, sender_session_id: int | None = None,
+    images: list[str] | None = None,
 ) -> int:
     source = ({"type": "user"} if sender_session_id is None else
               {"type": "agent", "session_id": sender_session_id})
-    if not prompt.strip():
+    if not isinstance(prompt, str):
+        raise HTTPException(status_code=400, detail="Prompt must be a string")
+    if images is None:
+        images = []
+    if not isinstance(images, list) or any(not isinstance(image, str) for image in images):
+        raise HTTPException(status_code=400, detail="Images must be a list of string IDs")
+    if not prompt.strip() and not images:
         raise HTTPException(status_code=400, detail="Prompt cannot be empty")
     async with turn_lock:
         session = require_session_or_404(session_id)
@@ -1291,11 +1325,19 @@ async def begin_turn(
                 status_code=409,
                 detail=f"Agent is no longer available: {session['agent']}",
             )
-        row = await commit_stream(
-            session_id,
-            lambda: db.enqueue_input(session_id, prompt, source),
-            lambda accepted: [frame_for_scrollback(accepted)],
-        )
+        if images:
+            if session["model"] is None:
+                raise HTTPException(status_code=400, detail="Session model is unknown")
+            if "image" not in catalog_model(session["agent"], session["model"])["input"]:
+                raise HTTPException(status_code=400, detail="Model does not support images")
+        try:
+            row = await commit_stream(
+                session_id,
+                lambda: db.enqueue_input(session_id, prompt, source, images),
+                lambda accepted: [frame_for_scrollback(accepted)],
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         existing_task = running_tasks.get(session_id)
         if session["status"] == "idle" and not (
             existing_task and not existing_task.done()
@@ -1316,12 +1358,14 @@ async def ship_queued_turn(session_id: int) -> bool:
     )
     if row is None:
         return False
-    prompt = batch_delivery_prompt(row["payload"]["messages"])
-    running_tasks[session_id] = asyncio.create_task(run_turn(session_id, prompt))
+    messages = row["payload"]["messages"]
+    prompt = batch_delivery_prompt(messages)
+    images = [image for message in messages for image in message.get("images", [])]
+    running_tasks[session_id] = asyncio.create_task(run_turn(session_id, prompt, images=images))
     return True
 
 
-async def run_turn(session_id: int, prompt: str) -> None:
+async def run_turn(session_id: int, prompt: str, images: list[dict[str, Any]] | None = None) -> None:
     session = db.require_session(session_id)
     adapter = adapters[session["agent"]]
 
@@ -1337,7 +1381,12 @@ async def run_turn(session_id: int, prompt: str) -> None:
             project = db.get_project_by_id(session["project_id"])
             if project is not None:
                 session["git_repository"] = project["path"]
-        async for event in adapter.start_turn(session, prompt):
+        image_content = await asyncio.to_thread(native_images, db, images) if images else []
+        turn = (
+            adapter.start_turn(session, prompt, images=image_content)
+            if image_content else adapter.start_turn(session, prompt)
+        )
+        async for event in turn:
             event_type = event.get("type")
             failed = failed or event_type == "error"
 
