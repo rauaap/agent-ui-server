@@ -1,4 +1,4 @@
-"""Validation of server-wide sandbox TCP destination exceptions."""
+"""Validation of server and project sandbox TCP destination exceptions."""
 from __future__ import annotations
 
 import ipaddress

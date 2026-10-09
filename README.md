@@ -269,7 +269,7 @@ FastAPI also exposes generated OpenAPI documentation at `/docs`.
 | `PATCH` | `/sandbox-paths` | Replace server-wide sandbox path defaults |
 | `GET` | `/projects` | List projects and live/archive session aggregates |
 | `POST` | `/projects` | Register/create a project directory |
-| `PATCH` | `/projects` | Update project sandbox paths or archive/unarchive with session cascade |
+| `PATCH` | `/projects` | Update project sandbox paths/network exceptions or archive/unarchive with session cascade |
 | `DELETE` | `/projects` | Forget a project, sessions, and managed worktrees |
 | `GET` | `/worktrees` | List worktrees; optionally filter by `project_path` |
 | `POST` | `/worktrees` | Create a worktree on a new branch from project HEAD |
@@ -678,11 +678,33 @@ also load the real extension and exercise its callback without making model call
 
 Entries are exact unicast IPv4 addresses and TCP ports (1–65535). DNS names,
 CIDRs, loopback, reserved/multicast addresses, and the sandbox DNS proxy address
-are not accepted. Duplicate pairs are collapsed. An empty list removes all
-exceptions. See [client handoff](docs/sandbox_network_client_handoff.md).
+are not accepted. Duplicate pairs are collapsed. An empty server list removes
+server exceptions. See [client handoff](docs/sandbox_network_client_handoff.md).
 
-The setting is persisted and applies to every new sandbox launch, including
-resumed sessions, in both agents. Running turns retain their existing rules.
+Projects expose their own `sandbox_network_allowlist` in project responses.
+Set it on `POST /projects` or replace it with `PATCH /projects`:
+
+```json
+{
+  "path": "/path/to/project",
+  "sandbox_network_allowlist": [{"ip": "192.168.1.10", "port": 22}]
+}
+```
+
+Omission leaves an existing project's list unchanged; `[]` clears its entries
+and returns it to server inheritance. Effective exceptions are the union of
+server and project lists, deduplicated by IP/port. Projects cannot remove an
+inherited exception. Project responses contain only the project's own entries,
+not the effective union. There is no per-session list.
+
+Entries persist as individual rows in `sandbox_network_allowlist`, with an
+integer `id` primary key and nullable `project_id` foreign key (`NULL` = server).
+IP/port pairs are unique within each scope. Project deletion cascades to its
+entries. Existing databases must use this schema; no automatic migration runs.
+
+Settings apply to every new sandboxed turn, including resumed sessions and
+worktree sessions of the project, in both agents. Updates are allowed during
+turns; running turns retain their existing rules.
 Private networks and host addresses remain blocked by default. Exceptions use
 host routes plus nftables output filtering **inside the pasta namespace**, so
 only the listed TCP ports are exposed on exception IPs, not other services on

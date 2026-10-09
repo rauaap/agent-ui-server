@@ -1,4 +1,4 @@
-"""Server-wide network settings and fail-closed namespace rules."""
+"""Server/project network settings and fail-closed namespace rules."""
 from pathlib import Path
 import tempfile
 import subprocess
@@ -107,8 +107,12 @@ class NetworkAPITests(unittest.IsolatedAsyncioTestCase):
         first = [{"ip": "100.64.0.10", "port": 443}]
         second = [{"ip": "100.64.0.10", "port": 22}]
         self.database.set_sandbox_network_allowlist(first)
-        project = self.database.create_project(self.temp.name, "fixture")
-        session = self.database.create_session("fixture", project["id"], agent="pi")
+        project_entries = [{"ip": "192.168.1.10", "port": 80}]
+        project = self.database.create_project(
+            self.temp.name, "fixture", sandbox_network_allowlist=project_entries,
+        )
+        worktree = self.database.create_worktree(project["id"], self.temp.name + "/worktree", "fixture")
+        session = self.database.create_session("fixture", project["id"], agent="pi", worktree_id=worktree["id"])
         started, release = asyncio.Event(), asyncio.Event()
         snapshots = []
 
@@ -125,12 +129,87 @@ class NetworkAPITests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(started.wait(), 2)
             try:
                 self.database.set_sandbox_network_allowlist(second)
-                self.assertEqual(snapshots, [first])
+                self.database.set_sandbox_network_allowlist([], project["id"])
+                self.assertEqual(snapshots, [first + project_entries])
             finally:
                 release.set()
                 await task
             await self.main.run_turn(session["id"], "second")
-        self.assertEqual(snapshots, [first, second])
+        self.assertEqual(snapshots, [first + project_entries, second])
+
+    async def test_project_scope_create_update_inheritance_and_persistence(self):
+        server = [{"ip": "100.64.0.10", "port": 443}]
+        extra = [{"ip": "192.168.1.10", "port": 22}]
+        self.database.set_sandbox_network_allowlist(server)
+        path = str(Path(self.temp.name) / "project")
+        project = await self.main.create_project(self.main.CreateProjectRequest(
+            path=path, sandbox_network_allowlist=server + extra + extra,
+        ))
+        self.assertEqual(project["sandbox_network_allowlist"], server + extra)
+        repeated = await self.main.create_project(self.main.CreateProjectRequest(path=path))
+        self.assertEqual(repeated["sandbox_network_allowlist"], server + extra)
+        updated = await self.main.update_project(self.main.UpdateProjectRequest(path=path))
+        self.assertEqual(updated["sandbox_network_allowlist"], server + extra)
+        self.assertEqual(self.database.effective_sandbox_network_allowlist(project["id"]), server + extra)
+        other = self.database.create_project(str(Path(self.temp.name) / "other"), "other")
+        self.assertEqual(other["sandbox_network_allowlist"], [])
+        self.assertEqual(self.database.effective_sandbox_network_allowlist(other["id"]), server)
+        reopened = Database(self.database.path)
+        try:
+            self.assertEqual(reopened.get_project_by_id(project["id"])["sandbox_network_allowlist"], server + extra)
+        finally:
+            reopened.close()
+        self.database.set_sandbox_network_allowlist([])
+        self.assertEqual(self.database.get_sandbox_network_allowlist(project["id"]), server + extra)
+        self.database.set_sandbox_network_allowlist(server)
+        updated = await self.main.update_project(self.main.UpdateProjectRequest(
+            path=path, sandbox_network_allowlist=extra,
+        ))
+        self.assertEqual(updated["sandbox_network_allowlist"], extra)
+        updated = await self.main.update_project(self.main.UpdateProjectRequest(
+            path=path, sandbox_network_allowlist=[],
+        ))
+        self.assertEqual(updated["sandbox_network_allowlist"], [])
+        self.assertEqual(self.database.effective_sandbox_network_allowlist(project["id"]), server)
+
+    async def test_invalid_project_updates_do_not_change_settings_or_archive_state(self):
+        project = self.database.create_project(self.temp.name, "fixture")
+        entries = [{"ip": "100.64.0.10", "port": 443}]
+        self.database.set_sandbox_network_allowlist(entries, project["id"])
+        with self.assertRaises(HTTPException) as error:
+            await self.main.update_project(self.main.UpdateProjectRequest(
+                path=self.temp.name, archived=True,
+                sandbox_network_allowlist=[{"ip": "localhost", "port": 443}],
+            ))
+        self.assertEqual(error.exception.status_code, 400)
+        self.assertEqual(self.database.get_sandbox_network_allowlist(project["id"]), entries)
+        self.assertIsNone(self.database.get_project_by_id(project["id"])["archived_at"])
+        with self.assertRaises(ValueError):
+            self.database.set_sandbox_network_allowlist([{"ip": "localhost", "port": 443}], project["id"])
+        self.assertEqual(self.database.get_sandbox_network_allowlist(project["id"]), entries)
+        invalid_path = str(Path(self.temp.name) / "invalid")
+        with self.assertRaises(HTTPException):
+            await self.main.create_project(self.main.CreateProjectRequest(
+                path=invalid_path, sandbox_network_allowlist=[{"ip": "127.0.0.1", "port": 443}],
+            ))
+        self.assertFalse(Path(invalid_path).exists())
+
+    async def test_scope_uniqueness_constraints_and_project_deletion(self):
+        import sqlite3
+        project = self.database.create_project(self.temp.name, "fixture")
+        entries = [{"ip": "100.64.0.10", "port": 443}]
+        self.database.set_sandbox_network_allowlist(entries)
+        self.database.set_sandbox_network_allowlist(entries, project["id"])
+        with sqlite3.connect(self.database.path) as conn:
+            for scope in (None, project["id"]):
+                with self.assertRaises(sqlite3.IntegrityError):
+                    conn.execute(
+                        "INSERT INTO sandbox_network_allowlist(project_id, ip, port) VALUES (?, ?, ?)",
+                        (scope, "100.64.0.10", 443),
+                    )
+        self.database.delete_project(self.temp.name)
+        self.assertEqual(self.database.get_sandbox_network_allowlist(project["id"]), [])
+        self.assertEqual(self.database.get_sandbox_network_allowlist(), entries)
 
     async def test_persistence_replace_clear_and_invalid_update(self):
         self.assertEqual(await self.main.get_sandbox_network(), {"sandbox_network_allowlist": []})

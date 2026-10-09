@@ -183,11 +183,20 @@ class Database:
             """)
             self._conn.execute("""
                 CREATE TABLE IF NOT EXISTS sandbox_network_allowlist (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
                     ip TEXT NOT NULL,
-                    port INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
-                    PRIMARY KEY (ip, port)
+                    port INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535)
                 )
             """)
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS sandbox_network_server_destination "
+                "ON sandbox_network_allowlist(ip, port) WHERE project_id IS NULL"
+            )
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS sandbox_network_project_destination "
+                "ON sandbox_network_allowlist(project_id, ip, port) WHERE project_id IS NOT NULL"
+            )
             self._conn.execute("""
                 CREATE TABLE IF NOT EXISTS sandbox_paths (
                     id INTEGER PRIMARY KEY,
@@ -212,7 +221,7 @@ class Database:
             self._conn.execute(
                 "SELECT asset_root, path, project_id FROM shared_asset_roots LIMIT 0"
             )
-            self._conn.execute("SELECT ip, port FROM sandbox_network_allowlist LIMIT 0")
+            self._conn.execute("SELECT id, project_id, ip, port FROM sandbox_network_allowlist LIMIT 0")
             self._conn.execute(
                 "SELECT id, project_id, path, writable FROM sandbox_paths LIMIT 0"
             )
@@ -360,22 +369,46 @@ class Database:
         ORDER BY last_active_at DESC, p.path ASC
     """
 
-    def get_sandbox_network_allowlist(self) -> list[dict[str, Any]]:
+    def get_sandbox_network_allowlist(
+        self, project_id: int | None = None,
+    ) -> list[dict[str, Any]]:
         with self._lock:
             return [dict(row) for row in self._conn.execute(
-                "SELECT ip, port FROM sandbox_network_allowlist ORDER BY rowid"
+                "SELECT ip, port FROM sandbox_network_allowlist "
+                "WHERE project_id IS ? ORDER BY id", (project_id,),
             )]
 
-    def set_sandbox_network_allowlist(self, entries: list[dict[str, Any]]) -> None:
+    def _insert_sandbox_network_allowlist(
+        self, entries: list[dict[str, Any]], project_id: int | None,
+    ) -> None:
+        """Caller holds the lock and transaction."""
         from .sandbox_network import validate_network_allowlist
 
-        entries = validate_network_allowlist(entries)
+        self._conn.executemany(
+            "INSERT INTO sandbox_network_allowlist (project_id, ip, port) VALUES (?, ?, ?)",
+            [(project_id, entry["ip"], entry["port"])
+             for entry in validate_network_allowlist(entries)],
+        )
+
+    def set_sandbox_network_allowlist(
+        self, entries: list[dict[str, Any]], project_id: int | None = None,
+    ) -> None:
         with self._lock, self._conn:
-            self._conn.execute("DELETE FROM sandbox_network_allowlist")
-            self._conn.executemany(
-                "INSERT INTO sandbox_network_allowlist (ip, port) VALUES (?, ?)",
-                [(entry["ip"], entry["port"]) for entry in entries],
+            self._conn.execute(
+                "DELETE FROM sandbox_network_allowlist WHERE project_id IS ?", (project_id,),
             )
+            self._insert_sandbox_network_allowlist(entries, project_id)
+
+    def effective_sandbox_network_allowlist(self, project_id: int) -> list[dict[str, Any]]:
+        """Read and deduplicate both scopes in one SQLite snapshot, server first."""
+        with self._lock:
+            return [dict(row) for row in self._conn.execute(
+                "SELECT ip, port FROM sandbox_network_allowlist "
+                "WHERE project_id IS NULL OR project_id = ? "
+                "GROUP BY ip, port ORDER BY MIN(project_id IS NOT NULL), "
+                "MIN(CASE WHEN project_id IS NULL THEN id END), MIN(id)",
+                (project_id,),
+            )]
 
     def get_sandbox_paths(self, project_id: int | None = None) -> list[dict[str, Any]]:
         with self._lock:
@@ -417,6 +450,7 @@ class Database:
     def _project_dict(self, row: sqlite3.Row) -> dict[str, Any]:
         result = dict(row)
         result["sandbox_paths"] = self.get_sandbox_paths(row["id"])
+        result["sandbox_network_allowlist"] = self.get_sandbox_network_allowlist(row["id"])
         return result
 
     def list_projects(self) -> list[dict[str, Any]]:
@@ -503,6 +537,7 @@ class Database:
 
     def create_project(
         self, path: str, name: str, sandbox_paths: list[dict[str, Any]] | None = None,
+        sandbox_network_allowlist: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Register a project. Creating one that exists is a no-op, not an error.
 
@@ -516,6 +551,7 @@ class Database:
             )
             if cursor.rowcount:
                 self._insert_sandbox_paths(sandbox_paths or [], cursor.lastrowid)
+                self._insert_sandbox_network_allowlist(sandbox_network_allowlist or [], cursor.lastrowid)
         project = self.get_project(path)
         if project is None:
             raise KeyError(f"Unknown project: {path}")

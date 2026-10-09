@@ -137,6 +137,15 @@ class UpdateSandboxNetworkRequest(BaseModel):
     sandbox_network_allowlist: list[SandboxNetworkDestinationRequest]
 
 
+def checked_sandbox_network_allowlist(
+    entries: list[SandboxNetworkDestinationRequest],
+) -> list[dict[str, Any]]:
+    try:
+        return validate_network_allowlist([entry.model_dump() for entry in entries])
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 class SandboxPathRequest(BaseModel):
     path: str = Field(min_length=1)
     write: bool = False
@@ -165,6 +174,7 @@ class CreateProjectRequest(BaseModel):
     path: str = Field(min_length=1)
     name: str | None = Field(default=None, max_length=120)
     sandbox_paths: list[SandboxPathRequest] = Field(default_factory=list)
+    sandbox_network_allowlist: list[SandboxNetworkDestinationRequest] = Field(default_factory=list)
 
     @field_validator("name")
     @classmethod
@@ -180,11 +190,12 @@ class DeleteProjectRequest(BaseModel):
 
 
 class UpdateProjectRequest(BaseModel):
-    """Update paths or archive state, addressing the project by its path."""
+    """Update sandbox settings or archive state, addressing the project by its path."""
 
     path: str = Field(min_length=1)
     archived: bool | None = None
     sandbox_paths: list[SandboxPathRequest] | None = None
+    sandbox_network_allowlist: list[SandboxNetworkDestinationRequest] | None = None
 
 
 class CreateWorktreeRequest(BaseModel):
@@ -336,12 +347,7 @@ async def get_sandbox_network() -> dict[str, Any]:
 
 @app.patch("/sandbox-network")
 async def update_sandbox_network(payload: UpdateSandboxNetworkRequest) -> dict[str, Any]:
-    try:
-        entries = validate_network_allowlist([
-            entry.model_dump() for entry in payload.sandbox_network_allowlist
-        ])
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    entries = checked_sandbox_network_allowlist(payload.sandbox_network_allowlist)
     db.set_sandbox_network_allowlist(entries)
     return {"sandbox_network_allowlist": db.get_sandbox_network_allowlist()}
 
@@ -372,6 +378,7 @@ async def create_project(payload: CreateProjectRequest) -> dict[str, Any]:
     session exists. Creating one that already exists is a no-op.
     """
     paths = checked_sandbox_paths(payload.sandbox_paths)
+    network = checked_sandbox_network_allowlist(payload.sandbox_network_allowlist)
     path = normalize_project_path(payload.path)
     target = Path(path)
 
@@ -396,14 +403,16 @@ async def create_project(payload: CreateProjectRequest) -> dict[str, Any]:
         )
 
     name = payload.name or PurePosixPath(path).name
-    return with_existence(db.create_project(path=path, name=name, sandbox_paths=paths))
+    return with_existence(db.create_project(
+        path=path, name=name, sandbox_paths=paths, sandbox_network_allowlist=network,
+    ))
 
 
 @app.patch("/projects")
 async def update_project(payload: UpdateProjectRequest) -> dict[str, Any]:
-    """Update sandbox paths or archive/unarchive a project and its sessions.
+    """Update sandbox settings or archive/unarchive a project and its sessions.
 
-    Sandbox paths affect future turns, without changing running sessions.
+    Sandbox settings affect future turns, without changing running sessions.
 
     Archiving cascades: an archived project must not leave sessions showing in
     the main list, so every live session under it is archived too. A session
@@ -423,6 +432,10 @@ async def update_project(payload: UpdateProjectRequest) -> dict[str, Any]:
     paths = (
         checked_sandbox_paths(payload.sandbox_paths)
         if payload.sandbox_paths is not None else None
+    )
+    network = (
+        checked_sandbox_network_allowlist(payload.sandbox_network_allowlist)
+        if payload.sandbox_network_allowlist is not None else None
     )
     sessions = db.list_sessions_for_project(project["id"])
     affected = 0
@@ -458,6 +471,8 @@ async def update_project(payload: UpdateProjectRequest) -> dict[str, Any]:
 
     if paths is not None:
         db.set_sandbox_paths(paths, project["id"])
+    if network is not None:
+        db.set_sandbox_network_allowlist(network, project["id"])
 
     # The clients holding one of these sessions open are the reason this moved
     # server-side; tell them rather than making them refetch to find out. Only
@@ -1312,7 +1327,7 @@ async def run_turn(session_id: int, prompt: str) -> None:
         if session.get("sandbox", True):
             defaults, project_paths = db.sandbox_paths_snapshot(session["project_id"])
             session["sandbox_paths"] = merge_paths(defaults, project_paths)
-            session["sandbox_network_allowlist"] = db.get_sandbox_network_allowlist()
+            session["sandbox_network_allowlist"] = db.effective_sandbox_network_allowlist(session["project_id"])
             # The worktree's gitfile is agent-writable, so the repository its
             # metadata may come from is taken from the database instead.
             project = db.get_project_by_id(session["project_id"])
