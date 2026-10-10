@@ -299,38 +299,45 @@ class ProjectTableTests(unittest.TestCase):
             self.assertIsNone(database.get_project_by_id("missing"))
             database.close()
 
-    def test_projects_sorted_by_recency_with_never_used_last(self) -> None:
+    def test_projects_sorted_by_later_of_creation_and_session_activity(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             database = Database(Path(tmpdir) / "sessions.db")
             projects = {}
-            for path in ("/p/older", "/p/newer", "/p/b-idle", "/p/a-idle"):
-                projects[path] = database.create_project(
-                    path, PurePosixPath(path).name
-                )
+            with patch.object(db_module, "utc_now", return_value="2026-07-25T10:00:00Z"):
+                for path in ("/p/older", "/p/newer", "/p/b-idle", "/p/a-idle"):
+                    projects[path] = database.create_project(
+                        path, PurePosixPath(path).name
+                    )
 
-            # Pin the clock so the two active projects differ by more than the
-            # one-second resolution of the stored timestamps.
-            stamps = iter(["2026-07-27T10:00:00Z", "2026-07-28T10:00:00Z"])
-            original = db_module.utc_now
-            db_module.utc_now = lambda: next(stamps)
-            try:
-                database.create_session(
-                    name="a",
-                    project_id=projects["/p/older"]["id"],
-                    agent="claude-code",
-                )
-                database.create_session(
-                    name="b",
-                    project_id=projects["/p/newer"]["id"],
-                    agent="claude-code",
-                )
-            finally:
-                db_module.utc_now = original
+            for path, stamp in (
+                ("/p/older", "2026-07-27T10:00:00Z"),
+                ("/p/newer", "2026-07-28T10:00:00Z"),
+            ):
+                with patch.object(db_module, "utc_now", return_value=stamp):
+                    database.create_session(
+                        name="session", project_id=projects[path]["id"], agent="claude-code",
+                    )
 
+            with patch.object(db_module, "utc_now", return_value="2026-07-29T10:00:00Z"):
+                recent = database.create_project("/p/recent-created", "recent-created")
+            # Even a session timestamp earlier than creation must not push a
+            # recently created project down the list.
+            with patch.object(db_module, "utc_now", return_value="2026-07-26T10:00:00Z"):
+                database.create_session(
+                    name="session", project_id=recent["id"], agent="claude-code",
+                )
+            with patch.object(db_module, "utc_now", return_value="2026-07-30T10:00:00Z"):
+                database.create_project("/p/new-empty", "new-empty")
+
+            listed = database.list_projects()
             self.assertEqual(
-                [p["path"] for p in database.list_projects()],
-                ["/p/newer", "/p/older", "/p/a-idle", "/p/b-idle"],
+                [p["path"] for p in listed],
+                ["/p/new-empty", "/p/recent-created", "/p/newer", "/p/older",
+                 "/p/a-idle", "/p/b-idle"],
             )
+            # Sorting does not redefine the activity field as creation time.
+            self.assertIsNone(listed[0]["last_active_at"])
+            self.assertEqual(listed[1]["last_active_at"], "2026-07-26T10:00:00Z")
             database.close()
 
     def test_projects_survive_reopening_the_database(self) -> None:

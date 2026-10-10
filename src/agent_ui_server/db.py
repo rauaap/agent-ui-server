@@ -385,7 +385,11 @@ class Database:
         LEFT JOIN sessions s ON s.project_id = p.id
         {where}
         GROUP BY p.id, p.path, p.name, p.archived_at
-        ORDER BY last_active_at DESC, p.path ASC
+        -- Creation counts toward recency even before the first session exists.
+        ORDER BY MAX(p.created_at, COALESCE(
+            MAX(s.last_active_at) FILTER (WHERE s.archived_at IS NULL),
+            p.created_at
+        )) DESC, p.path ASC
     """
 
     def get_sandbox_network_allowlist(
