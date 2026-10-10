@@ -886,15 +886,6 @@ class Database:
             ).rowcount
         return marked if restore_sessions else 0
 
-    def touch_session(self, session_id: int) -> None:
-        with self._lock, self._conn:
-            cursor = self._conn.execute(
-                "UPDATE sessions SET last_active_at = ? WHERE id = ?",
-                (utc_now(), session_id),
-            )
-        if cursor.rowcount == 0:
-            raise KeyError(f"Unknown session: {session_id}")
-
     def set_agent_session_id(self, session_id: int, agent_session_id: str) -> None:
         with self._lock, self._conn:
             cursor = self._conn.execute(
@@ -925,6 +916,10 @@ class Database:
             VALUES (?, ?, ?, ?)
             """,
             (session_id, ts, event_type, encoded),
+        )
+        self._conn.execute(
+            "UPDATE sessions SET last_active_at = ? WHERE id = ?",
+            (ts, session_id),
         )
         return {
             "id": cursor.lastrowid,
@@ -984,10 +979,6 @@ class Database:
             self._conn.execute(
                 "INSERT INTO pending_inputs (message_id) VALUES (?)", (row["id"],),
             )
-            self._conn.execute(
-                "UPDATE sessions SET last_active_at = ? WHERE id = ?",
-                (row["ts"], session_id),
-            )
             return row
 
     def pending_inputs(self, session_id: int) -> list[dict[str, Any]]:
@@ -1023,8 +1014,8 @@ class Database:
                 [(message["message_id"],) for message in messages],
             )
             self._conn.execute(
-                "UPDATE sessions SET status = 'running', last_active_at = ? WHERE id = ?",
-                (row["ts"], session_id),
+                "UPDATE sessions SET status = 'running' WHERE id = ?",
+                (session_id,),
             )
             return row
 

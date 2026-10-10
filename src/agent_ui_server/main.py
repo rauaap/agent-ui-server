@@ -1499,7 +1499,6 @@ async def begin_bash(session_id: int, command: str) -> int:
 
     def start() -> int:
         row = db.append_scrollback(session_id, "bash_input", {"command": command})
-        db.touch_session(session_id)
         return row["id"]
 
     message_id = await commit_stream(

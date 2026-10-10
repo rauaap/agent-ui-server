@@ -97,6 +97,43 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(database.require_session(session["id"])["status"], "idle")
             database.close()
 
+    def test_last_active_at_tracks_creation_and_persisted_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Database(Path(tmpdir) / "sessions.db")
+            with patch.object(db_module, "utc_now", return_value="2026-01-01T00:00:00Z"):
+                session = make_session(database, "/projects/demo")
+            session_id = session["id"]
+            self.assertEqual(session["last_active_at"], session["created_at"])
+
+            with patch.object(db_module, "utc_now", return_value="2026-01-01T00:00:01Z"):
+                event = database.enqueue_input(session_id, "hello", {"type": "user"})
+            self.assertEqual(database.require_session(session_id)["last_active_at"], event["ts"])
+
+            with patch.object(db_module, "utc_now", return_value="2026-01-01T00:00:02Z"):
+                event = database.ship_inputs(session_id)
+            self.assertIsNotNone(event)
+            self.assertEqual(database.require_session(session_id)["last_active_at"], event["ts"])
+
+            for index, event_type in enumerate(
+                ("output", "tool_use", "approval_request", "approval_response",
+                 "question", "question_response", "error", "bash_input", "bash_output"),
+                start=3,
+            ):
+                timestamp = f"2026-01-01T00:00:{index:02d}Z"
+                with patch.object(db_module, "utc_now", return_value=timestamp):
+                    event = database.append_scrollback(session_id, event_type, {})
+                self.assertEqual(event["ts"], timestamp)
+                self.assertEqual(database.require_session(session_id)["last_active_at"], timestamp)
+
+            with patch.object(db_module, "utc_now") as clock:
+                database.require_session(session_id)
+                database.recent_scrollback(session_id)
+                database.scrollback_after(session_id)
+                database.update_status(session_id, "idle")
+                self.assertEqual(database.require_session(session_id)["last_active_at"], timestamp)
+                clock.assert_not_called()
+            database.close()
+
     def test_rename_session_updates_name(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             database = Database(Path(tmpdir) / "sessions.db")
