@@ -107,9 +107,9 @@ class Database:
                 """
             )
             # `worktree_id` links a session to a managed worktree. NULL usually
-            # means the project directory; after explicit detachment the saved
+            # means the project directory; after detachment or worktree removal
             # `detached_working_dir` supplies its harness cwd instead. RESTRICT
-            # is the backstop behind delete_worktree's attached-session check.
+            # ensures worktree references are cleared before deleting a row.
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS sessions (
@@ -278,33 +278,10 @@ class Database:
         return [_row_to_session(row) for row in rows]
 
     def list_sessions_for_worktree(self, worktree_id: int) -> list[dict[str, Any]]:
-        """Every session attached to a worktree.
-
-        What `DELETE /worktrees/{id}` checks before removing anything: a
-        worktree with sessions in it is refused rather than pulled out from
-        under them.
-        """
+        """Every session attached to a worktree."""
         with self._lock:
             rows = self._conn.execute(
                 _SESSION_QUERY.format(where="WHERE s.worktree_id = ?"),
-                (worktree_id,),
-            ).fetchall()
-        return [_row_to_session(row) for row in rows]
-
-    def list_live_detached_sessions_for_worktree(
-        self, worktree_id: int
-    ) -> list[dict[str, Any]]:
-        """Live detached sessions whose preserved cwd is this worktree's path."""
-        with self._lock:
-            rows = self._conn.execute(
-                _SESSION_QUERY.format(
-                    where=(
-                        "WHERE s.worktree_id IS NULL "
-                        "AND s.detached_working_dir = "
-                        "(SELECT path FROM worktrees WHERE id = ?) "
-                        "AND s.archived_at IS NULL"
-                    )
-                ),
                 (worktree_id,),
             ).fetchall()
         return [_row_to_session(row) for row in rows]
@@ -642,9 +619,30 @@ class Database:
             raise KeyError(f"Unknown worktree: {worktree_id}")
         return worktree
 
+    def directory_paths(self) -> list[str]:
+        """Unique catalog and effective session paths from one DB snapshot."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT path FROM projects UNION SELECT path FROM worktrees "
+                "UNION SELECT COALESCE(w.path, s.detached_working_dir, p.path) "
+                "FROM sessions s JOIN projects p ON p.id = s.project_id "
+                "LEFT JOIN worktrees w ON w.id = s.worktree_id"
+            ).fetchall()
+        return [row[0] for row in rows]
+
     def delete_worktree(self, worktree_id: int) -> bool:
-        """Forget a worktree. The caller removes the directory first."""
+        """Preserve attached sessions' cwd and forget the worktree atomically.
+
+        The caller removes the directory first. A failed DELETE rolls back
+        the session updates too.
+        """
         with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE sessions SET detached_working_dir = "
+                "(SELECT path FROM worktrees WHERE id = ?), worktree_id = NULL "
+                "WHERE worktree_id = ?",
+                (worktree_id, worktree_id),
+            )
             cursor = self._conn.execute(
                 "DELETE FROM worktrees WHERE id = ?",
                 (worktree_id,),

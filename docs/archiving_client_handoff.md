@@ -1,5 +1,10 @@
 # Handoff: archiving sessions and projects (client side)
 
+**Contract update:** [worktree_removal_server_handoff.md](worktree_removal_server_handoff.md)
+supersedes this document's worktree-deletion restrictions and `exists` fields.
+Archived or idle attached sessions no longer block worktree removal; their paths
+and archive states are preserved. Archiving and explicit detachment are unchanged.
+
 Status: **server side implemented** (schema, migration, endpoints, WebSocket
 event, tests, README). This document is a hand-off spec for the agents building
 the client half, in `agent-ui-desktop` (separate repo). It is self-contained:

@@ -398,7 +398,13 @@ async def update_sandbox_paths(payload: UpdateSandboxPathsRequest) -> dict[str, 
 
 @app.get("/projects")
 async def list_projects() -> list[dict[str, Any]]:
-    return [with_existence(project) for project in db.list_projects()]
+    return [with_project_metadata(project) for project in db.list_projects()]
+
+
+@app.get("/directory-existence")
+async def directory_existence() -> dict[str, bool]:
+    """Fresh directory checks for all catalog and effective session paths."""
+    return {path: os.path.isdir(path) for path in db.directory_paths()}
 
 
 @app.post("/projects", status_code=201)
@@ -435,7 +441,7 @@ async def create_project(payload: CreateProjectRequest) -> dict[str, Any]:
         )
 
     name = payload.name or PurePosixPath(path).name
-    return with_existence(db.create_project(
+    return with_project_metadata(db.create_project(
         path=path, name=name, sandbox_paths=paths, sandbox_network_allowlist=network,
     ))
 
@@ -518,7 +524,7 @@ async def update_project(payload: UpdateProjectRequest) -> dict[str, Any]:
                 await broadcast_archived(updated)
 
     return {
-        **with_existence(db.get_project(path) or project),
+        **with_project_metadata(db.get_project(path) or project),
         "sessions_affected": affected,
     }
 
@@ -676,10 +682,7 @@ async def list_worktrees(project_path: str | None = None) -> list[dict[str, Any]
         if project is None:
             raise HTTPException(status_code=404, detail="Project not found")
         project_id = project["id"]
-    return [
-        with_worktree_existence(worktree)
-        for worktree in db.list_worktrees(project_id)
-    ]
+    return db.list_worktrees(project_id)
 
 
 @app.post("/worktrees", status_code=201)
@@ -769,54 +772,46 @@ async def create_worktree(payload: CreateWorktreeRequest) -> dict[str, Any]:
         # back before the failure propagates.
         await git.remove_worktree(project_path, worktree_path)
         raise
-    return with_worktree_existence(worktree)
+    return worktree
 
 
 @app.delete("/worktrees/{worktree_id}")
 async def delete_worktree(worktree_id: int) -> dict[str, Any]:
-    """Remove a worktree from disk and forget it.
+    """Safely remove a worktree, preserving every session and its cwd."""
+    # Serialize the busy check and removal with both agent and bash starts.
+    # Git failure leaves all database metadata untouched.
+    async with turn_lock:
+        worktree = db.get_worktree(worktree_id)
+        if worktree is None:
+            raise HTTPException(status_code=404, detail="Worktree not found")
 
-    A 409 either way when it cannot be removed — with sessions still attached,
-    or with work in it git refuses to discard. Unlike deleting a session, the
-    row does **not** go regardless: the row *is* the worktree, so keeping one
-    whose directory is still there is what stops it becoming an orphan nothing
-    can see.
-    """
-    worktree = db.get_worktree(worktree_id)
-    if worktree is None:
-        raise HTTPException(status_code=404, detail="Worktree not found")
+        busy = [
+            session for session in db.list_sessions()
+            if session["working_dir"] == worktree["path"]
+            and session_is_busy(session)
+        ]
+        if busy:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Cannot remove a worktree with busy sessions: "
+                    + ", ".join(session["name"] for session in busy)
+                ),
+            )
 
-    attached = db.list_sessions_for_worktree(worktree_id)
-    if attached:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"{len(attached)} session(s) are still using this worktree: "
-                + ", ".join(session["name"] for session in attached)
-            ),
-        )
+        project = db.get_project_by_id(worktree["project_id"])
+        if project is not None:
+            registered, error = await git.registered_worktree_paths(project["path"])
+            if error is not None:
+                raise HTTPException(status_code=409, detail=error)
+            if worktree["path"] in registered:
+                error = await git.remove_worktree(project["path"], worktree["path"])
+                if error is not None:
+                    raise HTTPException(status_code=409, detail=error)
+            # An unregistered path is only a stale server record. Leave any
+            # directory at that path untouched, even if it still exists.
 
-    # A detached session no longer references the worktree row, but once it is
-    # live its preserved cwd is an active harness dependency. Removing that
-    # directory would strand the session even though the foreign key permits it.
-    live_detached = db.list_live_detached_sessions_for_worktree(worktree_id)
-    if live_detached:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"{len(live_detached)} live detached session(s) still use this "
-                "worktree directory: "
-                + ", ".join(session["name"] for session in live_detached)
-            ),
-        )
-
-    project = db.get_project_by_id(worktree["project_id"])
-    if project is not None:
-        error = await git.remove_worktree(project["path"], worktree["path"])
-        if error is not None:
-            raise HTTPException(status_code=409, detail=error)
-
-    db.delete_worktree(worktree_id)
+        db.delete_worktree(worktree_id)
     return {"status": "deleted"}
 
 
@@ -1496,30 +1491,31 @@ async def run_turn(session_id: int, prompt: str, images: list[dict[str, Any]] | 
 async def begin_bash(session_id: int, command: str) -> int:
     """Start a one-shot shell command in the session's working directory.
 
-    Deliberately none of what `begin_turn` does: no turn lock, no status
-    change, no adapter. Bash mode bypasses the agent entirely, so it must also
-    bypass the turn state machine — a command can run while the agent is
-    mid-turn or blocked on an approval, and neither notices the other.
+    No agent status change or adapter: bash can run during an agent turn.
+    The start lock only serializes it with worktree removal and other starts.
     """
-    require_not_archived(require_session_or_404(session_id))
-    existing = bash_tasks.get(session_id)
-    if existing and not existing.done():
-        raise HTTPException(
-            status_code=409, detail="A command is already running in this session"
+    async with turn_lock:
+        require_not_archived(require_session_or_404(session_id))
+        existing = bash_tasks.get(session_id)
+        if existing and not existing.done():
+            raise HTTPException(
+                status_code=409, detail="A command is already running in this session"
+            )
+
+        def start() -> int:
+            row = db.append_scrollback(session_id, "bash_input", {"command": command})
+            return row["id"]
+
+        message_id = await commit_stream(
+            session_id,
+            start,
+            lambda event_id: [
+                {"type": "bash_input", "command": command, "event_id": event_id}
+            ],
         )
 
-    def start() -> int:
-        row = db.append_scrollback(session_id, "bash_input", {"command": command})
-        return row["id"]
-
-    message_id = await commit_stream(
-        session_id,
-        start,
-        lambda event_id: [{"type": "bash_input", "command": command, "event_id": event_id}],
-    )
-
-    bash_tasks[session_id] = asyncio.create_task(run_bash(session_id, command))
-    return message_id
+        bash_tasks[session_id] = asyncio.create_task(run_bash(session_id, command))
+        return message_id
 
 
 async def run_bash(session_id: int, command: str) -> None:
@@ -1779,31 +1775,14 @@ async def teardown_session(session: dict[str, Any]) -> None:
         await file_tree_manager.close_session(session_id)
 
 
-def with_worktree_existence(worktree: dict[str, Any]) -> dict[str, Any]:
-    """Annotate a worktree with whether its directory is still there.
+def with_project_metadata(project: dict[str, Any]) -> dict[str, Any]:
+    """Add the cheap .git hint; session creation enforces Git validity.
 
-    Same one stat per row as `with_existence` does for projects. A worktree
-    removed by hand outside the app still has a row, and this is how the client
-    can tell — `DELETE /worktrees/{id}` then succeeds and tidies up, since git
-    prunes a worktree whose directory is gone without complaint.
-    """
-    return {**worktree, "exists": os.path.isdir(worktree["path"])}
-
-
-def with_existence(project: dict[str, Any]) -> dict[str, Any]:
-    """Annotate a project with whether its directory is still there.
-
-    One stat per project, not a scan: the client needs it to explain a project
-    whose directory was removed outside the app and offer to forget it.
-
-    `is_git_repo` rides along as a hint for hiding the worktree toggle on
-    projects that cannot have one — one more cheap `exists`, no subprocess.
-    `.git` as a *file* counts, so a project that is itself a worktree reads as
-    a repo. Creating a session is where this is actually enforced.
+    A .git file counts too, for projects that are themselves worktrees.
+    Directory existence is reported separately by /directory-existence.
     """
     return {
         **project,
-        "exists": os.path.isdir(project["path"]),
         "is_git_repo": os.path.exists(os.path.join(project["path"], ".git")),
     }
 

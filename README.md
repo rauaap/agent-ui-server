@@ -826,9 +826,20 @@ project directory**.
 Worktrees are first-class resources rather than session-owned temporary
 directories. `POST /worktrees` runs `git worktree add -b`, and any number of
 sessions can attach to the resulting row. Deleting a session never removes its
-worktree. Worktree removal is never forced: attached sessions, live detached
-sessions, or dirty/untracked files cause `409` and leave both directory and row
-intact.
+worktree. Worktree removal is never forced: busy sessions using its directory
+(including detached sessions), or dirty/untracked files cause `409` and leave
+session metadata and the worktree row intact. Idle and archived sessions do not
+block removal. Attached sessions retain the absolute working directory and all
+history/settings, while their worktree association is cleared atomically with
+record deletion. The server checks Git registration first: an unregistered
+stale record can be forgotten without touching any directory at its saved path.
+A failed registration listing blocks cleanup rather than implying absence.
+
+`GET /directory-existence` returns a fresh map of every unique project,
+worktree, and effective session path to directory existence, including archived
+and former-worktree paths. Project/worktree responses no longer include
+`exists`. See [`docs/worktree_removal_server_handoff.md`](docs/worktree_removal_server_handoff.md)
+for the endpoint and client refresh contract.
 
 See [`docs/worktree_sessions_design.md`](docs/worktree_sessions_design.md) and
 [`docs/archive_worktree_design_decisions.md`](docs/archive_worktree_design_decisions.md)

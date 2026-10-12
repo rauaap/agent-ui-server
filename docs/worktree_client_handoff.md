@@ -1,5 +1,10 @@
 # Client hand-off: first-class worktrees
 
+**Contract update:** [worktree_removal_server_handoff.md](worktree_removal_server_handoff.md)
+supersedes this document's worktree-deletion restrictions and `exists` fields.
+Use the separate directory-existence map; only busy directory-dependent sessions
+block removal. Other behavior below remains applicable.
+
 Status: **server side implemented** (schema, endpoints, tests,
 README). This is the client-side spec, for an implementing agent working in a
 client repo — the Android app

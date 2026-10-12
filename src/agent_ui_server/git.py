@@ -57,6 +57,20 @@ async def add_worktree(repo: str, path: str, branch: str) -> str | None:
     return None if code == 0 else _describe(code, stderr, "git worktree add")
 
 
+async def registered_worktree_paths(repo: str) -> tuple[set[str], str | None]:
+    """List Git registrations, preserving porcelain -z paths verbatim."""
+    code, stdout, stderr = await _run(
+        "-C", repo, "worktree", "list", "--porcelain", "-z", raw_stdout=True
+    )
+    if code != 0:
+        return set(), _describe(code, stderr, "git worktree list")
+    return {
+        field.removeprefix("worktree ")
+        for field in stdout.split("\0")
+        if field.startswith("worktree ")
+    }, None
+
+
 async def remove_worktree(repo: str, path: str) -> str | None:
     """Remove a worktree. Returns git's error, if any.
 
@@ -70,7 +84,7 @@ async def remove_worktree(repo: str, path: str) -> str | None:
     return None if code == 0 else _describe(code, stderr, "git worktree remove")
 
 
-async def _run(*args: str) -> tuple[int | None, str, str]:
+async def _run(*args: str, raw_stdout: bool = False) -> tuple[int | None, str, str]:
     """Run `git` with these arguments; return (exit code, stdout, stderr).
 
     A git that could not be started or had to be killed comes back with a
@@ -101,7 +115,10 @@ async def _run(*args: str) -> tuple[int | None, str, str]:
         _kill(process)
         raise
 
-    return process.returncode, _trim(stdout), _trim(stderr)
+    # Machine-readable path lists must not be stripped, truncated, or decoded
+    # with replacement: each can turn a registered path into apparent absence.
+    output = os.fsdecode(stdout) if raw_stdout else _trim(stdout)
+    return process.returncode, output, _trim(stderr)
 
 
 def _kill(process: asyncio.subprocess.Process) -> None:

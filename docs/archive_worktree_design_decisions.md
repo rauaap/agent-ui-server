@@ -1,5 +1,11 @@
 # Archive and worktree design decisions
 
+**Contract update:** [worktree_removal_server_handoff.md](worktree_removal_server_handoff.md)
+supersedes the deletion restrictions and directory-existence reporting below.
+Removal automatically clears attached sessions' associations and preserves paths;
+only busy directory-dependent sessions block it. Explicit detachment and archive
+behavior otherwise remain unchanged.
+
 ## Core model
 
 - Worktrees are not archivable.
