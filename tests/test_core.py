@@ -2599,7 +2599,7 @@ class WebSocketOrderingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_snapshot_frames_precede_a_live_status(self) -> None:
         session_id = self.session["id"]
-        self.main.db.append_scrollback(session_id, "output", {"text": "old"})
+        old = self.main.db.append_scrollback(session_id, "output", {"text": "old"})
         self.main.db.update_status(session_id, "running")
         websocket = _FakeWebSocket(send_open=False)
 
@@ -2619,7 +2619,7 @@ class WebSocketOrderingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             websocket.sent,
             [
-                {"type": "output", "text": "old"},
+                {"type": "output", "text": "old", "event_id": old["id"]},
                 {"type": "input_queue", "messages": []},
                 {"type": "status", "status": "running"},
                 {"type": "archived", "archived_at": None},

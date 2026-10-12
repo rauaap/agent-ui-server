@@ -1046,6 +1046,29 @@ class Database:
             decoded.append(item)
         return decoded
 
+    def scrollback_before(
+        self, session_id: int, before: int, limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Read the nearest events before the exclusive cursor, oldest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT id, session_id, ts, type, payload
+                FROM scrollback
+                WHERE session_id = ? AND id < ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (session_id, before, limit),
+            ).fetchall()
+
+        decoded = []
+        for row in reversed(rows):
+            item = dict(row)
+            item["payload"] = json.loads(item["payload"])
+            decoded.append(item)
+        return decoded
+
     def recent_scrollback(self, session_id: int, limit: int = 200) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(

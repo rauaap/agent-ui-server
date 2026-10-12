@@ -97,7 +97,7 @@ class SessionOperationTests(unittest.IsolatedAsyncioTestCase):
             source = {"type": "user"} if sender is None else {"type": "agent", "session_id": sender}
             row = next(r for r in self.db.recent_scrollback(sid) if r["id"] == mid)
             self.assertEqual(row["payload"], {"text": "original", "source": source, "delivery": "queued"})
-            self.assertIn({"type": "input", "message_id": mid, **row["payload"]}, self.events)
+            self.assertIn({"type": "input", "message_id": mid, "event_id": mid, **row["payload"]}, self.events)
             self.assertTrue(any(
                 event["type"] == "inputs_shipped" and
                 any(message["message_id"] == mid for message in event["messages"])

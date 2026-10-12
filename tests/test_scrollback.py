@@ -82,6 +82,45 @@ class ScrollbackTests(unittest.IsolatedAsyncioTestCase):
             "queued_messages": [],
         })
 
+    async def test_backward_pages_use_nearest_events_with_gapped_ids(self):
+        rows = []
+        for i in range(405):
+            rows.append(self.append(str(i)))
+            self.db.append_scrollback(self.other, "output", {"text": "unrelated"})
+        _, body = await self.get(f"before={rows[-1]['id']}&limit=200")
+        self.assertEqual(body["messages"], rows[204:404])
+        self.assertEqual(body["next_cursor"], rows[204]["id"])
+        self.assertTrue(body["has_more"])
+        _, body = await self.get(f"before={body['next_cursor']}&limit=200")
+        self.assertEqual(body["messages"], rows[4:204])
+        self.assertTrue(body["has_more"])
+        _, body = await self.get(f"before={body['next_cursor']}&limit=200")
+        self.assertEqual(body["messages"], rows[:4])
+        self.assertFalse(body["has_more"])
+        _, body = await self.get(f"before={body['next_cursor']}&limit=200")
+        self.assertEqual(body["messages"], [])
+        self.assertEqual(body["next_cursor"], rows[0]["id"])
+        self.assertFalse(body["has_more"])
+
+    async def test_backward_exact_page_and_zero_cursor(self):
+        rows = [self.append(str(i)) for i in range(201)]
+        _, body = await self.get(f"before={rows[-1]['id']}")
+        self.assertEqual(body["messages"], rows[:200])
+        self.assertFalse(body["has_more"])
+        _, body = await self.get("before=0")
+        self.assertEqual(body["messages"], [])
+        self.assertEqual(body["next_cursor"], 0)
+        self.assertFalse(body["has_more"])
+
+    def test_persisted_frames_include_event_id(self):
+        for event_type in ("input", "output", "tool_use", "approval_response",
+                           "question_response", "bash_input", "bash_output", "error"):
+            row = self.db.append_scrollback(self.session, event_type, {"text": "hi"})
+            frame = main.frame_for_scrollback(row)
+            self.assertEqual(frame["event_id"], row["id"])
+            if event_type == "input":
+                self.assertEqual(frame["message_id"], row["id"])
+
     def corrupt_payload(self):
         row = self.append()
         with self.db._conn:
@@ -144,7 +183,8 @@ class ScrollbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 404)
 
     async def test_validation(self):
-        for query in ["after=-1", "after=no", "after=1.5", "limit=0", "limit=-1",
+        for query in ["before=-1", "before=no", "before=1.5", "before=0&after=0",
+                      "after=-1", "after=no", "after=1.5", "limit=0", "limit=-1",
                       "limit=1001", "limit=no", "limit=1.5"]:
             with self.subTest(query=query):
                 status, _ = await self.get(query)

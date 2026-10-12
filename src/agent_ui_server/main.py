@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
@@ -986,19 +986,29 @@ async def get_scrollback(
     session_id: int,
     after: int | None = Query(default=None, ge=0),
     limit: int = Query(default=200, ge=1, le=1000),
+    before: Annotated[int | None, Query(ge=0)] = None,
 ) -> dict[str, Any]:
-    return read_session_operation(session_id, after=after, limit=limit)
+    if before is not None and after is not None:
+        raise HTTPException(status_code=422, detail="after and before are mutually exclusive")
+    return read_session_operation(session_id, after=after, before=before, limit=limit)
 
 
 def read_session_operation(
-    session_id: int, *, after: int | None = None, limit: int = 200,
+    session_id: int, *, after: int | None = None, before: int | None = None,
+    limit: int = 200,
 ) -> dict[str, Any]:
     require_session_or_404(session_id)
-    rows = db.scrollback_after(session_id, after, limit + 1)
-    messages = rows[:limit]
+    if before is not None:
+        rows = db.scrollback_before(session_id, before, limit + 1)
+        messages = rows[-limit:]
+        next_cursor = messages[0]["id"] if messages else before
+    else:
+        rows = db.scrollback_after(session_id, after, limit + 1)
+        messages = rows[:limit]
+        next_cursor = messages[-1]["id"] if messages else after
     return {
         "messages": messages,
-        "next_cursor": messages[-1]["id"] if messages else after,
+        "next_cursor": next_cursor,
         "has_more": len(rows) > limit,
         "queued_messages": db.pending_inputs(session_id),
     }
@@ -1423,9 +1433,10 @@ async def run_turn(session_id: int, prompt: str, images: list[dict[str, Any]] | 
                 event_type == "approval_request" and auto_setting is None
             )
 
-            def record_event() -> None:
+            def record_event() -> dict[str, Any]:
+                frame = event
                 if persisted:
-                    db.append_scrollback(
+                    row = db.append_scrollback(
                         session_id,
                         event_type,
                         {
@@ -1434,20 +1445,20 @@ async def run_turn(session_id: int, prompt: str, images: list[dict[str, Any]] | 
                             if key != "type"
                         },
                     )
+                    frame = frame_for_scrollback(row)
                 # A pending question blocks on the user just like an approval.
                 # Auto-approved requests never leave running state.
                 if awaiting:
                     db.update_status(session_id, "awaiting_approval")
+                return frame
 
-            frames = (
-                [{"type": "status", "status": "awaiting_approval"}, event]
-                if awaiting
-                else [event]
-            )
             await commit_stream(
                 session_id,
                 record_event,
-                lambda _result: frames,
+                lambda frame: (
+                    [{"type": "status", "status": "awaiting_approval"}, frame]
+                    if awaiting else [frame]
+                ),
             )
 
             # Answer on the user's behalf right after the request is on the wire,
@@ -1464,7 +1475,7 @@ async def run_turn(session_id: int, prompt: str, images: list[dict[str, Any]] | 
             lambda: db.append_scrollback(
                 session_id, "error", {"message": message}
             ),
-            lambda _result: [{"type": "error", "message": message}],
+            lambda row: [frame_for_scrollback(row)],
         )
     finally:
         async with turn_lock:
@@ -1504,7 +1515,7 @@ async def begin_bash(session_id: int, command: str) -> int:
     message_id = await commit_stream(
         session_id,
         start,
-        lambda _result: [{"type": "bash_input", "command": command}],
+        lambda event_id: [{"type": "bash_input", "command": command, "event_id": event_id}],
     )
 
     bash_tasks[session_id] = asyncio.create_task(run_bash(session_id, command))
@@ -1519,7 +1530,7 @@ async def run_bash(session_id: int, command: str) -> None:
         await commit_stream(
             session_id,
             lambda: db.append_scrollback(session_id, "bash_output", payload),
-            lambda _result: [{"type": "bash_output", **payload}],
+            lambda row: [frame_for_scrollback(row)],
         )
     except asyncio.CancelledError:
         # Stopped by the user or shutting down; the process group is already
@@ -1545,7 +1556,7 @@ async def report_bash_error(session_id: int, message: str) -> None:
     await commit_stream(
         session_id,
         lambda: db.append_scrollback(session_id, "error", {"message": message}),
-        lambda _result: [{"type": "error", "message": message}],
+        lambda row: [frame_for_scrollback(row)],
     )
 
 
@@ -1582,15 +1593,16 @@ async def handle_approval(
     if auto:
         payload["auto"] = True
 
-    def record_response() -> None:
-        db.append_scrollback(session_id, "approval_response", payload)
+    def record_response() -> dict[str, Any]:
+        row = db.append_scrollback(session_id, "approval_response", payload)
         db.update_status(session_id, "running")
+        return row
 
     await commit_stream(
         session_id,
         record_response,
-        lambda _result: [
-            {"type": "approval_response", **payload},
+        lambda row: [
+            frame_for_scrollback(row),
             {"type": "status", "status": "running"},
         ],
     )
@@ -1609,15 +1621,16 @@ async def handle_question_answer(
 
     payload = {"request_id": request_id, "answers": validated}
 
-    def record_response() -> None:
-        db.append_scrollback(session_id, "question_response", payload)
+    def record_response() -> dict[str, Any]:
+        row = db.append_scrollback(session_id, "question_response", payload)
         db.update_status(session_id, "running")
+        return row
 
     await commit_stream(
         session_id,
         record_response,
-        lambda _result: [
-            {"type": "question_response", **payload},
+        lambda row: [
+            frame_for_scrollback(row),
             {"type": "status", "status": "running"},
         ],
     )
@@ -1625,7 +1638,7 @@ async def handle_question_answer(
 
 def frame_for_scrollback(row: dict[str, Any]) -> dict[str, Any]:
     payload = row["payload"] if isinstance(row["payload"], dict) else {}
-    frame = {"type": row["type"], **payload}
+    frame = {"type": row["type"], **payload, "event_id": row["id"]}
     if row["type"] == "input":
         frame["message_id"] = row["id"]
     return frame
