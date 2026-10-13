@@ -27,7 +27,7 @@ The API can also be exercised directly with tools such as `curl` and
 ## What it does
 
 - Registers project directories and reports their session activity
-- Creates, resumes, stops, archives, and deletes agent sessions
+- Creates, resumes, stops, and deletes agent sessions
 - Selects an agent per session through the adapter registry
 - Streams output and persists the latest transcript history in SQLite
 - Normalizes provider-specific tool calls into a canonical action schema
@@ -291,17 +291,16 @@ FastAPI also exposes generated OpenAPI documentation at `/docs`.
 | `GET` | `/usage` | Five-hour and weekly consumption for each subscription |
 | `GET` | `/sandbox-paths` | Read server-wide sandbox path defaults |
 | `PATCH` | `/sandbox-paths` | Replace server-wide sandbox path defaults |
-| `GET` | `/projects` | List projects and live/archive session aggregates |
+| `GET` | `/projects` | List projects and session aggregates |
 | `POST` | `/projects` | Register/create a project directory |
-| `PATCH` | `/projects` | Update project sandbox paths/network exceptions or archive/unarchive with session cascade |
+| `PATCH` | `/projects` | Update project sandbox paths/network exceptions |
 | `DELETE` | `/projects` | Forget a project, sessions, and managed worktrees |
 | `GET` | `/worktrees` | List worktrees; optionally filter by `project_path` |
 | `POST` | `/worktrees` | Create a worktree on a new branch from project HEAD |
 | `DELETE` | `/worktrees/{id}` | Remove a clean, unused worktree |
 | `GET` | `/sessions` | List sessions and current metadata |
 | `POST` | `/sessions` | Create a session for a registered project |
-| `PATCH` | `/sessions/{id}` | Rename, archive, or change reasoning level or auto-approval/sandbox settings |
-| `POST` | `/sessions/{id}/detach-worktree` | Detach an archived session while preserving its cwd |
+| `PATCH` | `/sessions/{id}` | Rename or change reasoning level or auto-approval/sandbox settings |
 | `POST` | `/sessions/{id}/turn` | Start an agent turn |
 | `POST` | `/sessions/{id}/bash` | Start a direct one-shot shell command |
 | `GET` | `/sessions/{id}/scrollback` | Read persisted transcript events with cursor pagination |
@@ -405,13 +404,12 @@ curl -X POST http://127.0.0.1:8000/sessions \
 ```
 
 A session's effective `working_dir` is derived from its attached worktree,
-preserved detached-worktree path, or project path, in that order. It is not a
-stored session column. `working_dir` remains accepted as a deprecated request
-alias for `project_path`.
+preserved former-worktree path, or project path, in that order. It is not a
+stored session column.
 
 Only one agent turn may run per session. A direct shell command has a separate
-slot and may run while the agent is running or awaiting approval. Starting new
-work in an archived session or project is rejected.
+slot and may run while the agent is running or awaiting approval. Missing working
+directories produce normal operation errors; transcript access remains available.
 
 ### Persisted scrollback and input cursors
 
@@ -463,7 +461,7 @@ curl 'http://127.0.0.1:8000/sessions/7/scrollback?after=123&limit=200' \
   and `delivery:"queued"`.
 
 Reads return immediately without waiting for new events or requiring a live
-WebSocket connection. Archived sessions remain readable; nonexistent sessions
+WebSocket connection. Sessions with missing working directories remain readable; nonexistent sessions
 return 404.
 
 ### Subscription usage
@@ -827,8 +825,8 @@ Worktrees are first-class resources rather than session-owned temporary
 directories. `POST /worktrees` runs `git worktree add -b`, and any number of
 sessions can attach to the resulting row. Deleting a session never removes its
 worktree. Worktree removal is never forced: busy sessions using its directory
-(including detached sessions), or dirty/untracked files cause `409` and leave
-session metadata and the worktree row intact. Idle and archived sessions do not
+(including sessions with saved former-worktree paths), or dirty/untracked files
+cause `409` and leave session metadata and the worktree row intact. Idle sessions do not
 block removal. Attached sessions retain the absolute working directory and all
 history/settings, while their worktree association is cleared atomically with
 record deletion. The server checks Git registration first: an unregistered
@@ -836,25 +834,17 @@ stale record can be forgotten without touching any directory at its saved path.
 A failed registration listing blocks cleanup rather than implying absence.
 
 `GET /directory-existence` returns a fresh map of every unique project,
-worktree, and effective session path to directory existence, including archived
-and former-worktree paths. Project/worktree responses no longer include
+worktree, and effective session path to directory existence, including
+former-worktree paths. Project/worktree responses no longer include
 `exists`. See [`docs/worktree_removal_server_handoff.md`](docs/worktree_removal_server_handoff.md)
 for the endpoint and client refresh contract.
 
-See [`docs/worktree_sessions_design.md`](docs/worktree_sessions_design.md) and
-[`docs/archive_worktree_design_decisions.md`](docs/archive_worktree_design_decisions.md)
-for the detailed lifecycle decisions.
+Project `session_count` counts all sessions, and `last_active_at` includes all
+session activity. There is no archive state or explicit session-detachment action.
+Worktree deletion preserves session paths automatically.
 
-### Archiving
-
-Projects and sessions use nullable `archived_at` timestamps. List endpoints
-return both live and archived rows; clients split the views.
-
-Archiving a project archives its live sessions. Unarchiving restores only the
-sessions archived by that cascade. Busy sessions prevent archiving, and missing
-working directories prevent restoration. Archived sessions retain transcript
-access and can still be renamed, reconfigured, detached, or deleted, but cannot
-start turns or shell commands.
+See [`docs/archive_removal_client_handoff.md`](docs/archive_removal_client_handoff.md)
+for the client cleanup contract.
 
 ## Session WebSocket
 
@@ -866,7 +856,7 @@ Connect to:
 
 The socket is bidirectional. On connect, the server atomically establishes a
 snapshot boundary, queues up to the latest 200 persisted transcript rows, then
-sends current `status` and `archived` snapshots. Live events follow the snapshot
+sends current `input_queue` and `status` snapshots. Live events follow the snapshot
 without interleaving. Every connection has one bounded writer queue, so a slow
 or failed client cannot block healthy subscribers.
 
@@ -972,14 +962,12 @@ request carries `"auto_approved": true` and is followed by an
 { "type": "reasoning_level", "reasoning_level": "high" }
 { "type": "settings", "auto_approve_write": true, "auto_approve_command": false,
   "auto_approve_inter_agent_communication": false, "sandbox": true }
-{ "type": "archived", "archived_at": "2026-08-26T11:02:00Z" }
-{ "type": "worktree_detached", "worktree_id": null, "working_dir": "/projects/app-fix" }
 { "type": "done" }
 { "type": "error", "message": "Human-readable failure" }
 ```
 
-Transcript events are persisted; lifecycle snapshots such as `status`,
-`archived`, and `done` are not historical transcript records. SQLite is the
+Transcript events are persisted; lifecycle frames such as `status`,
+`input_queue`, and `done` are not historical transcript records. SQLite is the
 source of truth for current metadata.
 
 A `question` is different from approval: the agent is asking the user to choose
@@ -1133,7 +1121,7 @@ action.
 
 SQLite runs in WAL mode with foreign keys enabled. It stores:
 
-- `projects` — explicit project identity, path, label, archive timestamp
+- `projects` — explicit project identity, path, label, creation timestamp
 - `worktrees` — project-owned Git worktree paths and branch records
 - `sessions` — adapter id, harness resume id, state, settings, timestamps, links
 - `scrollback` — append-only persisted transcript events

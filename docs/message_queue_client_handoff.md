@@ -14,7 +14,7 @@ now with `{"status":"accepted","message_id":123}`. Acceptance is not delivery
 or completion. `message_session` still returns the persisted input ID immediately.
 
 Clients must remove their busy-session rejection for ordinary messages. Keep
-archived, disconnected, and sandbox-setting-save guards. Bash commands are
+disconnected and sandbox-setting-save guards. Bash commands are
 unchanged and do not use this queue.
 
 ## Accepted input (persisted and broadcast immediately)
@@ -96,7 +96,6 @@ WebSocket initialization, atomically ordered with live publications:
    the entire current pending list. Items have the same shape as accepted inputs
    without `type`: `message_id`, `text`, `source`, `delivery:"queued"`.
 3. Current `status`.
-4. Current `archived` state.
 
 The queue snapshot includes **all** pending inputs, even when their acceptance
 records are outside the replay window. Replace, don't merge, the pending list
@@ -121,8 +120,7 @@ current pending snapshot independent of the page cursor/limit.
   pending inputs. In each case, a new submission to the idle session resumes by
   shipping all retained inputs plus the new submission. There is no separate
   resume/cancel/edit-queue endpoint in this change.
-- Archived sessions reject new submissions. Existing pending messages stay
-  persisted while archived. Deletion removes their queue together with scrollback.
+- Session deletion removes its queue together with scrollback.
 
 ## Tests expected in clients
 
@@ -130,7 +128,7 @@ Busy send succeeds; queue arrival does not split a streaming answer; shipment
 appends separate attributed rows; history is recorded once; multiple messages are
 ordered; old acceptances outside replay still ship correctly; authoritative queue
 snapshot clears stale pending entries; reconnect does not duplicate messages;
-Stop/failure leave pending inputs visible; archived/disconnected guards and Bash
+Stop/failure leave pending inputs visible; disconnected guards and Bash
 behavior remain unchanged.
 
 The synchronous Python API package already returns raw response JSON and its

@@ -231,9 +231,6 @@ class ImageAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(main, "adapters", {}), self.assertRaises(HTTPException) as caught:
             await main.begin_turn(self.sid, "", images=[image["id"]])
         self.assertEqual(caught.exception.status_code, 409)
-        self.db.set_session_archived(self.sid, True)
-        with self.assertRaises(HTTPException):
-            await main.begin_turn(self.sid, "", images=[image["id"]])
         self.assertEqual(self.db.recent_scrollback(self.sid), [])
         self.assertEqual(self.db._conn.execute("SELECT count(*) FROM message_images").fetchone()[0], 0)
         self.assertIsNotNone(self.db.get_image(image["id"]))

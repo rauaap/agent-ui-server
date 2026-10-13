@@ -255,16 +255,12 @@ class MessageQueueTests(unittest.IsolatedAsyncioTestCase):
                 await main.begin_turn(self.sid, "resume")
                 await self.finish(await self.next_call())
 
-    async def test_empty_archived_missing_and_unavailable_rejections_write_nothing(self):
+    async def test_empty_missing_and_unavailable_rejections_write_nothing(self):
         for text in ("", " \n "):
             with self.assertRaises(HTTPException):
                 await main.begin_turn(self.sid, text)
         with self.assertRaises(HTTPException):
             await main.begin_turn(999, "hello")
-        self.db.set_session_archived(self.sid, True)
-        with self.assertRaises(HTTPException):
-            await main.begin_turn(self.sid, "hello")
-        self.db.set_session_archived(self.sid, False)
         with mock.patch.object(main, "adapters", {}), self.assertRaises(HTTPException):
             await main.begin_turn(self.sid, "hello")
         self.assertEqual(self.db.recent_scrollback(self.sid), [])

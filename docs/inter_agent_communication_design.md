@@ -25,8 +25,8 @@ and reply to the session that contacted it.
 Submit an input to the target session and return its persisted input ID. This does
 not wait for the agent's response.
 
-Reuse `begin_turn()` for both users and agents: validate the target, reject archived
-sessions, persist/broadcast acceptance, and queue busy-session inputs. Idle sessions
+Reuse `begin_turn()` for both users and agents: validate the target,
+persist/broadcast acceptance, and queue busy-session inputs. Idle sessions
 ship the whole pending batch; successful turns ship the next batch at completion.
 
 ### `start_session`
@@ -226,6 +226,6 @@ agent-specific implementation of turn startup.
   targeting unsandboxed or missing sessions.
 - Denied/cancelled requests do not execute; pending requests are cleaned up.
 - Both harness integrations work independently of sandbox bypass settings.
-- Missing/archived targets reject; busy targets accept into the next-turn queue.
+- Missing targets reject; busy targets accept into the next-turn queue.
 - Creation followed by failed messaging reports the retained session's ID.
 - Pagination and input-ID return semantics match the API helpers.

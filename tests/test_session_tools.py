@@ -135,7 +135,7 @@ class SessionOperationTests(unittest.IsolatedAsyncioTestCase):
                 })
         self.assertTrue(any(s["name"] == "retained" for s in self.db.list_sessions()))
 
-    async def test_missing_and_archived_target_rejected_busy_target_queues(self):
+    async def test_missing_target_rejected_busy_target_queues(self):
         with self.assertRaises(HTTPException):
             await main.session_tool_operation(self.sender["id"], "message_session", {
                 "session_id": 999, "message": "hello",
@@ -145,10 +145,6 @@ class SessionOperationTests(unittest.IsolatedAsyncioTestCase):
             "session_id": self.target["id"], "message": "hello",
         })
         self.assertEqual(self.db.pending_inputs(self.target["id"])[0]["message_id"], mid)
-        self.db.update_status(self.target["id"], "idle")
-        self.db.set_session_archived(self.target["id"], True)
-        with self.assertRaises(HTTPException):
-            await main.begin_turn(self.target["id"], "hello", sender_session_id=self.sender["id"])
         self.assertEqual(self.prompts, [])
 
 

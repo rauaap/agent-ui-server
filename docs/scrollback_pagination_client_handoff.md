@@ -2,7 +2,7 @@
 
 The WebSocket still replays the newest 200 persisted events. Every persisted
 WebSocket frame, both replayed and live, now includes `event_id` (the database
-scrollback row ID). Non-persisted frames such as status, input_queue, archived,
+scrollback row ID). Non-persisted frames such as status, input_queue,
 and done have no event_id. Input frames also retain message_id for input delivery.
 
 When the user scrolls to the top, fetch 200 older events:

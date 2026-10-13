@@ -96,8 +96,8 @@ The busy check runs before applying any fields in a mixed PATCH. A busy
 sandbox rejection therefore also leaves any supplied name/auto-approval fields
 unchanged. Prefer a dedicated `{"sandbox": ...}` request anyway.
 
-An idle archived session may change this setting. A direct user shell command
-running by itself does not block the change: only agent turns are checked.
+A direct user shell command running by itself does not block the change:
+only agent turns are checked.
 
 ### Live updates: session WebSocket
 

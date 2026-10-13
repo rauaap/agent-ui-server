@@ -1,5 +1,11 @@
 # Design: order WebSocket replay and live events
 
+**Historical protocol note:** archive state and explicit detachment have since
+been removed. All `archived`/`worktree_detached` examples and archive-specific
+concurrency discussion below are obsolete. Current initialization is persisted
+replay, `input_queue`, then `status`; the ordering/writer-queue design still
+applies. See [archive_removal_client_handoff.md](archive_removal_client_handoff.md).
+
 Status: **implemented.** This document describes a status desynchronization bug
 in the session WebSocket and the server-side ordering and writer-queue design
 used to fix it.

@@ -172,18 +172,17 @@ class NetworkAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(updated["sandbox_network_allowlist"], [])
         self.assertEqual(self.database.effective_sandbox_network_allowlist(project["id"]), server)
 
-    async def test_invalid_project_updates_do_not_change_settings_or_archive_state(self):
+    async def test_invalid_project_updates_do_not_change_settings(self):
         project = self.database.create_project(self.temp.name, "fixture")
         entries = [{"ip": "100.64.0.10", "port": 443}]
         self.database.set_sandbox_network_allowlist(entries, project["id"])
         with self.assertRaises(HTTPException) as error:
             await self.main.update_project(self.main.UpdateProjectRequest(
-                path=self.temp.name, archived=True,
+                path=self.temp.name,
                 sandbox_network_allowlist=[{"ip": "localhost", "port": 443}],
             ))
         self.assertEqual(error.exception.status_code, 400)
         self.assertEqual(self.database.get_sandbox_network_allowlist(project["id"]), entries)
-        self.assertIsNone(self.database.get_project_by_id(project["id"])["archived_at"])
         with self.assertRaises(ValueError):
             self.database.set_sandbox_network_allowlist([{"ip": "localhost", "port": 443}], project["id"])
         self.assertEqual(self.database.get_sandbox_network_allowlist(project["id"]), entries)

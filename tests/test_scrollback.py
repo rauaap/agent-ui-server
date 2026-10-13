@@ -170,9 +170,10 @@ class ScrollbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["messages"], rows)
         self.assertFalse(body["has_more"])
 
-    async def test_archived_session_is_readable(self):
+    async def test_session_with_missing_working_directory_is_readable(self):
         row = self.append()
-        self.db.set_session_archived(self.session, True)
+        self.db._conn.execute("UPDATE projects SET path = '/missing-session-directory'")
+        self.db._conn.commit()
         status, body = await self.get("limit=1")
         self.assertEqual(status, 200)
         self.assertEqual(body["messages"], [row])

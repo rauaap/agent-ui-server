@@ -3,7 +3,9 @@
 **Contract update:** [worktree_removal_server_handoff.md](worktree_removal_server_handoff.md)
 supersedes this document's worktree-deletion restrictions and `exists` fields.
 Use the separate directory-existence map; only busy directory-dependent sessions
-block removal. Other behavior below remains applicable.
+block removal. [archive_removal_client_handoff.md](archive_removal_client_handoff.md)
+also supersedes all archive state, guards, and explicit detachment described below.
+Those historical portions no longer describe the current API.
 
 Status: **server side implemented** (schema, endpoints, tests,
 README). This is the client-side spec, for an implementing agent working in a

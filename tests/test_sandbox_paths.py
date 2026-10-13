@@ -176,7 +176,7 @@ class SandboxPathsAPITests(PathFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.settings(), {"sandbox_paths": [self.entry()]})
         project = await self.project_settings(sandbox_paths=[self.entry(True)])
         self.assertEqual(project["sandbox_paths"], [self.entry(True)])
-        self.assertEqual(project["sessions_affected"], 0)
+        self.assertNotIn("sessions_affected", project)
         self.assertEqual((await self.project_settings())["sandbox_paths"], [self.entry(True)])
         reopened = Database(self.database.path)
         try:
@@ -257,8 +257,8 @@ class SandboxPathsAPITests(PathFixture, unittest.IsolatedAsyncioTestCase):
                 await self.settings(sandbox_paths=paths)
             self.assertEqual((await self.main.get_sandbox_paths())["sandbox_paths"], [self.entry()])
         with self.assertRaises(HTTPException):
-            await self.project_settings(archived=True, sandbox_paths=[{"path": "relative"}])
-        self.assertIsNone(self.database.get_project(str(self.work))["archived_at"])
+            await self.project_settings(sandbox_paths=[{"path": "relative"}])
+        self.assertEqual(self.database.get_project(str(self.work))["sandbox_paths"], [])
         created = await self.main.create_project(self.main.CreateProjectRequest(
             path=str(self.root / "new-project"), sandbox_paths=[self.entry(True)]))
         self.assertEqual(created["sandbox_paths"], [self.entry(True)])

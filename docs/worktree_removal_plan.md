@@ -1,5 +1,10 @@
 # Plan: allow worktree removal while preserving sessions
 
+**Historical scope note:** this plan predates archive removal. Archive state and
+explicit detachment have since been removed; the statements below that retain
+them are superseded by [archive_removal_client_handoff.md](archive_removal_client_handoff.md).
+The worktree-removal and saved-path behavior remains in place.
+
 Status: server implemented; client implementation remains separate work.
 See [worktree_removal_server_handoff.md](worktree_removal_server_handoff.md) for the server contract.
 
