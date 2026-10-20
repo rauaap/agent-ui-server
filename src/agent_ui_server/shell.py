@@ -83,25 +83,32 @@ async def run_command(
 
     stdout_task = asyncio.create_task(_drain(process.stdout, limit))
     stderr_task = asyncio.create_task(_drain(process.stderr, limit))
+    completion = asyncio.gather(process.wait(), stdout_task, stderr_task)
     timed_out = False
 
     try:
         try:
-            await asyncio.wait_for(process.wait(), timeout)
+            # The deadline includes draining pipes held open by descendants.
+            # Keep the readers alive during cleanup to preserve captured output.
+            await asyncio.wait_for(asyncio.shield(completion), timeout)
         except asyncio.TimeoutError:
             timed_out = True
             await _kill_group(process)
+            # A descendant may have escaped the group while retaining stdio.
+            _close_output_pipes(process)
+            await asyncio.wait_for(completion, KILL_GRACE_SECONDS)
 
-        # The readers finish as soon as the pipes close, which the kill above
-        # guarantees, so whatever the command managed to print is still here.
-        stdout, stdout_truncated = await stdout_task
-        stderr, stderr_truncated = await stderr_task
+        _, (stdout, stdout_truncated), (stderr, stderr_truncated) = completion.result()
     except asyncio.CancelledError:
-        # No awaiting on the way out — a second cancel would strand the
-        # process. Signal the group outright and let the loop reap it.
+        # Signal and close pipes before awaiting cleanup, so a second cancel
+        # cannot strand the process or leave inherited pipes open.
         _signal_group(process, signal.SIGKILL)
-        stdout_task.cancel()
-        stderr_task.cancel()
+        _close_output_pipes(process)
+        completion.cancel()
+        try:
+            await completion
+        except asyncio.CancelledError:
+            pass
         raise
 
     return {
@@ -174,25 +181,27 @@ async def _drain(
 
 
 async def _kill_group(process: asyncio.subprocess.Process) -> None:
-    """SIGTERM the command's process group, then SIGKILL if it lingers."""
-    if process.returncode is not None:
-        return
-
+    """Terminate descendants even if the original shell has already exited."""
     _signal_group(process, signal.SIGTERM)
-    try:
-        await asyncio.wait_for(process.wait(), KILL_GRACE_SECONDS)
-    except asyncio.TimeoutError:
-        _signal_group(process, signal.SIGKILL)
-        await process.wait()
+    await asyncio.sleep(KILL_GRACE_SECONDS)
+    _signal_group(process, signal.SIGKILL)
 
 
 def _signal_group(process: asyncio.subprocess.Process, sig: int) -> None:
-    if process.returncode is not None:
-        return
     try:
-        os.killpg(os.getpgid(process.pid), sig)
+        # start_new_session=True makes the original PID the group ID. Looking
+        # it up would fail once the shell exits, even if descendants remain.
+        os.killpg(process.pid, sig)
     except ProcessLookupError:
         pass
+
+
+def _close_output_pipes(process: asyncio.subprocess.Process) -> None:
+    # asyncio.Process has no public API for closing its read-pipe transports.
+    for fd in (1, 2):
+        transport = process._transport.get_pipe_transport(fd)
+        if transport is not None:
+            transport.close()
 
 
 def _build_env() -> dict[str, str]:
