@@ -1,0 +1,1934 @@
+{
+  "capture": {
+    "harness": "Pi",
+    "version": "1.1.0",
+    "generated_using_installed_serializer": true,
+    "source": "dist/modes/json-event.js:toJsonEvent",
+    "synthetic_input": true,
+    "observations": [
+      "RPC omits partial and message snapshots on updates",
+      "toolcall_start supplies id and toolName",
+      "raw JSON is split at every escape boundary"
+    ]
+  },
+  "expected": {
+    "text": "Hello world!",
+    "arguments_json": "{\"message\":\"Hello \\\"quoted\\\" \\\\ path\\nemoji \\ud83d\\ude00\",\"session_id\":42}",
+    "arguments": {
+      "message": "Hello \"quoted\" \\ path\nemoji 😀",
+      "session_id": 42
+    }
+  },
+  "events": [
+    {
+      "type": "message_start",
+      "message": {
+        "role": "assistant",
+        "content": [],
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
+        "stopReason": "pending",
+        "timestamp": 1
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "thinking_start",
+        "contentIndex": 0
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "thinking_delta",
+        "contentIndex": 0,
+        "delta": "not public"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "thinking_end",
+        "contentIndex": 0,
+        "content": "not public"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "text_start",
+        "contentIndex": 1
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_start",
+        "contentIndex": 2,
+        "id": "rpc-call",
+        "toolName": "message_session"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "text_delta",
+        "contentIndex": 1,
+        "delta": "Hello"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "{"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "\""
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "m"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "e"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "s"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "s"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "a"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "g"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "e"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "\""
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": ":"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "\""
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "H"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "e"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "l"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "l"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "o"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": " "
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "\\"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "\""
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "q"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "u"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "o"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "t"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "e"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "d"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "\\"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "\""
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": " "
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "\\"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "\\"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": " "
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "p"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "a"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "t"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "h"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "\\"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "n"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "e"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "m"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "o"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "j"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "i"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": " "
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "\\"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "u"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "d"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "8"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "3"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "d"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "\\"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "u"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "d"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "e"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "0"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "0"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "\""
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": ","
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "\""
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "s"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "e"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "s"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "s"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "i"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "o"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "n"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "_"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "i"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "d"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "\""
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": ":"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "4"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "2"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 2,
+        "delta": "}"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "text_delta",
+        "contentIndex": 1,
+        "delta": " world"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "text_end",
+        "contentIndex": 1,
+        "content": "Hello world!"
+      }
+    },
+    {
+      "type": "message_update",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "assistantMessageEvent": {
+        "type": "toolcall_end",
+        "contentIndex": 2,
+        "toolCall": {
+          "type": "toolCall",
+          "id": "rpc-call",
+          "name": "message_session",
+          "arguments": {
+            "message": "Hello \"quoted\" \\ path\nemoji 😀",
+            "session_id": 42
+          }
+        }
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "thinking",
+            "thinking": "not public"
+          },
+          {
+            "type": "text",
+            "text": "Hello world!"
+          },
+          {
+            "type": "toolCall",
+            "id": "rpc-call",
+            "name": "message_session",
+            "arguments": {
+              "message": "Hello \"quoted\" \\ path\nemoji 😀",
+              "session_id": 42
+            }
+          }
+        ],
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
+        "stopReason": "toolUse",
+        "timestamp": 1
+      }
+    },
+    {
+      "type": "tool_execution_start",
+      "toolCallId": "rpc-call",
+      "toolName": "message_session",
+      "args": {
+        "message": "Hello \"quoted\" \\ path\nemoji 😀",
+        "session_id": 42
+      }
+    },
+    {
+      "type": "agent_settled",
+      "aborted": false
+    }
+  ]
+}

@@ -155,6 +155,8 @@ class PiProtocolTests(unittest.IsolatedAsyncioTestCase):
             ({"type": "tool_execution_start", "toolName": "bash", "args": {}}, "toolCallId"),
             ({"type": "tool_execution_start", "toolCallId": "call-1", "args": {}}, "toolName"),
             ({"type": "message_update", "assistantMessageEvent": {"type": "text_end"}}, "content"),
+            ({"type": "message_update", "assistantMessageEvent": {"type": "toolcall_start", "contentIndex": 0, "toolName": "bash"}}, "id"),
+            ({"type": "message_update", "assistantMessageEvent": {"type": "toolcall_start", "contentIndex": 0, "id": "call-1"}}, "toolName"),
             ({"type": "extension_ui_request", "method": "select", "id": "approval-1",
               "title": json.dumps({"agent-ui": 1, "kind": "approval", "toolName": "bash"})}, "toolCallId"),
             ({"type": "extension_ui_request", "method": "select", "id": "approval-1",

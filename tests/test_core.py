@@ -1647,9 +1647,10 @@ class ClaudeCodeAdapterParsingTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual(events[0], {"type": "output", "text": "hello"})
+        self.assertEqual([e["type"] for e in events], ["_stream_start", "output", "_stream_start", "tool_use"])
+        self.assertEqual(events[1], {"type": "output", "text": "hello", "stream_id": events[0]["draft"]["stream_id"]})
         self.assertEqual(
-            events[1],
+            {key: value for key, value in events[3].items() if key != "stream_id"},
             {
                 "type": "tool_use",
                 "call_id": "call-1",
@@ -1770,7 +1771,7 @@ class ClaudeCodeAdapterParsingTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             _normalize_questions(None)
 
-    def test_assistant_events_omit_askuserquestion_tool_use(self) -> None:
+    def test_assistant_events_include_correlated_question_tool_use(self) -> None:
         events = self.adapter._assistant_events(
             {
                 "type": "assistant",
@@ -1779,6 +1780,7 @@ class ClaudeCodeAdapterParsingTests(unittest.TestCase):
                         {"type": "text", "text": "thinking"},
                         {
                             "type": "tool_use",
+                            "id": "question-call",
                             "name": "AskUserQuestion",
                             "input": {"questions": []},
                         },
@@ -1793,10 +1795,12 @@ class ClaudeCodeAdapterParsingTests(unittest.TestCase):
             }
         )
 
+        finals = [{key: value for key, value in e.items() if key != "stream_id"} for e in events if e["type"] in {"output", "tool_use"}]
         self.assertEqual(
-            events,
+            finals,
             [
                 {"type": "output", "text": "thinking"},
+                {"type": "tool_use", "call_id": "question-call", "action": {"kind": "other", "name": "AskUserQuestion", "arguments": {"questions": []}}},
                 {
                     "type": "tool_use",
                     "call_id": "call-2",
@@ -1995,7 +1999,9 @@ for line in sys.stdin:
                   "stopReason": "error", "errorMessage": "quota exceeded"}}
         adapter = self._adapter({"steps": [
             {"type": "message_update", "assistantMessageEvent": {
-                "type": "text_delta", "delta": "partial"}},
+                "type": "text_start", "contentIndex": 0}},
+            {"type": "message_update", "assistantMessageEvent": {
+                "type": "text_delta", "contentIndex": 0, "delta": "partial"}},
             failed,
             {"type": "auto_retry_start", "attempt": 1},
             {"type": "auto_retry_end", "success": False, "finalError": "quota exceeded"},
@@ -2005,12 +2011,9 @@ for line in sys.stdin:
             {"type": "agent_settled"},
         ]})
         events = await self._collect(adapter)
-        self.assertEqual(events, [
-            {"type": "session", "session_id": "sess-abc"},
-            {"type": "output", "text": "partial"},
-            {"type": "error", "message": "quota exceeded"},
-            {"type": "done"},
-        ])
+        self.assertEqual([e["type"] for e in events], ["session", "_stream_start", "_stream_delta", "_stream_interrupt", "error", "done"])
+        self.assertEqual(events[2]["text"], "partial")
+        self.assertEqual(events[-2], {"type": "error", "message": "quota exceeded"})
 
     async def test_recovered_provider_error_is_not_reported(self):
         adapter = self._adapter({"steps": [
@@ -2083,7 +2086,7 @@ for line in sys.stdin:
                 ],
                 "after_answers": [
                     {"type": "message_update",
-                     "assistantMessageEvent": {"type": "text_end", "content": "done!"}},
+                     "assistantMessageEvent": {"type": "text_end", "contentIndex": 0, "content": "done!"}},
                     {"type": "agent_settled"},
                 ],
             }
@@ -2098,7 +2101,7 @@ for line in sys.stdin:
         by_type = {e["type"]: e for e in events}
 
         self.assertEqual(
-            by_type["tool_use"],
+            {key: value for key, value in by_type["tool_use"].items() if key != "stream_id"},
             {
                 "type": "tool_use",
                 "call_id": "c1",
@@ -2133,7 +2136,7 @@ for line in sys.stdin:
         adapter = self._adapter(
             {
                 "steps": [
-                    # The question tool must not also render a tool bubble.
+                    # Completed generation and the controls correlate by call_id.
                     {"type": "tool_execution_start", "toolCallId": "c9",
                      "toolName": "AskUserQuestion", "args": {"questions": []}},
                     dialog(0, "Database", "Postgres"),
@@ -2159,10 +2162,9 @@ for line in sys.stdin:
         self.assertEqual(
             [q["header"] for q in questions[0]["questions"]], ["Database", "Client"]
         )
-        self.assertFalse(
-            [e for e in events if e["type"] == "tool_use"],
-            "AskUserQuestion should not emit a tool_use bubble",
-        )
+        tools = [e for e in events if e["type"] == "tool_use"]
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0]["call_id"], questions[0]["call_id"])
 
     async def test_turn_refuses_to_run_without_the_extension_handshake(self):
         adapter = self._adapter({"ready": False, "steps": [{"type": "agent_settled"}]})
@@ -2257,6 +2259,10 @@ class _FakeWebSocket:
         await self.send_gate.wait()
         self.sent.append(message)
 
+    async def send_text(self, message: str) -> None:
+        message.encode("utf-8")
+        await self.send_json(json.loads(message))
+
     async def receive_json(self) -> dict[str, Any]:
         if self.closed:
             from fastapi import WebSocketDisconnect
@@ -2323,12 +2329,13 @@ class WebSocketOrderingTests(unittest.IsolatedAsyncioTestCase):
             lambda _result: [{"type": "status", "status": "idle"}],
         )
         websocket.send_gate.set()
-        await self.wait_for(lambda: len(websocket.sent) == 4)
+        await self.wait_for(lambda: len(websocket.sent) == 5)
 
         self.assertEqual(
             websocket.sent,
             [
                 {"type": "output", "text": "old", "event_id": old["id"]},
+                {"type": "stream_snapshot", "drafts": []},
                 {"type": "input_queue", "messages": []},
                 {"type": "status", "status": "running"},
                 {"type": "status", "status": "idle"},
@@ -2356,14 +2363,14 @@ class WebSocketOrderingTests(unittest.IsolatedAsyncioTestCase):
                 == "awaiting_approval"
             )
             websocket.send_gate.set()
-            await self.wait_for(lambda: len(websocket.sent) == 4)
+            await self.wait_for(lambda: len(websocket.sent) == 5)
 
             self.assertEqual(
                 [event["type"] for event in websocket.sent],
-                ["input_queue", "status", "status", "approval_request"],
+                ["stream_snapshot", "input_queue", "status", "status", "approval_request"],
             )
             self.assertEqual(
-                websocket.sent[2]["status"], "awaiting_approval"
+                websocket.sent[3]["status"], "awaiting_approval"
             )
             self.assertEqual(
                 self.main.db.recent_scrollback(session_id)[-1]["type"],
@@ -2457,7 +2464,7 @@ class WebSocketOrderingTests(unittest.IsolatedAsyncioTestCase):
         websocket = _FakeWebSocket()
         endpoint = asyncio.create_task(self.main.session_websocket(websocket, session_id))
         try:
-            await self.wait_for(lambda: len(websocket.sent) == self.main.SCROLLBACK_REPLAY_LIMIT + 2)
+            await self.wait_for(lambda: len(websocket.sent) == self.main.SCROLLBACK_REPLAY_LIMIT + 3)
             self.assertNotIn("input", [frame["type"] for frame in websocket.sent])
             snapshot = websocket.sent[-2]
             self.assertEqual(snapshot["type"], "input_queue")
@@ -2473,7 +2480,7 @@ class WebSocketOrderingTests(unittest.IsolatedAsyncioTestCase):
         endpoint = asyncio.create_task(
             self.main.session_websocket(websocket, session_id)
         )
-        await self.wait_for(lambda: len(websocket.sent) == 2)
+        await self.wait_for(lambda: len(websocket.sent) == 3)
         subscriber = next(iter(self.main.subscribers[session_id]))
         assert subscriber.writer is not None
 

@@ -14,6 +14,35 @@ def write(value):
 
 names = ["message_session", "start_session", "read_session"]
 pi = "--mode" in sys.argv
+
+
+def stream_call(config):
+    raw = json.dumps(config["arguments"])
+    name = config["name"] if pi else "mcp__agent_ui__" + config["name"]
+    call_id = "call" if pi else "toolu_call"
+    block = {"type": "toolCall" if pi else "tool_use", "id": call_id, "name": name,
+             "arguments" if pi else "input": {}}
+    def partial(event):
+        write({"type": "message_update", "assistantMessageEvent": event} if pi else
+              {"type": "stream_event", "event": event})
+    if pi:
+        write({"type": "message_start", "message": {"role": "assistant", "content": []}})
+        partial({"type": "toolcall_start", "contentIndex": 0, "id": call_id, "toolName": name})
+    else:
+        partial({"type": "message_start", "message": {"id": "streamed-message"}})
+        partial({"type": "content_block_start", "index": 0, "content_block": block})
+    for index in range(0, len(raw), 128):
+        delta = raw[index:index + 128]
+        if pi:
+            partial({"type": "toolcall_delta", "contentIndex": 0, "delta": delta})
+        else:
+            partial({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": delta}})
+    if pi:
+        partial({"type": "toolcall_end", "contentIndex": 0, "toolCall": {**block, "arguments": config["arguments"]}})
+    else:
+        block["input"] = config["arguments"]
+        write({"type": "assistant", "message": {"id": "streamed-message", "content": [block]}})
+        partial({"type": "content_block_stop", "index": 0})
 if pi:
     write({"type": "extension_ui_request", "method": "notify", "message": json.dumps({
         "agent-ui": 1, "kind": "ready", "sessionTools": names,
@@ -27,6 +56,8 @@ if pi:
         if request["type"] == "get_state":
             write({"type": "response", "command": "get_state", "id": request["id"],
                    "success": True, "data": {"sessionId": "test-session"}})
+    if config.get("stream"):
+        stream_call(config)
     write({"type": "tool_execution_start", "toolCallId": "call",
            "toolName": config["name"], "args": config["arguments"]})
     write({"type": "extension_ui_request", "method": "input", "id": "call", "title": json.dumps({
@@ -39,8 +70,9 @@ if pi:
             "agent-ui": 1, "kind": "host_cancel", "toolCallId": "call",
         })})
         response = read()
+    write({"type": "message_start", "message": {"role": "assistant", "content": []}})
     write({"type": "message_update", "assistantMessageEvent": {
-        "type": "text_delta", "delta": json.dumps(response),
+        "type": "text_end", "contentIndex": 0, "content": json.dumps(response),
     }})
     write({"type": "agent_settled"})
 else:
@@ -64,10 +96,13 @@ else:
         "input": config["arguments"], "tool_use_id": "toolu_call",
     }})
     assert read()["response"]["response"]["behavior"] == "allow"
-    write({"type": "assistant", "message": {"content": [{
-        "type": "tool_use", "id": "toolu_call", "name": "mcp__agent_ui__" + config["name"],
-        "input": config["arguments"],
-    }]}})
+    if config.get("stream"):
+        stream_call(config)
+    else:
+        write({"type": "assistant", "message": {"content": [{
+            "type": "tool_use", "id": "toolu_call", "name": "mcp__agent_ui__" + config["name"],
+            "input": config["arguments"],
+        }]}})
     mcp("call", "tools/call", **config, _meta={"claudecode/toolUseId": "toolu_call"})
     response = read()
     if response.get("type") == "test_cancel":

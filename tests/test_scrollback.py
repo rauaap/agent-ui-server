@@ -82,6 +82,22 @@ class ScrollbackTests(unittest.IsolatedAsyncioTestCase):
             "queued_messages": [],
         })
 
+    async def test_interrupted_partial_surrogates_persist_and_round_trip_http(self):
+        tool_draft = {"stream_id": "s1", "turn_id": "t1", "ordinal": 0, "revision": 1,
+                      "kind": "tool", "call_id": "c1", "name": "message_session",
+                      "arguments_json": '{"message":"emoji \\ud83d',
+                      "arguments_preview": {"message": "emoji \ud83d"}}
+        text_draft = {"stream_id": "s2", "turn_id": "t1", "ordinal": 1, "revision": 1,
+                      "kind": "text", "text": "emoji \ud83d"}
+        rows = [self.db.append_scrollback(self.session, "stream_interrupted", {"draft": draft, "reason": "cancelled"}) for draft in (tool_draft, text_draft)]
+        status, body = await self.get()
+        self.assertEqual(status, 200)
+        self.assertEqual(body["messages"], rows)
+        self.assertEqual(body["messages"][0]["payload"]["draft"], tool_draft)
+        self.assertEqual(body["messages"][1]["payload"]["draft"], text_draft)
+        page = await main.session_tool_operation(self.other, "read_session", {"session_id": self.session, "limit": 200})
+        self.assertEqual(page["messages"], rows)
+
     async def test_backward_pages_use_nearest_events_with_gapped_ids(self):
         rows = []
         for i in range(405):

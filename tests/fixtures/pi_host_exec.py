@@ -35,8 +35,9 @@ for line in sys.stdin:
         emit({"type": "extension_ui_request", "method": "notify", "id": "cancel",
               "message": envelope("host_cancel", toolCallId=message["call_id"])})
     elif message["type"] == "extension_ui_response":
+        emit({"type": "message_start", "message": {"role": "assistant", "content": []}})
         emit({"type": "message_update", "assistantMessageEvent": {
-            "type": "text_end", "content": json.dumps(message),
+            "type": "text_end", "contentIndex": 0, "content": json.dumps(message),
         }})
         pending.discard(message["id"])
         if not pending:

@@ -856,8 +856,9 @@ Connect to:
 
 The socket is bidirectional. On connect, the server atomically establishes a
 snapshot boundary, queues up to the latest 200 persisted transcript rows, then
-sends current `input_queue` and `status` snapshots. Live events follow the snapshot
-without interleaving. Every connection has one bounded writer queue, so a slow
+sends one frozen `stream_snapshot` (including an empty draft list), followed by
+current `input_queue` and `status` snapshots. `status` remains the end-of-replay
+marker. Live events follow this boundary without interleaving. Every connection has one bounded writer queue, so a slow
 or failed client cannot block healthy subscribers.
 
 Clients can send:
@@ -946,13 +947,48 @@ provider-name table and no `category` field on the wire. An auto-approved
 request carries `"auto_approved": true` and is followed by an
 `approval_response` with `"auto": true`.
 
+### Live model output
+
+Claude Code runs with `--include-partial-messages`; Pi uses assistant-message
+updates. Text and tool argument generation appear as read-only drafts:
+
+```jsonc
+{"type":"stream_start","draft":{"stream_id":"s1","turn_id":"t1","ordinal":0,"revision":0,"kind":"text","text":""}}
+{"type":"stream_delta","stream_id":"s1","revision":1,"delta":"Hello"}
+{"type":"output","text":"Hello","stream_id":"s1","turn_id":"t1","ordinal":0,"event_id":124}
+```
+
+A final `output` or canonical `tool_use` replaces its draft by `stream_id`.
+Tool drafts carry native `name`, `call_id`, accumulated `arguments_json` and a
+provisional `arguments_preview` object, **not** a canonical action. Tool deltas
+carry the current replacement preview alongside the native JSON fragment. The
+Python `partial-json-parser` dependency supplies provisional previews for both
+providers. Pi's JSON/RPC updates are delta-only: the transport strips the SDK's
+partial-message snapshots. Only complete calls reach canonical validators.
+
+Starts/deltas/snapshots and empty-placeholder `stream_remove` frames are
+transient, never scrollback rows or cursors. Interrupted substantive drafts
+become durable `stream_interrupted` rows with `reason` (`cancelled`, `error`,
+`retry`, `incomplete`). Unfinished drafts live only in memory until orderly
+interruption; a hard server crash loses them.
+
+Generation completion does not authorize execution. Only explicit
+`approval_request`/`question` events create controls. Question tools now also
+emit a completed `tool_use`; `question.call_id` links the request to that same
+card. Inter-agent message drafts go only to sender subscribers; recipient input
+still requires full argument validation, approval and atomic submission.
+
+See [the client handoff](docs/model-streaming-client-handoff.md) for exact frame
+shapes, revisions, reconciliation, and replay rules. Server implementation is
+staged for owner review; desktop/Android implementation is a later phase.
+
 ### Other server events
 
 ```jsonc
-{ "type": "output", "text": "Streaming agent text" }
+{ "type": "output", "text": "Completed agent text" }
 { "type": "status", "status": "running" } // idle | running | awaiting_approval
 { "type": "approval_response", "request_id": "perm_1", "behavior": "allow" }
-{ "type": "question", "request_id": "question_1", "questions": [/* ... */] }
+{ "type": "question", "request_id": "question_1", "call_id": "toolu_01ABC", "questions": [/* ... */] }
 { "type": "question_response", "request_id": "question_1", "answers": {/* ... */} }
 { "type": "input", "text": "Echoed prompt" }
 { "type": "bash_input", "command": "pytest -q" }

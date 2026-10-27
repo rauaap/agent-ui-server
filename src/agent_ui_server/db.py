@@ -741,7 +741,9 @@ class Database:
     ) -> dict[str, Any]:
         """Caller holds the database lock and transaction."""
         ts = utc_now()
-        encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+        # Interrupted drafts may contain a partial Unicode surrogate pair.
+        # JSON escapes retain those code units without invalid SQLite UTF-8.
+        encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
         cursor = self._conn.execute(
             """
             INSERT INTO scrollback (session_id, ts, type, payload)

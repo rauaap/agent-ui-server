@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sqlite3
+import uuid
 from collections import defaultdict
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -13,7 +15,7 @@ from typing import Annotated, Any
 from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, StrictStr, field_validator, model_validator
-from starlette.responses import FileResponse
+from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Match, Mount
 from starlette.types import Scope
 
@@ -21,6 +23,7 @@ from . import git, shell
 from .shared_assets import ASSET_HEADERS, AssetFiles, CreateAssetRoot, UpdateAssetRoot, resolve_asset_link, root_object
 from .actions import auto_approval_setting
 from .agent import AgentAdapter
+from .streaming import DraftRegistry
 from .agent_registry import adapter_types
 from .db import Database
 from .images import FORMATS, ImageMetadata, native_images, upload_image
@@ -121,6 +124,7 @@ file_socket_tasks: dict[int, set[asyncio.Task[None]]] = defaultdict(set)
 # Session ids are monotonic and the expected count is tiny. Keeping locks for
 # the process lifetime avoids unsafe cleanup while another task is waiting.
 stream_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+active_streams: dict[int, DraftRegistry] = {}
 running_tasks: dict[int, asyncio.Task[None]] = {}
 stopping_sessions: set[int] = set()
 stop_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -871,7 +875,13 @@ async def delete_session(session_id: int) -> dict[str, str]:
     return {"status": "deleted"}
 
 
-@app.get("/sessions/{session_id}/scrollback")
+class ScrollbackJSONResponse(JSONResponse):
+    def render(self, content: Any) -> bytes:
+        # Durable interrupted previews can contain incomplete surrogate pairs.
+        return json.dumps(content, ensure_ascii=True, allow_nan=False, separators=(",", ":")).encode("utf-8")
+
+
+@app.get("/sessions/{session_id}/scrollback", response_class=ScrollbackJSONResponse)
 async def get_scrollback(
     session_id: int,
     after: int | None = Query(default=None, ge=0),
@@ -1070,7 +1080,7 @@ async def session_websocket(websocket: WebSocket, session_id: int) -> None:
             outbound: asyncio.Queue[dict[str, Any]] = asyncio.Queue(
                 maxsize=(
                     SCROLLBACK_REPLAY_LIMIT
-                    + 3
+                    + 4
                     + WEBSOCKET_LIVE_QUEUE_CAPACITY
                 )
             )
@@ -1079,6 +1089,8 @@ async def session_websocket(websocket: WebSocket, session_id: int) -> None:
                 session_id, SCROLLBACK_REPLAY_LIMIT
             ):
                 outbound.put_nowait(frame_for_scrollback(row))
+            registry = active_streams.get(session_id)
+            outbound.put_nowait(registry.snapshot() if registry is not None else {"type": "stream_snapshot", "drafts": []})
             outbound.put_nowait(
                 {"type": "input_queue", "messages": db.pending_inputs(session_id)}
             )
@@ -1267,6 +1279,10 @@ async def run_turn(session_id: int, prompt: str, images: list[dict[str, Any]] | 
 
     completed = False
     failed = False
+    done_seen = False
+    interruption_reason = "incomplete"
+    registry = DraftRegistry(uuid.uuid4().hex)
+    await commit_stream(session_id, lambda: active_streams.__setitem__(session_id, registry), lambda _: [])
     try:
         if session.get("sandbox", True):
             defaults, project_paths = db.sandbox_paths_snapshot(session["project_id"])
@@ -1285,6 +1301,15 @@ async def run_turn(session_id: int, prompt: str, images: list[dict[str, Any]] | 
         async for event in turn:
             event_type = event.get("type")
             failed = failed or event_type == "error"
+            done_seen = done_seen or event_type == "done"
+            if event_type in {"_stream_start", "_stream_delta"}:
+                await commit_stream(session_id, lambda: registry.apply(event), lambda frame: [frame])
+                continue
+            if event_type == "_stream_interrupt":
+                await interrupt_streams(session_id, event["reason"], event.get("stream_id"))
+                continue
+            if event_type in {"error", "done"}:
+                await interrupt_streams(session_id, "error" if event_type == "error" else "incomplete")
 
             # The harness reports its session id at the start of every turn;
             # only a new agent session needs it stored.
@@ -1321,17 +1346,22 @@ async def run_turn(session_id: int, prompt: str, images: list[dict[str, Any]] | 
 
             def record_event() -> dict[str, Any]:
                 frame = event
+                stream_id = event.get("stream_id")
+                if stream_id is not None:
+                    frame = {**event, **registry.metadata[stream_id]}
                 if persisted:
                     row = db.append_scrollback(
                         session_id,
                         event_type,
                         {
                             key: value
-                            for key, value in event.items()
+                            for key, value in frame.items()
                             if key != "type"
                         },
                     )
                     frame = frame_for_scrollback(row)
+                    if stream_id is not None:
+                        registry.drafts.pop(stream_id, None)
                 # A pending question blocks on the user just like an approval.
                 # Auto-approved requests never leave running state.
                 if awaiting:
@@ -1353,8 +1383,15 @@ async def run_turn(session_id: int, prompt: str, images: list[dict[str, Any]] | 
                 await handle_approval(
                     session_id, event["request_id"], "allow", auto=True
                 )
-        completed = not failed
+        completed = done_seen and not failed
+        if failed:
+            interruption_reason = "error"
+    except asyncio.CancelledError:
+        interruption_reason = "cancelled"
+        raise
     except Exception as exc:
+        interruption_reason = "error"
+        await interrupt_streams(session_id, "error")
         message = f"Agent turn failed: {exc}"
         await commit_stream(
             session_id,
@@ -1364,6 +1401,8 @@ async def run_turn(session_id: int, prompt: str, images: list[dict[str, Any]] | 
             lambda row: [frame_for_scrollback(row)],
         )
     finally:
+        await interrupt_streams(session_id, interruption_reason)
+        await commit_stream(session_id, lambda: active_streams.pop(session_id, None), lambda _: [])
         async with turn_lock:
             # Only the task that owns the slot may release it. Cancellation,
             # Stop, failures and shutdown never automatically consume the inbox.
@@ -1607,6 +1646,18 @@ async def commit_stream(
     return result
 
 
+async def interrupt_streams(session_id: int, reason: str, stream_id: str | None = None) -> None:
+    def mutation() -> list[dict[str, Any]]:
+        registry = active_streams.get(session_id)
+        if registry is None:
+            return []
+        def persist(event: dict[str, Any]) -> dict[str, Any]:
+            row = db.append_scrollback(session_id, event["type"], {key: value for key, value in event.items() if key != "type"})
+            return frame_for_scrollback(row)
+        return registry.interrupt(reason, persist, stream_id)
+    await commit_stream(session_id, mutation, lambda frames: frames)
+
+
 async def broadcast(session_id: int, message: dict[str, Any]) -> None:
     await commit_stream(session_id, lambda: None, lambda _result: [message])
 
@@ -1634,7 +1685,12 @@ async def write_subscriber(subscriber: Subscriber) -> None:
         while True:
             frame = await subscriber.outbound.get()
             async with asyncio.timeout(WEBSOCKET_SEND_TIMEOUT_SECONDS):
-                await subscriber.websocket.send_json(frame)
+                # A provisional JSON string can end halfway through a Unicode
+                # surrogate pair. Escape code units so transport UTF-8 remains
+                # valid without changing native fragments or preview content.
+                await subscriber.websocket.send_text(
+                    json.dumps(frame, separators=(",", ":"), ensure_ascii=True)
+                )
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -1655,6 +1711,7 @@ async def teardown_session(session: dict[str, Any]) -> None:
             for subscriber in doomed:
                 retire_subscriber_locked(session_id, subscriber)
             file_endpoints = list(file_socket_tasks.get(session_id, set()))
+            active_streams.pop(session_id, None)
             db.delete_session(session_id)
 
         for endpoint in file_endpoints:

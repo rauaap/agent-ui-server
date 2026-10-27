@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .actions import approval_request_event, tool_use_event
+from .streaming import ClaudeBlocks, PiBlocks
 from .asset_tools import NAME as ASSET_TOOL_NAME, execute_asset_tool, validate_asset_arguments
 from .session_tools import MODELS, SessionOperation, agent_description, execute_session_tool, validate_session_arguments
 from .sandbox import claude_sandbox_command, pi_sandbox_command
@@ -288,6 +289,7 @@ class ClaudeCodeAdapter(AgentAdapter):
         self.pending_question_specs: dict[str, list[dict[str, Any]]] = {}
         self.tool_actions: dict[tuple[int, str], dict[str, Any]] = {}
         self.server_tools: dict[int, ServerTools] = {}
+        self._streams: dict[int, ClaudeBlocks] = {}
 
     async def start_turn(
         self,
@@ -317,6 +319,7 @@ class ClaudeCodeAdapter(AgentAdapter):
                 "sandbox": {"autoAllowBashIfSandboxed": False},
             }),
             "--verbose",
+            "--include-partial-messages",
         ]
         bypass_sandbox_enabled = session.get("sandbox", True)
         command.extend(["--mcp-config", json.dumps({
@@ -364,6 +367,7 @@ class ClaudeCodeAdapter(AgentAdapter):
             return
 
         self.processes[session_id] = process
+        self._streams[session_id] = ClaudeBlocks(lambda block: self._tool_use_event(block, session_id))
         stderr_task = asyncio.create_task(self._collect_stderr(process.stderr))
         result_seen = False
         error_seen = False
@@ -433,6 +437,7 @@ class ClaudeCodeAdapter(AgentAdapter):
             self.processes.pop(session_id, None)
             await self._clear_session_approvals(session_id, "Session ended")
             self._clear_tool_actions(session_id)
+            self._streams.pop(session_id, None)
             if not stderr_task.done():
                 stderr_task.cancel()
 
@@ -522,13 +527,25 @@ class ClaudeCodeAdapter(AgentAdapter):
     ) -> AsyncIterator[AgentEvent]:
         event_type = event.get("type")
 
+        if event_type in {"assistant", "stream_event", "tool_use"} and event.get("parent_tool_use_id"):
+            return
+
+        if event_type == "stream_event":
+            stream = self._streams.setdefault(session_id, ClaudeBlocks(lambda block: self._tool_use_event(block, session_id)))
+            for partial in stream.partial(event["event"]):
+                yield partial
+            return
+
         if event_type == "assistant":
             for output_event in self._assistant_events(event, session_id):
                 yield output_event
             return
 
         if event_type == "tool_use":
-            yield self._tool_use_event(event, session_id)
+            stream = self._streams.setdefault(session_id, ClaudeBlocks(lambda block: self._tool_use_event(block, session_id)))
+            key = next((key for key, draft in stream.blocks.items() if draft.get("call_id") == event["id"]), ("call", event["id"]))
+            for output_event in stream.finish(key, {**event, "type": "tool_use"}):
+                yield output_event
             return
 
         if event_type == "control_request":
@@ -564,6 +581,7 @@ class ClaudeCodeAdapter(AgentAdapter):
                 yield {
                     "type": "question",
                     "request_id": request_id,
+                    "call_id": _call_id,
                     "questions": questions,
                 }
 
@@ -627,27 +645,10 @@ class ClaudeCodeAdapter(AgentAdapter):
     def _assistant_events(
         self, event: dict[str, Any], session_id: int = 0
     ) -> list[AgentEvent]:
-        content = event["message"]["content"]
-
-        if isinstance(content, str):
-            return [{"type": "output", "text": content}] if content else []
-
-        events: list[AgentEvent] = []
-        if isinstance(content, list):
-            for block in content:
-                if not isinstance(block, dict):
-                    continue
-                block_type = block.get("type")
-                if block_type == "text" and block.get("text"):
-                    events.append({"type": "output", "text": block["text"]})
-                elif block_type in {"tool_use", "server_tool_use"}:
-                    # AskUserQuestion is surfaced as a `question` event via its
-                    # control_request, so don't also emit a tool_use bubble.
-                    if block.get("name") == self.QUESTION_TOOL:
-                        continue
-                    events.append(self._tool_use_event(block, session_id))
-
-        return events
+        if event.get("parent_tool_use_id"):
+            return []
+        stream = self._streams.setdefault(session_id, ClaudeBlocks(lambda block: self._tool_use_event(block, session_id)))
+        return stream.assistant(event["message"], event.get("uuid"))
 
     def _tool_use_event(
         self, event: dict[str, Any], session_id: int = 0
@@ -1007,7 +1008,7 @@ class PiAdapter(AgentAdapter):
         tool_actions: dict[str, dict[str, Any]] = {}
         deny_reasons: dict[str, str] = {}
         batches: dict[str, dict[str, Any]] = {}
-        text_buf: list[str] = []
+        stream = PiBlocks(lambda block: tool_use_event(block["id"], action_or_other(block["name"], block["input"], PI_TOOL_TRANSLATORS)))
         pending_error: str | None = None
 
         assert process.stdin is not None
@@ -1046,13 +1047,9 @@ class PiAdapter(AgentAdapter):
             resolvers.add(task)
             task.add_done_callback(resolvers.discard)
 
-        async def flush_text() -> None:
-            if not text_buf:
-                return
-            text = "".join(text_buf)
-            text_buf.clear()
-            if text.strip():
-                await queue.put({"type": "output", "text": text})
+        async def publish(events: list[AgentEvent]) -> None:
+            for event in events:
+                await queue.put(event)
 
         async def resolve_approval(
             request_id: str,
@@ -1092,7 +1089,6 @@ class PiAdapter(AgentAdapter):
             self.pending_sessions[request_id] = session_id
             self.pending_options[request_id] = self.OPTIONS
             try:
-                await flush_text()
                 await queue.put(approval_request_event(
                     request_id, tool_call_id,
                     action, _event_options(self.OPTIONS),
@@ -1187,11 +1183,11 @@ class PiAdapter(AgentAdapter):
             self.pending_question_specs[tool_call_id] = questions
             self.pending_sessions[tool_call_id] = session_id
 
-            await flush_text()
             await queue.put(
                 {
                     "type": "question",
                     "request_id": tool_call_id,
+                    "call_id": tool_call_id,
                     "questions": questions,
                 }
             )
@@ -1266,7 +1262,6 @@ class PiAdapter(AgentAdapter):
                 self.pending_sessions[request_id] = session_id
                 self.pending_options[request_id] = self.OPTIONS
 
-                await flush_text()
                 await queue.put(
                     approval_request_event(
                         request_id,
@@ -1295,9 +1290,21 @@ class PiAdapter(AgentAdapter):
             nonlocal pending_error
             kind = message.get("type")
 
+            if kind == "message_start":
+                if message.get("message", {}).get("role") == "assistant":
+                    await publish(stream.interrupt("incomplete"))
+                    await publish(stream.new_message(message["message"]))
+                return
+
+            if kind == "auto_retry_start":
+                await publish(stream.interrupt("retry"))
+                stream.new_message()
+                return
+
             if kind == "message_end":
                 completed = message.get("message")
                 if isinstance(completed, dict) and completed.get("role") == "assistant":
+                    await publish(stream.message_end(completed))
                     # A later successful assistant message supersedes an error
                     # recovered through retry or context compaction.
                     reason = completed.get("stopReason")
@@ -1320,29 +1327,16 @@ class PiAdapter(AgentAdapter):
 
             if kind == "message_update":
                 event = message["assistantMessageEvent"]
-                event_type = event["type"]
-                if event_type == "text_delta":
-                    text_buf.append(event["delta"])
-                elif event_type == "text_end":
-                    text = event["content"]
-                    text_buf.clear()
-                    if text.strip():
-                        await queue.put({"type": "output", "text": text})
-                # thinking_* and toolcall_* deltas carry nothing the UI needs.
+                await publish(stream.update_event(event))
                 return
 
             if kind == "tool_execution_start":
                 tool = message["toolName"]
                 args = message["args"]
                 tool_call_id = message["toolCallId"]
-                # The question tool is surfaced as a `question` event, so don't
-                # also emit a tool_use bubble for it.
-                if tool == self.QUESTION_TOOL:
-                    return
                 action = action_or_other(tool, args, PI_TOOL_TRANSLATORS)
                 tool_actions[tool_call_id] = action
-                await flush_text()
-                await queue.put(tool_use_event(tool_call_id, action))
+                await publish(stream.execution(tool_call_id, tool, args))
                 return
 
             if kind == "extension_ui_request":
@@ -1352,7 +1346,6 @@ class PiAdapter(AgentAdapter):
             if kind == "agent_settled":
                 # Terminal: agent_end can still be followed by a retry, settled
                 # cannot.
-                await flush_text()
                 if pending_error:
                     await queue.put({"type": "error", "message": pending_error})
                 await queue.put({"type": "done"})
@@ -1366,7 +1359,6 @@ class PiAdapter(AgentAdapter):
                         await queue.put({"type": "session", "session_id": str(data["sessionId"])})
                     return
                 if not message.get("success"):
-                    await flush_text()
                     await queue.put(
                         {
                             "type": "error",
