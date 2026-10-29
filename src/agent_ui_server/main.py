@@ -134,6 +134,31 @@ bash_tasks: dict[int, asyncio.Task[None]] = {}
 turn_lock = asyncio.Lock()
 
 
+class UpdateSettingsRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    worktree_path_template: StrictStr | None = None
+    default_working_directory: StrictStr | None = None
+    default_agent: StrictStr | None = None
+
+    @field_validator("worktree_path_template", "default_working_directory")
+    @classmethod
+    def strip_nonempty_setting(cls, value: str | None) -> str:
+        if value is None or not value.strip():
+            raise ValueError("setting must not be empty")
+        return value.strip()
+
+    @field_validator("default_agent")
+    @classmethod
+    def check_agent(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if value not in adapter_types:
+            raise ValueError("unknown agent")
+        return value
+
+
 class SandboxNetworkDestinationRequest(BaseModel):
     ip: str
     port: int = Field(strict=True, ge=1, le=65535)
@@ -372,6 +397,17 @@ async def get_usage() -> dict[str, Any]:
     request, so a user who has only authenticated one of them still sees it.
     """
     return await collect_usage()
+
+
+@app.get("/settings")
+async def get_settings() -> dict[str, Any]:
+    """Server-wide preferences; clients expand the worktree template locally."""
+    return db.get_settings()
+
+
+@app.patch("/settings")
+async def update_settings(payload: UpdateSettingsRequest) -> dict[str, Any]:
+    return db.update_settings(payload.model_dump(exclude_unset=True))
 
 
 @app.get("/sandbox-network")

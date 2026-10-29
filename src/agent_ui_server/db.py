@@ -75,6 +75,20 @@ class Database:
     def init(self) -> None:
         with self._lock, self._conn:
             self._conn.execute("BEGIN")
+            self._conn.execute("""
+                CREATE TABLE IF NOT EXISTS server_settings (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    worktree_path_template TEXT NOT NULL CHECK (length(trim(worktree_path_template)) > 0),
+                    default_working_directory TEXT NOT NULL CHECK (length(trim(default_working_directory)) > 0),
+                    default_agent TEXT
+                )
+            """)
+            self._conn.execute(
+                "INSERT INTO server_settings "
+                "(id, worktree_path_template, default_working_directory, default_agent) "
+                "VALUES (1, ?, ?, NULL) ON CONFLICT(id) DO NOTHING",
+                ("%P/%N-%B", "/projects/"),
+            )
             # Projects have their own identity: `path` is still how the HTTP
             # API addresses one and is still unique, but sessions link to the
             # id, so a project's path can change without taking its sessions
@@ -245,6 +259,28 @@ class Database:
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    def get_settings(self) -> dict[str, Any]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT worktree_path_template, default_working_directory, default_agent "
+                "FROM server_settings WHERE id = 1"
+            ).fetchone()
+        return dict(row)
+
+    def update_settings(self, changes: dict[str, Any]) -> dict[str, Any]:
+        columns = [key for key in (
+            "worktree_path_template", "default_working_directory", "default_agent",
+        ) if key in changes]
+        with self._lock, self._conn:
+            if columns:
+                self._conn.execute(
+                    "UPDATE server_settings SET "
+                    + ", ".join(f"{column} = ?" for column in columns)
+                    + " WHERE id = 1",
+                    [changes[column] for column in columns],
+                )
+            return self.get_settings()
 
     def reset_active_sessions(self) -> None:
         with self._lock, self._conn:

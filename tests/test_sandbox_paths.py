@@ -209,8 +209,8 @@ class SandboxPathsAPITests(PathFixture, unittest.IsolatedAsyncioTestCase):
         await self.project_settings(sandbox_paths=[self.entry(True)])
         with sqlite3.connect(self.database.path) as conn:
             conn.execute("PRAGMA foreign_keys = ON")
-            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-            self.assertNotIn("server_settings", tables)
+            settings_columns = {row[1] for row in conn.execute("PRAGMA table_info(server_settings)")}
+            self.assertNotIn("sandbox_paths", settings_columns)
             columns = {row[1] for row in conn.execute("PRAGMA table_info(projects)")}
             self.assertNotIn("sandbox_paths", columns)
             rows = conn.execute("SELECT project_id, path, writable FROM sandbox_paths ORDER BY id").fetchall()
@@ -228,7 +228,7 @@ class SandboxPathsAPITests(PathFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.database.get_sandbox_paths(self.project["id"]), [])
         self.assertEqual(self.database.get_sandbox_paths(), [self.entry()])
         routes = {route.path for route in self.main.app.routes}
-        self.assertNotIn("/settings", routes)
+        self.assertIn("/settings", routes)
         self.assertIn("/sandbox-paths", routes)
 
     async def test_adapter_forwarding_and_disabled_bypass(self):

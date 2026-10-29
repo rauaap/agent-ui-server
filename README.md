@@ -289,6 +289,8 @@ FastAPI also exposes generated OpenAPI documentation at `/docs`.
 |---|---|---|
 | `GET` | `/agents` | List registered agents with their startup model catalogs |
 | `GET` | `/usage` | Five-hour and weekly consumption for each subscription |
+| `GET` | `/settings` | Read server-wide preferences |
+| `PATCH` | `/settings` | Update supplied server-wide preferences |
 | `GET` | `/sandbox-paths` | Read server-wide sandbox path defaults |
 | `PATCH` | `/sandbox-paths` | Replace server-wide sandbox path defaults |
 | `GET` | `/projects` | List projects and session aggregates |
@@ -306,6 +308,47 @@ FastAPI also exposes generated OpenAPI documentation at `/docs`.
 | `GET` | `/sessions/{id}/scrollback` | Read persisted transcript events with cursor pagination |
 | `POST` | `/sessions/{id}/stop` | Stop the agent turn and shell command |
 | `DELETE` | `/sessions/{id}` | Delete a session and its transcript |
+
+### Server settings
+
+`GET /settings` returns these defaults:
+
+```json
+{
+  "worktree_path_template": "%P/%N-%B",
+  "default_working_directory": "/projects/",
+  "default_agent": null
+}
+```
+
+All three preferences are stored in a single row in the server database and shared
+by all clients. Update supplied fields with `PATCH /settings`, for example:
+
+```json
+{
+  "default_working_directory": "/srv/projects/",
+  "default_agent": "pi"
+}
+```
+
+PATCH returns the full settings object. Omitted fields stay unchanged. The template
+and directory must be non-empty strings; surrounding whitespace is stripped.
+`default_agent` is a registered agent ID (`"pi"` or `"claude-code"`), or `null` to
+clear the preference and use the server's default agent. Agent IDs are also trimmed.
+Invalid values and unknown fields are rejected with HTTP 422. The server stores
+the template as text without expanding it or validating tokens; saving the directory
+does not create it or check its existence.
+
+Clients fetch settings when opening settings or a creation form that uses these
+preferences. The directory seeds new project paths; the agent seeds new session
+agent selection, with `null` selecting the default identified by `GET /agents`.
+These are UI defaults, not overrides of explicit creation choices; existing
+project and session creation requests retain their meanings. Clients expand the
+worktree template locally for previews and creation and save preference edits
+through PATCH. There is no client-local persistence or long-lived cache for these
+preferences. Connection/device preferences remain client-local.
+`POST /worktrees` is unchanged: clients still send an absolute `path` alongside
+`project_path` and `branch`. Template expansion and token meanings are unchanged.
 
 ### Agents and sessions
 
